@@ -1,0 +1,21 @@
+# bots/volume.py
+from .shared import *
+from datetime import datetime
+
+async def run_volume():
+    now = datetime.now()
+    if now.hour != 9 or now.minute != 31 or now.weekday() >= 5: return
+
+    universe = await get_top_500_universe()
+    top_volume = []
+    for sym in universe:
+        try:
+            bars = polygon_client.get_aggs(sym, 1, "minute", limit=1)
+            vol = bars.results[0].volume
+            if vol > 5_000_000:
+                top_volume.append((sym, vol))
+        except: pass
+
+    top_volume = sorted(top_volume, key=lambda x: x[1], reverse=True)[:10]
+    body = f"*FLOW LEADERS | {now.strftime('%H:%M')} AM EST*\n" + "\n".join([f"{i+1}. {s}: {v:,} shares" for i, (s, v) in enumerate(top_volume)])
+    await send_alert(os.getenv("TELEGRAM_TOKEN_FLOW"), "FLOW LEADERS", body)
