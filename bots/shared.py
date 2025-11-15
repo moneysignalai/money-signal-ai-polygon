@@ -46,7 +46,7 @@ async def send_alert(token, title, body, link=None):
     if link:
         msg += f"\n[TAP TO TRADE]({link})"
     await bot.send_message(
-        chat_id=os.getenv(f"TELEGRAM_CHAT_{token[-6:]}", token),
+        chat_id=os.getenv("TELEGRAM_CHAT_ALL"),  # ← ONE ID
         text=msg.strip(),
         parse_mode='Markdown',
         disable_web_page_preview=True
