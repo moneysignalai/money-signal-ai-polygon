@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+polygon-api-client
+python-telegram-bot
+pandas
+yfinance
+ta
+python-dateutil
+python-dotenv
