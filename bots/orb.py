@@ -17,10 +17,18 @@ async def run_orb():
             if bars.empty: continue
             high, low = bars['h'].max(), bars['l'].min()
 
-            quote = polygon_client.get_last_trade(sym)
-            price = quote.price
+            price = polygon_client.get_last_trade(sym).price
             direction = "LONG" if price > high else "SHORT" if price < low else None
             if not direction: continue
+
+            # RSI Divergence
+            rsi = RSIIndicator(bars['c']).rsi().iloc[-1]
+            rsi_prev = RSIIndicator(bars['c'].shift(1)).rsi().iloc[-1]
+            if (direction == "LONG" and rsi < rsi_prev) or (direction == "SHORT" and rsi > rsi_prev):
+                continue
+
+            # MTF
+            if not mtf_confirm(sym, direction): continue
 
             exp = (datetime.today() + timedelta(days=1)).strftime("%Y-%m-%d")
             contracts_resp = polygon_client.list_options_contracts(underlying_ticker=sym, expiration_date=exp, contract_type=direction.lower())
@@ -32,6 +40,7 @@ async def run_orb():
             if not oquote or not is_edge_option(oquote): continue
 
             link = build_rh_link(sym, exp, best.strike_price, direction.lower())
-            body = f"Buy 2x {int(best.strike_price)}{direction[0]} @ ${oquote.ask:.2f} | Exp: {exp[5:10].replace('-','/')}\nIV: {oquote.implied_volatility:.0%} | Delta: {oquote.delta:.2f} | Gamma: {oquote.gamma:.2f}\nVol: {oquote.volume:,} | OI: {oquote.open_interest:,} | V/OI: {oquote.volume/oquote.open_interest:.1f}x\nRSI: 72 | FVG: YES | Price > VWAP\nORB High: ${high:.2f} → Break @ ${price:.2f}\nTarget: +120% | Stop: ${low:.2f}\nExit 50% @ +100% | Trail rest"
-            await send_alert(os.getenv("TELEGRAM_TOKEN_ORB"), f"ORB {direction} {sym}", body, link)
+            confidence = get_confidence_score(oquote.volume/oquote.open_interest, oquote.gamma, oquote.implied_volatility, True, True)
+            body = f"Buy 2x {int(best.strike_price)}{direction[0]} @ ${oquote.ask:.2f} | Exp: {exp[5:10].replace('-','/')}\nIV: {oquote.implied_volatility:.0%} | Delta: {oquote.delta:.2f} | Gamma: {oquote.gamma:.2f}\nVol: {oquote.volume:,} | OI: {oquote.open_interest:,} | V/OI: {oquote.volume/oquote.open_interest:.1f}x\nRSI: {rsi:.0f} | FVG: YES | MTF: {'UP' if direction=='LONG' else 'DOWN'}\nTarget: +120% | Stop: ${low:.2f}\nExit: 50% @ +80% | 50% @ +150% | Trail"
+            await send_alert(os.getenv("TELEGRAM_TOKEN_ORB"), f"ORB {direction} {sym}", body, link, confidence)
         except: pass
