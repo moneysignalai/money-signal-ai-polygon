@@ -6,37 +6,38 @@ from datetime import datetime, timedelta
 import pandas as pd
 from ta.momentum import RSIIndicator
 
+# Polygon client
 polygon_client = RESTClient(api_key=os.getenv("POLYGON_KEY"))
 
+# Cache for top 500
 HIGH_LIQUIDITY_UNIVERSE = None
 
 async def get_top_500_universe():
+    """Scan ALL US stocks → return top 500 by 30-day avg volume > 1M, price > $10"""
     global HIGH_LIQUIDITY_UNIVERSE
     if HIGH_LIQUIDITY_UNIVERSE is not None:
         return HIGH_LIQUIDITY_UNIVERSE
 
-    # Get ALL US stocks from Polygon
+    # Get all US stocks
     tickers_resp = polygon_client.list_tickers(market="stocks", limit=1000)
     tickers = tickers_resp.results
 
-    # Filter: US, price > $10, avg volume > 1M
     filtered = []
     for t in tickers:
-        if t.market != "stocks": continue
-        if t.type != "CS": continue  # Common Stock
-        if t.locale != "us": continue
+        if t.market != "stocks" or t.type != "CS" or t.locale != "us":
+            continue
         try:
-            # Get 30-day avg volume
             agg = polygon_client.get_aggs(t.ticker, 1, "day", limit=30)
-            if not agg.results: continue
+            if not agg.results:
+                continue
             df = pd.DataFrame(agg.results)
             avg_vol = df['v'].mean()
             last_price = df['c'].iloc[-1]
             if avg_vol > 1_000_000 and last_price > 10:
                 filtered.append((t.ticker, avg_vol))
-        except: continue
+        except:
+            continue
 
-    # Sort by volume, take top 500
     filtered.sort(key=lambda x: x[1], reverse=True)
     HIGH_LIQUIDITY_UNIVERSE = [t[0] for t in filtered[:500]]
     return HIGH_LIQUIDITY_UNIVERSE
@@ -77,6 +78,7 @@ def mtf_confirm(sym, direction):
     return (direction == "LONG" and trend == "UP") or (direction == "SHORT" and trend == "DOWN")
 
 async def send_alert(token, title, body, link=None, confidence=0):
+    """Send to PERSONAL CHAT (TELEGRAM_CHAT_ALL) — no channels"""
     bot = telegram.Bot(token=token)
     msg = f"*{title}*\n{body}"
     if confidence:
@@ -85,7 +87,7 @@ async def send_alert(token, title, body, link=None, confidence=0):
     if link:
         msg += f"\n[TAP TO TRADE]({link})"
     await bot.send_message(
-        chat_id=os.getenv(f"TELEGRAM_CHAT_{token[-6:]}", token),
+        chat_id=os.getenv("TELEGRAM_CHAT_ALL"),  # ← PERSONAL ID
         text=msg.strip(),
         parse_mode='Markdown',
         disable_web_page_preview=True
