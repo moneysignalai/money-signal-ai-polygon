@@ -22,6 +22,7 @@ async def run_earnings():
                     if t: sentiment, opt_type = s, t
                 if opt_type is None: continue
 
+                # IV Crush
                 exp = (now + timedelta(days=2)).strftime("%Y-%m-%d")
                 contracts_resp = polygon_client.list_options_contracts(underlying_ticker=sym, expiration_date=exp, contract_type=opt_type)
                 contracts = contracts_resp.results
@@ -30,9 +31,10 @@ async def run_earnings():
                 if not atm: continue
                 best = max(atm, key=lambda x: x.volume)
                 oquote = get_greeks(sym, exp, best.strike_price, opt_type)
-                if not oquote or not is_edge_option(oquote): continue
+                if not oquote or not is_edge_option(oquote) or oquote.implied_volatility > 0.5: continue
 
                 link = build_rh_link(sym, exp, best.strike_price, opt_type)
-                body = f"PRE-EARNINGS {opt_type.upper()} | {now.strftime('%H:%M')} EST\nWhisper: {sentiment.upper()} News\nBuy 2x {int(best.strike_price)}{opt_type[0]} @ ${oquote.ask:.2f}\nIV: {oquote.implied_volatility:.0%} | Delta: {oquote.delta:.2f}\nEntry: Gap Play | Exit: 50% @ +100%"
-                await send_alert(os.getenv("TELEGRAM_TOKEN_EARN"), f"PRE {sym} {opt_type.upper()}", body, link)
+                confidence = get_confidence_score(oquote.volume/oquote.open_interest, oquote.gamma, oquote.implied_volatility, False, True)
+                body = f"PRE-EARNINGS {opt_type.upper()} | {now.strftime('%H:%M')} EST\nWhisper: {sentiment.upper()} News\nBuy 2x {int(best.strike_price)}{opt_type[0]} @ ${oquote.ask:.2f}\nIV: {oquote.implied_volatility:.0%} | Delta: {oquote.delta:.2f}\nEntry: Gap Play | Exit: 50% @ +80% | 50% @ +150% | Trail"
+                await send_alert(os.getenv("TELEGRAM_TOKEN_EARN"), f"PRE {sym} {opt_type.upper()}", body, link, confidence)
         except: pass
