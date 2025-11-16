@@ -29,4 +29,16 @@ async def start():
 
 @app.get("/")
 def home():
-    return {"status": "MoneySignalAi 6 Bots Live — ULTIMATE EDITION", "user": "@HuskersTalk", "time": "2025-11-16 17:18 EST"}
+    return {"status": "MoneySignalAi 6 Bots Live — ULTIMATE EDITION", "user": "@HuskersTalk"}
+
+@app.get("/test")
+async def test():
+    from bots.shared import send_alert
+    await send_alert(
+        token=os.getenv("TELEGRAM_TOKEN_ORB"),
+        title="TEST ALERT",
+        body="Your @MoneySignalAi bot is 100% working!\n\n6 bots running:\n• ORB\n• Earnings\n• Cheap\n• Volume\n• Unusual\n• Squeeze\n\nFirst real alert: 9:30 AM EST tomorrow.",
+        link=None,
+        confidence=100
+    )
+    return {"sent": True, "time": "2025-11-16 18:17 EST"}
