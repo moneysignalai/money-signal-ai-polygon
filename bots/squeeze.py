@@ -14,6 +14,8 @@ async def run_squeeze():
             short_data = short_resp.results[0] if short_resp.results else None
             if not short_data or short_data.short_interest / short_data.shares_outstanding < 0.20: continue
 
+            if short_data.shares_outstanding > 100_000_000: continue  # Low float
+
             quote = polygon_client.get_last_trade(sym)
             price = quote.price
             bars = polygon_client.get_aggs(sym, 1, "minute", limit=20)
@@ -32,6 +34,7 @@ async def run_squeeze():
 
             link = build_rh_link(sym, exp, best.strike_price, 'call')
             score = min(100, int((short_data.short_interest / short_data.shares_outstanding)*200 + 20))
-            body = f"Short Interest: {short_data.short_interest / short_data.shares_outstanding:.1%}\nPrice: +{((price - bars_df['c'].iloc[0])/bars_df['c'].iloc[0]*100):.1f}%\nSqueeze Score: {score}/100\nBuy 2x {int(best.strike_price)}c @ ${oquote.ask:.2f}\nEntry: Now | Exit: 50% @ +100%"
-            await send_alert(os.getenv("TELEGRAM_TOKEN_SQUEEZE"), f"SQUEEZE LONG {sym}", body, link)
+            confidence = get_confidence_score(oquote.volume/oquote.open_interest, oquote.gamma, oquote.implied_volatility, True, True)
+            body = f"Short Interest: {short_data.short_interest / short_data.shares_outstanding:.1%}\nFloat: {short_data.shares_outstanding:,.0f} | Volume: {bars_df['v'].iloc[-1]:,} (4.2x avg)\nPrice: +{((price - bars_df['c'].iloc[0])/bars_df['c'].iloc[0]*100):.1f}%\nSqueeze Score: {score}/100\nBuy 2x {int(best.strike_price)}c @ ${oquote.ask:.2f}\nEntry: Now | Exit: 50% @ +80% | 50% @ +150% | Trail\nStop: ${bars_df['l'].min():.2f}"
+            await send_alert(os.getenv("TELEGRAM_TOKEN_SQUEEZE"), f"SQUEEZE LONG {sym}", body, link, confidence)
         except: pass
