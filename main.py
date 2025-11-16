@@ -1,3 +1,4 @@
+# main.py
 from fastapi import FastAPI
 from bots.orb import run_orb
 from bots.earnings import run_earnings
@@ -28,4 +29,4 @@ async def start():
 
 @app.get("/")
 def home():
-    return {"status": "MoneySignalAi 6 Bots Live", "user": "@HuskersTalk"}
+    return {"status": "MoneySignalAi 6 Bots Live — ULTIMATE EDITION", "user": "@HuskersTalk", "time": "2025-11-16 17:18 EST"}
