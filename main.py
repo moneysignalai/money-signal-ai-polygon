@@ -11,27 +11,18 @@ import pytz
 # Eastern Time
 eastern = pytz.timezone('US/Eastern')
 def now_est():
-    return datetime.now(eastern).strftime("%I:%M %p")
+    return datetime.now(eastern).strftime("%I:%M %p EST · %b %d")
 
-app = FastAPI(title="MoneySignalAi — ELITE 8-BOT SUITE")
+app = FastAPI(title="MoneySignalAi — Elite 8-Bot Suite")
 
 @app.get("/")
 def root():
     return {"status": "LIVE — 8 BOTS ACTIVE", "time": now_est()}
 
-# ——— ALL ENVIRONMENT VARIABLES (MUST be in main.py) ———
-TELEGRAM_CHAT_ALL       = os.getenv("TELEGRAM_CHAT_ALL")
-TELEGRAM_TOKEN_DEAL     = os.getenv("TELEGRAM_TOKEN_DEAL")
-TELEGRAM_TOKEN_EARN     = os.getenv("TELEGRAM_TOKEN_EARN")
-TELEGRAM_TOKEN_FLOW     = os.getenv("TELEGRAM_TOKEN_FLOW")
-TELEGRAM_TOKEN_GAP      = os.getenv("TELEGRAM_TOKEN_GAP")
-TELEGRAM_TOKEN_ORB      = os.getenv("TELEGRAM_TOKEN_ORB")
-TELEGRAM_TOKEN_SQUEEZE  = os.getenv("TELEGRAM_TOKEN_SQUEEZE")
-TELEGRAM_TOKEN_UNUSUAL  = os.getenv("TELEGRAM_TOKEN_UNUSUAL")
-TELEGRAM_TOKEN_MOMENTUM = os.getenv("TELEGRAM_TOKEN_MOMENTUM")   # 8th bot
-TELEGRAM_TOKEN_STATUS   = os.getenv("TELEGRAM_TOKEN_STATUS")     # status bot
+TELEGRAM_CHAT_ALL     = os.getenv("TELEGRAM_CHAT_ALL")
+TELEGRAM_TOKEN_ALERTS = os.getenv("TELEGRAM_TOKEN_ALERTS")
+TELEGRAM_TOKEN_STATUS = os.getenv("TELEGRAM_TOKEN_STATUS")
 
-# Import bots
 from bots.cheap           import run_cheap
 from bots.earnings        import run_earnings
 from bots.gap             import run_gap
@@ -43,46 +34,65 @@ from bots.momentum_reversal import run_momentum_reversal
 
 from bots.shared import start_polygon_websocket
 
-# ——— ALERT FUNCTION (uses all 8 tokens) ———
 def send_alert(bot_name: str, ticker: str, price: float, rvol: float, extra: str = ""):
-    token = TELEGRAM_TOKEN_FLOW
-    if "cheap" in bot_name.lower():     token = TELEGRAM_TOKEN_DEAL
-    if "earn" in bot_name.lower():      token = TELEGRAM_TOKEN_EARN
-    if "gap" in bot_name.lower():       token = TELEGRAM_TOKEN_GAP
-    if "orb" in bot_name.lower():       token = TELEGRAM_TOKEN_ORB
-    if "squeeze" in bot_name.lower():   token = TELEGRAM_TOKEN_SQUEEZE
-    if "unusual" in bot_name.lower():   token = TELEGRAM_TOKEN_UNUSUAL
-    if "momentum" in bot_name.lower():  token = TELEGRAM_TOKEN_MOMENTUM
+    if not TELEGRAM_TOKEN_ALERTS or not TELEGRAM_CHAT_ALL: return
 
-    if not token or not TELEGRAM_CHAT_ALL: return
+    labels = {
+        "cheap":           "CHEAP 0DTE HUNTER",
+        "earnings":        "EARNINGS CATALYST",
+        "gap":             "GAP FILL/FADE PRO",
+        "orb":             "OPENING RANGE BREAKOUT",
+        "squeeze":         "SHORT SQUEEZE PRO",
+        "unusual":         "UNUSUAL OPTIONS FLOW",
+        "volume":          "VOLUME LEADERS PRO",
+        "momentum_reversal": "MOMENTUM REVERSAL EDGE",
+    }
+    label = labels.get(bot_name.lower(), bot_name.upper())
 
-    message = f"**{bot_name.upper()}** → **{ticker}** @ ${price:.2f} | RVOL {rvol:.1f}x {extra}".strip()
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    timestamp = now_est()
+    message = f"""*{label}*  
+**{ticker}** @ ${price:.2f} | RVOL {rvol:.1f}x  
+{extra.strip()}
+
+*{timestamp}*"""
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN_ALERTS}/sendMessage"
     try:
         requests.post(url, data={"chat_id": TELEGRAM_CHAT_ALL, "text": message, "parse_mode": "Markdown"}, timeout=10)
-        print(f"ALERT → {message}")
-    except Exception as e:
-        print(f"ALERT FAILED → {e}")
-
-# ——— STATUS REPORT (uses dedicated token) ———
-def send_status():
-    token = TELEGRAM_TOKEN_STATUS or TELEGRAM_TOKEN_FLOW
-    if not token or not TELEGRAM_CHAT_ALL: return
-    msg = f"""*MoneySignalAi — ELITE SUITE STATUS*  
-{now_est()} EST  
-
-8 bots live · Polygon connected · Scanner active  
-
-Next wave: 9:30–10:30 AM → Gap + ORB + Cheap  
-2:30–4:00 PM → Unusual + Squeeze + Volume + Momentum  
-
-Ready for tomorrow’s massacre"""
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    try:
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ALL, "text": msg, "parse_mode": "Markdown"}, timeout=10)
     except: pass
 
-# ——— RUN ALL 8 BOTS ———
+# CORRECTED STATUS REPORT — ALL-DAY BOTS SCAN ALL DAY
+def send_status():
+    if not TELEGRAM_TOKEN_STATUS or not TELEGRAM_CHAT_ALL: return
+
+    now = now_est()
+    message = f"""*MoneySignalAi — SCANNER STATUS*  
+{now}  
+
+8 bots actively scanning 24/7  
+
+All-day scanners (9:30 AM – 4:00 PM EST):  
+• Cheap 0DTE Hunter  
+• Unusual Options Flow  
+• Volume Leaders Pro  
+• Short Squeeze Pro  
+• Momentum Reversal Edge  
+• Earnings Catalyst  
+
+Morning-only (9:30–10:30 AM EST):  
+• Gap Fill/Fade Pro  
+• Opening Range Breakout  
+
+Polygon WebSocket: Connected  
+Scanner: Running every 30 seconds  
+
+System 100% operational — waiting on setups"""
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN_STATUS}/sendMessage"
+    try:
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ALL, "text": message, "parse_mode": "Markdown"}, timeout=10)
+    except: pass
+
 async def run_all_once():
     await asyncio.gather(
         run_cheap(), run_earnings(), run_gap(),
@@ -99,13 +109,13 @@ def run_forever():
         cycle += 1
         now = now_est()
         print(f"SCAN #{cycle} @ {now}")
-        if cycle % 60 == 0:  # every 30 min
+        if cycle % 60 == 0:  # every 30 minutes
             send_status()
         asyncio.new_event_loop().run_until_complete(run_all_once())
         time.sleep(30)
 
 @app.on_event("startup")
-async def startup():
+async def startup_event():
     threading.Thread(target=run_forever, daemon=True).start()
 
 if __name__ == "__main__":
