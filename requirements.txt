@@ -7,3 +7,4 @@ yfinance
 ta
 python-dateutil
 python-dotenv
+websocket-client
