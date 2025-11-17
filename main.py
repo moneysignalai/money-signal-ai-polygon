@@ -34,11 +34,18 @@ def home():
         "status": "MoneySignalAi 7 Bots Live — ULTIMATE EDITION",
         "user": "@HuskersTalk",
         "bots": ["ORB", "Earnings", "Cheap", "Volume", "Unusual", "Squeeze", "Gap"],
-        "time": "2025-11-16 19:17 EST"
+        "time": "2025-11-17 10:43 EST"
     }
-    
-    @app.get("/force")
-async def force():
-    from bots.cheap import run_cheap  # Test Cheap bot
-    await run_cheap()
-    return {"forced": True, "time": "2025-11-17 10:23 EST"}
+
+# Test endpoint (remove after testing)
+@app.get("/test")
+async def test():
+    from bots.shared import send_alert
+    await send_alert(
+        token=os.getenv("TELEGRAM_TOKEN_ORB"),
+        title="TEST ALERT",
+        body="Your @MoneySignalAi 7-bot suite is LIVE!\n\n6 bots running:\n• ORB\n• Earnings\n• Cheap\n• Volume\n• Unusual\n• Squeeze\n• Gap\n\nFirst real alert: 9:30 AM EST tomorrow.",
+        link=None,
+        confidence=100
+    )
+    return {"sent": True}
