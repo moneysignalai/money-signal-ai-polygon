@@ -1,38 +1,63 @@
-# main.py
-from fastapi import FastAPI
-from bots.orb import run_orb
-from bots.earnings import run_earnings
-from bots.cheap import run_cheap
-from bots.volume import run_volume
-from bots.unusual import run_unusual
-from bots.squeeze import run_squeeze
-from bots.gap import run_gap
-import asyncio
-from datetime import datetime
 import os
-from dotenv import load_dotenv
-load_dotenv()
+import threading
+import time
+from fastapi import FastAPI
+import uvicorn
 
-app = FastAPI()
+app = FastAPI(title="MoneySignalAi 7-Bot Suite")
 
-async def run_all():
-    while True:
-        now = datetime.now()
-        tasks = [run_orb(), run_earnings(), run_volume(), run_gap()]
-        if 9 <= now.hour < 16 and now.minute % 15 == 0:
-            tasks += [run_cheap(), run_unusual(), run_squeeze()]
-        await asyncio.gather(*tasks)
-        await asyncio.sleep(60)
-
-@app.on_event("startup")
-async def start():
-    asyncio.create_task(run_all())
-
+# Root endpoint — keeps Render health checks happy (200 OK)
 @app.get("/")
-def home():
+def root():
     return {
-        "status": "MoneySignalAi 7 Bots Live — ULTIMATE EDITION",
-        "user": "@HuskersTalk",
-        "bots": ["ORB", "Earnings", "Cheap", "Volume", "Unusual", "Squeeze", "Gap"],
-        "time": "2025-11-17 10:43 EST"
+        "status": "MoneySignalAi 7-Bot Suite LIVE",
+        "bots": "Gap • Cheap • Unusual • ORB • Squeeze • Momentum • Breakout",
+        "alerts_today": "3–10 expected"
     }
+
+# ———————— IMPORT YOUR BOT FUNCTIONS ————————
+# (adjust the import names if your files are named differently)
+from bots.gap_bot import run_gap_scan
+from bots.cheap_bot import run_cheap_scan
+from bots.unusual_bot import run_unusual_scan
+from bots.orb_bot import run_orb_scan
+from bots.squeeze_bot import run_squeeze_scan
+from bots.momentum_bot import run_momentum_scan
+from bots.breakout_bot import run_breakout_scan
+from shared import start_polygon_websocket, send_alert
+
+# ———————— BACKGROUND BOT LAUNCHER ————————
+def run_all_bots_forever():
+    print("INFO: MoneySignalAi 7-bot suite STARTED — loose filters active")
+    start_polygon_websocket()  # connects once and stays alive
+    
+    while True:
+        print(f"SCAN: Starting new cycle @ {time.strftime('%H:%M:%S')}")
+        
+        threads = [
+            threading.Thread(target=run_gap_scan),
+            threading.Thread(target=run_cheap_scan),
+            threading.Thread(target=run_unusual_scan),
+            threading.Thread(target=run_orb_scan),
+            threading.Thread(target=run_squeeze_scan),
+            threading.Thread(target=run_momentum_scan),
+            threading.Thread(target=run_breakout_scan),
+        ]
+        
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+            
+        print("SCAN: Cycle complete — sleeping 30s")
+        time.sleep(30)
+
+# Start bots automatically when the app boots
+@app.on_event("startup")
+async def startup_event():
+    thread = threading.Thread(target=run_all_bots_forever, daemon=True)
+    thread.start()
+    print("INFO: All 7 bots launched in background — scanning every 30s")
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
