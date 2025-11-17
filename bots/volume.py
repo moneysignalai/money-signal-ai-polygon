@@ -19,8 +19,8 @@ async def run_volume():
                     top_volume.append((sym, vol))
         except: pass
 
-    top_volume = sorted(top_volume, key=lambda x: x[1], reverse=True)[:10]
-    body = f"*FLOW LEADERS | {now.strftime('%H:%M')} AM EST*\n"
+    top_volume = sorted(top_volume, key=lambda x: x[1], reverse=True)[:25]  # ← TOP 25
+    body = f"*FLOW LEADERS (TOP 25) | {now.strftime('%H:%M')} AM EST*\n"
     for i, (s, v) in enumerate(top_volume):
         body += f"{i+1}. {s}: {v:,} shares (at VWAP)\n"
     if not top_volume:
