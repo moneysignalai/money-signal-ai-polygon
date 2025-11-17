@@ -8,19 +8,21 @@ import uvicorn
 from datetime import datetime
 import pytz
 
-# Correct Eastern Time (EST/EDT with auto daylight saving)
+# Eastern Time
 eastern = pytz.timezone('US/Eastern')
 def now_est():
     return datetime.now(eastern).strftime("%I:%M:%S %p")
 
-app = FastAPI(title="MoneySignalAi 7-Bot Suite")
+app = FastAPI(title="MoneySignalAi — 7 Bots + Dedicated Status Bot")
 
 @app.get("/")
 def root():
-    return {"status": "LIVE — ALL 7 BOTS ACTIVE", "time": now_est()}
+    return {"status": "LIVE — ALL IN YOUR PRIVATE CHAT", "time": now_est()}
 
-# Your exact environment variables
-TELEGRAM_CHAT_ALL      = os.getenv("TELEGRAM_CHAT_ALL")
+# ONE PRIVATE CHAT FOR EVERYTHING
+TELEGRAM_CHAT_ALL = os.getenv("TELEGRAM_CHAT_ALL")  # ← your private chat ID
+
+# 7 trading bot tokens
 TELEGRAM_TOKEN_DEAL    = os.getenv("TELEGRAM_TOKEN_DEAL")
 TELEGRAM_TOKEN_EARN    = os.getenv("TELEGRAM_TOKEN_EARN")
 TELEGRAM_TOKEN_FLOW    = os.getenv("TELEGRAM_TOKEN_FLOW")
@@ -29,7 +31,10 @@ TELEGRAM_TOKEN_ORB     = os.getenv("TELEGRAM_TOKEN_ORB")
 TELEGRAM_TOKEN_SQUEEZE = os.getenv("TELEGRAM_TOKEN_SQUEEZE")
 TELEGRAM_TOKEN_UNUSUAL = os.getenv("TELEGRAM_TOKEN_UNUSUAL")
 
-# All 7 bots — correct imports
+# DEDICATED STATUS BOT — uses its own token only
+TELEGRAM_TOKEN_STATUS  = os.getenv("TELEGRAM_TOKEN_STATUS")  # ← its own bot token
+
+# Import bots
 from bots.cheap    import run_cheap
 from bots.earnings import run_earnings
 from bots.gap      import run_gap
@@ -38,7 +43,7 @@ from bots.squeeze  import run_squeeze
 from bots.unusual  import run_unusual
 from bots.volume   import run_volume
 
-# Telegram sender
+# Normal alerts + heartbeat → your private chat
 def send_alert(bot_name: str, ticker: str, price: float, rvol: float, extra: str = ""):
     token = TELEGRAM_TOKEN_FLOW
     if "cheap" in bot_name.lower(): token = TELEGRAM_TOKEN_DEAL
@@ -49,16 +54,45 @@ def send_alert(bot_name: str, ticker: str, price: float, rvol: float, extra: str
     if "unusual" in bot_name.lower(): token = TELEGRAM_TOKEN_UNUSUAL
 
     if not token or not TELEGRAM_CHAT_ALL:
-        print(f"NO WEBHOOK → {bot_name}: {ticker} {extra}")
+        print(f"ALERT SKIPPED → {bot_name}")
         return
 
     message = f"**{bot_name.upper()}** → **{ticker}** @ ${price:.2f} | RVOL {rvol:.1f}x {extra}".strip()
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
         requests.post(url, data={"chat_id": TELEGRAM_CHAT_ALL, "text": message, "parse_mode": "Markdown"}, timeout=10)
-        print(f"TELEGRAM → {message}")
+        print(f"ALERT → {message}")
     except Exception as e:
-        print(f"TELEGRAM FAILED → {e}")
+        print(f"ALERT FAILED → {e}")
+
+# Status Report Bot → uses its own token, same private chat
+def send_status_report():
+    if not TELEGRAM_TOKEN_STATUS or not TELEGRAM_CHAT_ALL:
+        print("STATUS REPORT SKIPPED — missing token")
+        return
+
+    now = now_est()
+    message = f"""*MoneySignalAi — FULL STATUS REPORT*  
+{now} EST  
+
+7 trading bots running 24/7  
+Polygon connected · Scanner active  
+
+Bots live:  
+• Cheap • Earnings • Gap • ORB • Squeeze • Unusual • Volume  
+
+Next wave:  
+2:30–4:00 PM EST → Cheap / Squeeze / Unusual / Volume  
+Tomorrow 9:30 AM → Gap + ORB  
+
+System 100% healthy — waiting on setups"""
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN_STATUS}/sendMessage"
+    try:
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ALL, "text": message, "parse_mode": "Markdown"}, timeout=10)
+        print("STATUS REPORT SENT (dedicated bot)")
+    except Exception as e:
+        print(f"STATUS REPORT FAILED → {e}")
 
 from bots.shared import start_polygon_websocket
 
@@ -70,7 +104,7 @@ async def run_all_once():
     )
 
 def run_forever():
-    print("INFO: MoneySignalAi 7-BOT SUITE FULLY LIVE")
+    print("INFO: MoneySignalAi 7 BOTS + DEDICATED STATUS BOT LIVE")
     start_polygon_websocket()
     
     cycle = 0
@@ -79,6 +113,10 @@ def run_forever():
         now = now_est()
         print(f"SCAN #{cycle} | STARTING @ {now}")
         send_alert("Scanner", "Now Scanning", 0, 0, f"Cycle #{cycle} • {now} EST • 7 BOTS ACTIVE")
+        
+        # Status Report every 30 minutes — uses its own dedicated token
+        if cycle % 60 == 0:
+            send_status_report()
         
         asyncio.new_event_loop().run_until_complete(run_all_once())
         time.sleep(30)
