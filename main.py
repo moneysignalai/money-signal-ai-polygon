@@ -36,3 +36,9 @@ def home():
         "bots": ["ORB", "Earnings", "Cheap", "Volume", "Unusual", "Squeeze", "Gap"],
         "time": "2025-11-16 19:17 EST"
     }
+    
+    @app.get("/force")
+async def force():
+    from bots.cheap import run_cheap  # Test Cheap bot
+    await run_cheap()
+    return {"forced": True, "time": "2025-11-17 10:23 EST"}
