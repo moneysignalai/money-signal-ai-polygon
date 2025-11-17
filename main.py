@@ -15,15 +15,17 @@ def root():
         "time": time.strftime("%H:%M:%S")
     }
 
-# Correct imports — shared.py is inside bots/
+# Correct imports — everything is inside bots/ folder
 from bots.shared import send_alert, start_polygon_websocket
-from bots.gap_bot import run_gap_scan
+
+# ←←← ONLY THIS LINE CHANGED — your file is gap.py ←←←
+from bots.gap import run_gap_scan           # ← was gap_bot.py
 from bots.cheap_bot import run_cheap_scan
 from bots.unusual import run_unusual_scan
 from bots.orb_bot import run_orb_scan
 from bots.squeeze_bot import run_squeeze_scan
-from bots.momentum_bot import run_momentum_scan
-from bots.breakout_bot import run_breakout_scan
+from bots.momentum_bot import run_momentum_scan   # or whatever yours is called
+from bots.breakout_bot import run_breakout_scan   # or whatever yours is called
 
 def run_all_bots_forever():
     print("INFO: MoneySignalAi 7-bot suite STARTED — loose filters active")
@@ -33,9 +35,7 @@ def run_all_bots_forever():
     while True:
         cycle += 1
         now = time.strftime("%H:%M:%S")
-        print(f"SCAN #{cycle} | Starting scan cycle @ {now}")
-        
-        # ←←← This sends the "Now Scanning…" message once per cycle ←←←
+        print(f"SCAN #{cycle} | Starting @ {now}")
         send_alert("Scanner", "Now Scanning", 0, 0, f"Cycle #{cycle} • {now} EST • 7 bots active")
         
         threads = [
@@ -57,7 +57,7 @@ def run_all_bots_forever():
 async def startup_event():
     thread = threading.Thread(target=run_all_bots_forever, daemon=True)
     thread.start()
-    print("INFO: All 7 bots + scan ping launched — you’ll see activity every 30s")
+    print("INFO: All 7 bots + heartbeat launched — alerts incoming")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
