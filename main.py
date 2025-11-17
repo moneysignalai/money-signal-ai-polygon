@@ -1,17 +1,23 @@
 import os
 import threading
-import time
 import asyncio
+import requests
 from fastapi import FastAPI
 import uvicorn
+from datetime import datetime
+import pytz  # <-- This is the only new import
 
-app = FastAPI()
+# ←←← NEW: Force Eastern Time (EST/EDT with auto-daylight saving)
+eastern = pytz.timezone('US/Eastern')
+def now_est():
+    return datetime.now(eastern).strftime("%I:%M:%S %p")
+
+app = FastAPI(title="MoneySignalAi 7-Bot Suite")
 
 @app.get("/")
 def root():
-    return {"status": "LIVE — 7 BOTS ACTIVE", "time": time.strftime("%I:%M %p")}
+    return {"status": "LIVE — ALL 7 BOTS ACTIVE", "time": now_est()}
 
-# Your existing 7 trading tokens + chat
 TELEGRAM_CHAT_ALL      = os.getenv("TELEGRAM_CHAT_ALL")
 TELEGRAM_TOKEN_DEAL    = os.getenv("TELEGRAM_TOKEN_DEAL")
 TELEGRAM_TOKEN_EARN    = os.getenv("TELEGRAM_TOKEN_EARN")
@@ -29,9 +35,6 @@ from bots.squeeze  import run_squeeze
 from bots.unusual  import run_unusual
 from bots.volume   import run_volume
 
-# NEW — dedicated status bot
-from bots.status_report import run_status_report
-
 def send_alert(bot_name: str, ticker: str, price: float, rvol: float, extra: str = ""):
     token = TELEGRAM_TOKEN_FLOW
     if "cheap" in bot_name.lower(): token = TELEGRAM_TOKEN_DEAL
@@ -48,10 +51,10 @@ def send_alert(bot_name: str, ticker: str, price: float, rvol: float, extra: str
     message = f"**{bot_name.upper()}** → **{ticker}** @ ${price:.2f} | RVOL {rvol:.1f}x {extra}".strip()
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
-        import requests
         requests.post(url, data={"chat_id": TELEGRAM_CHAT_ALL, "text": message, "parse_mode": "Markdown"}, timeout=10)
-    except:
-        pass  # silent fail — we don’t want status spam in trading channels
+        print(f"TELEGRAM → {message}")
+    except Exception as e:
+        print(f"TELEGRAM FAILED → {e}")
 
 from bots.shared import start_polygon_websocket
 
@@ -63,20 +66,15 @@ async def run_all_once():
     )
 
 def run_forever():
-    print("INFO: MoneySignalAi 7-BOT SUITE + DEDICATED STATUS BOT LIVE")
+    print("INFO: MoneySignalAi 7-BOT SUITE FULLY LIVE")
     start_polygon_websocket()
     
     cycle = 0
     while True:
         cycle += 1
-        now = time.strftime("%I:%M:%S %p")
+        now = now_est()  # ←←← NOW USES CORRECT EASTERN TIME
         print(f"SCAN #{cycle} | STARTING @ {now}")
-        # Heartbeat only in trading channel
-        send_alert("Scanner", "Now Scanning", 0, 0, f"Cycle #{cycle} • {now} EST")
-        
-        # Dedicated status report — completely separate
-        if cycle % 120 == 0:  # once per hour
-            asyncio.new_event_loop().run_until_complete(run_status_report())
+        send_alert("Scanner", "Now Scanning", 0, 0, f"Cycle #{cycle} • {now} EST • 7 BOTS ACTIVE")
         
         asyncio.new_event_loop().run_until_complete(run_all_once())
         time.sleep(30)
