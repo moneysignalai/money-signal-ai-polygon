@@ -19,8 +19,23 @@ async def run_unusual():
                 for c in contracts:
                     quote = get_greeks(sym, exp, c.strike_price, c.contract_type)
                     if not quote or quote.volume < 3000: continue
-                    if quote.volume < 2 * quote.open_interest: continue        # ← loosened from 3x
-                    if quote.implied_volatility < 0.2: continue               # ← loosened from 0.3
+                    if quote.volume < 2 * quote.open_interest: continue
+                    if quote.implied_volatility < 0.2: continue
                     if not is_edge_option(quote): continue
 
-                    mtf_ok = mtf_confirm
+                    mtf_ok = mtf_confirm(sym, "LONG" if c.contract_type == 'call' else "SHORT")  # ← FIXED LINE
+                    confidence = get_confidence_score(
+                        quote.volume/quote.open_interest,
+                        quote.gamma,
+                        quote.implied_volatility,
+                        True,
+                        mtf_ok
+                    )
+
+                    link = build_rh_link(sym, exp, c.strike_price, c.contract_type)
+                    dte = (datetime.strptime(exp, "%Y-%m-%d") - now).days
+                    body = f"UNUSUAL {c.contract_type.upper()} {sym}\nVol: {quote.volume:,} (2x+ OI)\nIV: {quote.implied_volatility:.0%} | Delta: {quote.delta:.2f} | Gamma: {quote.gamma:.2f}\nV/OI: {quote.volume/quote.open_interest:.1f}x | {dte}DTE\nEntry: Momentum | Exit: 50% @ +80% | 50% @ +150% | Trail"
+                    await send_alert(os.getenv("TELEGRAM_TOKEN_UNUSUAL"), f"UNUSUAL {c.contract_type.upper()} {sym}", body, link, confidence)
+                    break
+        except:
+            pass
