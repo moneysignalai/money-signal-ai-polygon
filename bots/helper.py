@@ -1,12 +1,11 @@
-# bots/helpers.py — MUST EXIST (this was missing!)
+# bots/helpers.py   ← THIS FILE MUST EXIST AND HAVE THE client
 from polygon import RESTClient
 import os
 
-# Global Polygon client (shared with shared.py)
+# THIS IS THE ONLY PLACE client SHOULD BE DEFINED
 client = RESTClient(os.getenv("POLYGON_KEY"))
 
 def get_top_volume_stocks(limit=150):
-    """Returns real top volume stocks from Polygon"""
     try:
         snapshot = client.get_snapshot_all(tickers=None)
         stocks = []
@@ -16,15 +15,9 @@ def get_top_volume_stocks(limit=150):
         stocks.sort(key=lambda x: x[1], reverse=True)
         return [x[0] for x in stocks[:limit]]
     except:
-        # Fallback list if API fails
-        return [
-            "NVDA","TSLA","AAPL","AMD","SMCI","SPY","QQQ","IWM","T","F","AMC","GME","PLTR",
-            "SOFI","HOOD","MARA","RIOT","CLSK","CLOV","RIVN","LCID","NIO","XPEV","LI",
-            "AUR","IONQ","ASTS","DJT","MSTR","COIN","UPST","RBLX","PATH","SNOW","CRWD",
-            "NET","ZS","OKLO","SMR","BBAI","SOUN","HIMS","ARM","ANET","AVGO","NFLX"
-        ]
+        return ["NVDA","TSLA","AAPL","AMD","SMCI","SPY","QQQ","IWM","T","F","AMC","GME","PLTR","SOFI","HOOD","MARA","RIOT","CLSK","CLOV","RIVN"]
 
-# Dummy functions so nothing crashes
+# Dummy helpers
 def mtf_confirm(*a): return True
 def is_edge_option(*a): return True
 def get_confidence_score(*a): return 95
