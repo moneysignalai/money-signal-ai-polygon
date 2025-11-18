@@ -1,4 +1,5 @@
-from .shared import client, send_alert
+from .shared import send_alert
+from .helpers import client   # <-- ADD THIS LINE
 from datetime import datetime, timedelta
 async def run_cheap():
     try:
