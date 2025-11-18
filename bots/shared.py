@@ -13,13 +13,16 @@ eastern = pytz.timezone("US/Eastern")
 
 
 def now_est() -> str:
+    # Example: "09:34 AM EST · Nov 18"
     return datetime.now(eastern).strftime("%I:%M %p EST · %b %d")
 
 
-# ---------- Global filters (tweak as needed) ----------
+# ---------- Global filters (tweak via ENV if needed) ----------
 
-MIN_RVOL_GLOBAL = 1.5
-MIN_VOLUME_GLOBAL = 300_000
+# These are *base* filters used by several bots.
+# You can tighten them via ENV if you want fewer, higher-conviction alerts.
+MIN_RVOL_GLOBAL = float(os.getenv("MIN_RVOL_GLOBAL", "2.0"))        # was 1.5 → now 2.0
+MIN_VOLUME_GLOBAL = int(os.getenv("MIN_VOLUME_GLOBAL", "500000"))   # was 300k → now 500k
 RSI_OVERSOLD = 35
 RSI_OVERBOUGHT = 65
 
@@ -62,8 +65,10 @@ def send_alert(
     """
     Core Telegram send function used by all bots.
 
-    bot_name → only used for display in the message.
-    Everything goes to TELEGRAM_CHAT_ALL with TELEGRAM_TOKEN_ALERTS.
+    Adds:
+      - EST timestamp
+      - Bot/strategy name in header
+      - Standardized price/RVOL formatting
     """
     if not TELEGRAM_CHAT_ALL:
         print("ALERT SKIPPED: TELEGRAM_CHAT_ALL not set")
@@ -74,11 +79,22 @@ def send_alert(
         print(f"ALERT SKIPPED: no Telegram token configured (TELEGRAM_TOKEN_ALERTS)")
         return
 
+    timestamp = now_est()
     title = bot_name.upper().replace("_", " ")
-    msg = f"*{title}* — {symbol}\nPrice: ${last_price:.2f}"
-    if rvol > 0:
-        msg += f" · RVOL {rvol:.1f}x"
 
+    # Header with time + scanner name
+    # Example:
+    # [09:35 AM EST · Nov 18] PREMARKET — AAPL
+    header = f"*[{timestamp}]*  *{title}* — {symbol}"
+
+    # Base line: price (+ RVOL when available)
+    line1 = f"Last: ${last_price:.2f}"
+    if rvol > 0:
+        line1 += f" · RVOL {rvol:.1f}x"
+
+    msg = f"{header}\n{line1}"
+
+    # Strategy-specific details come through `extra`
     if extra:
         msg += f"\n\n{extra}"
 
