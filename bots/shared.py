@@ -1,59 +1,55 @@
-# bots/shared.py — core config + Telegram helpers
+# bots/shared.py — core config + Telegram helpers + dynamic universe
 import os
-import requests
+import time
 from datetime import datetime
-import pytz
+from typing import List
 
-# Time helpers
+import pytz
+import requests
+
+# ---------- Time helpers ----------
+
 eastern = pytz.timezone("US/Eastern")
+
+
 def now_est() -> str:
     return datetime.now(eastern).strftime("%I:%M %p EST · %b %d")
 
 
-# Global filters (you can tweak these later)
-MIN_RVOL_GLOBAL   = 1.5
-MIN_VOLUME_GLOBAL = 300_000
-RSI_OVERSOLD      = 35
-RSI_OVERBOUGHT    = 65
+# ---------- Global filters (tweak as needed) ----------
 
-# Env vars
+MIN_RVOL_GLOBAL = 1.5
+MIN_VOLUME_GLOBAL = 300_000
+RSI_OVERSOLD = 35
+RSI_OVERBOUGHT = 65
+
+# ---------- Environment variables ----------
+
 POLYGON_KEY = os.getenv("POLYGON_KEY", "")
 
-# One main chat for all alerts
+# Main chat where all alerts go
 TELEGRAM_CHAT_ALL = os.getenv("TELEGRAM_CHAT_ALL", "")
 
-# Per-strategy bots (you can reuse the same token for all if you want)
-TELEGRAM_TOKEN_DEAL    = os.getenv("TELEGRAM_TOKEN_DEAL", "")
-TELEGRAM_TOKEN_EARN    = os.getenv("TELEGRAM_TOKEN_EARN", "")
-TELEGRAM_TOKEN_GAP     = os.getenv("TELEGRAM_TOKEN_GAP", "")
-TELEGRAM_TOKEN_ORB     = os.getenv("TELEGRAM_TOKEN_ORB", "")
-TELEGRAM_TOKEN_SQUEEZE = os.getenv("TELEGRAM_TOKEN_SQUEEZE", "")
-TELEGRAM_TOKEN_UNUSUAL = os.getenv("TELEGRAM_TOKEN_UNUSUAL", "")
-TELEGRAM_TOKEN_FLOW    = os.getenv("TELEGRAM_TOKEN_FLOW", "")
-TELEGRAM_TOKEN_STATUS  = os.getenv("TELEGRAM_TOKEN_STATUS", "")
+# Single "all alerts" bot
+TELEGRAM_TOKEN_ALERTS = os.getenv("TELEGRAM_TOKEN_ALERTS", "")
+
+# Optional status/health bot (can be same as TELEGRAM_TOKEN_ALERTS)
+TELEGRAM_TOKEN_STATUS = os.getenv("TELEGRAM_TOKEN_STATUS", "")
 
 
-def _pick_token(bot_name: str) -> str:
-    """Map logical bot name → Telegram bot token."""
-    name = bot_name.lower()
-    if name in ("cheap", "deal"):
-        return TELEGRAM_TOKEN_DEAL or TELEGRAM_TOKEN_FLOW
-    if name == "earnings":
-        return TELEGRAM_TOKEN_EARN or TELEGRAM_TOKEN_FLOW
-    if name == "gap":
-        return TELEGRAM_TOKEN_GAP or TELEGRAM_TOKEN_FLOW
-    if name == "orb":
-        return TELEGRAM_TOKEN_ORB or TELEGRAM_TOKEN_FLOW
-    if name in ("squeeze", "short_squeeze"):
-        return TELEGRAM_TOKEN_SQUEEZE or TELEGRAM_TOKEN_FLOW
-    if name == "unusual":
-        return TELEGRAM_TOKEN_UNUSUAL or TELEGRAM_TOKEN_FLOW
-    if name in ("volume", "top_volume", "premarket"):
-        return TELEGRAM_TOKEN_FLOW or TELEGRAM_TOKEN_DEAL
-    if name in ("momentum", "momentum_reversal"):
-        return TELEGRAM_TOKEN_FLOW or TELEGRAM_TOKEN_DEAL
-    # Fallback to status bot
-    return TELEGRAM_TOKEN_STATUS or TELEGRAM_TOKEN_FLOW or TELEGRAM_TOKEN_DEAL
+# ---------- Telegram helpers ----------
+
+def _pick_alert_token(bot_name: str) -> str:
+    """
+    Right now we just use TELEGRAM_TOKEN_ALERTS for all bots.
+    Kept as a function in case you later want to route different bots.
+    """
+    if TELEGRAM_TOKEN_ALERTS:
+        return TELEGRAM_TOKEN_ALERTS
+    # Fallback to status bot if alerts bot isn't set
+    if TELEGRAM_TOKEN_STATUS:
+        return TELEGRAM_TOKEN_STATUS
+    return ""
 
 
 def send_alert(
@@ -66,20 +62,22 @@ def send_alert(
     """
     Core Telegram send function used by all bots.
 
-    bot_name → picks which token to use.
-    Everything goes to TELEGRAM_CHAT_ALL.
+    bot_name → only used for display in the message.
+    Everything goes to TELEGRAM_CHAT_ALL with TELEGRAM_TOKEN_ALERTS.
     """
     if not TELEGRAM_CHAT_ALL:
         print("ALERT SKIPPED: TELEGRAM_CHAT_ALL not set")
         return
 
-    token = _pick_token(bot_name)
+    token = _pick_alert_token(bot_name)
     if not token:
-        print(f"ALERT SKIPPED: no Telegram token configured for {bot_name}")
+        print(f"ALERT SKIPPED: no Telegram token configured (TELEGRAM_TOKEN_ALERTS)")
         return
 
     title = bot_name.upper().replace("_", " ")
-    msg = f"*{title}* — {symbol}\nPrice: ${last_price:.2f} · RVOL {rvol:.1f}x"
+    msg = f"*{title}* — {symbol}\nPrice: ${last_price:.2f}"
+    if rvol > 0:
+        msg += f" · RVOL {rvol:.1f}x"
 
     if extra:
         msg += f"\n\n{extra}"
@@ -98,9 +96,13 @@ def send_alert(
 
 def send_status_message(text: str) -> None:
     """Optional status helper if you want to send custom messages."""
-    if not TELEGRAM_TOKEN_STATUS or not TELEGRAM_CHAT_ALL:
+    if not TELEGRAM_CHAT_ALL:
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN_STATUS}/sendMessage"
+    token = TELEGRAM_TOKEN_STATUS or TELEGRAM_TOKEN_ALERTS
+    if not token:
+        return
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
         requests.post(
             url,
@@ -114,3 +116,91 @@ def send_status_message(text: str) -> None:
 def start_polygon_websocket():
     # Placeholder – you can wire real websockets later if you want.
     print("Polygon/WebSocket placeholder — using REST scanners only for now.")
+
+
+# ---------- Dynamic top-volume universe ----------
+
+DYNAMIC_UNIVERSE_REFRESH_SEC = int(os.getenv("DYNAMIC_UNIVERSE_REFRESH_SEC", "300"))
+
+_dynamic_universe_cache = {
+    "tickers": [],  # type: List[str]
+    "ts": 0.0,
+}
+
+
+def get_dynamic_top_volume_universe(
+    max_tickers: int = 100,
+    volume_coverage: float = 0.90,
+) -> List[str]:
+    """
+    Returns a list of tickers that:
+      * Are sorted by today's total volume (descending)
+      * Stop when we either:
+          - Reach `max_tickers`, OR
+          - Cumulative volume >= `volume_coverage` of total market volume.
+
+    Uses Polygon snapshot endpoint:
+      /v2/snapshot/locale/us/markets/stocks/tickers
+
+    Result is cached for DYNAMIC_UNIVERSE_REFRESH_SEC seconds.
+    """
+    now_ts = time.time()
+    if (
+        _dynamic_universe_cache["tickers"]
+        and (now_ts - _dynamic_universe_cache["ts"]) < DYNAMIC_UNIVERSE_REFRESH_SEC
+    ):
+        return _dynamic_universe_cache["tickers"]
+
+    if not POLYGON_KEY:
+        print("[universe] POLYGON_KEY not set; returning cached/static universe.")
+        return _dynamic_universe_cache["tickers"] or []
+
+    url = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
+
+    try:
+        resp = requests.get(url, params={"apiKey": POLYGON_KEY}, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        raw_tickers = data.get("tickers", [])
+    except Exception as e:
+        print(f"[universe] Snapshot fetch failed: {e}")
+        return _dynamic_universe_cache["tickers"] or []
+
+    vols = []
+    for t in raw_tickers:
+        try:
+            sym = t.get("ticker")
+            day = t.get("day") or {}
+            vol = float(day.get("v") or 0.0)
+            if not sym or vol <= 0:
+                continue
+            vols.append((sym, vol))
+        except Exception:
+            continue
+
+    if not vols:
+        print("[universe] Snapshot contained no usable tickers.")
+        return _dynamic_universe_cache["tickers"] or []
+
+    vols.sort(key=lambda x: x[1], reverse=True)
+    total_vol = float(sum(v for _, v in vols))
+    selected: List[str] = []
+    cumulative = 0.0
+
+    for sym, vol in vols:
+        selected.append(sym)
+        cumulative += vol
+
+        if len(selected) >= max_tickers:
+            break
+
+        if total_vol > 0 and (cumulative / total_vol) >= volume_coverage:
+            break
+
+    _dynamic_universe_cache["tickers"] = selected
+    _dynamic_universe_cache["ts"] = now_ts
+
+    coverage_pct = (cumulative / total_vol * 100.0) if total_vol else 0.0
+    print(f"[universe] Selected {len(selected)} tickers covering {coverage_pct:.1f}% of volume.")
+
+    return selected
