@@ -1,5 +1,6 @@
 # bots/earnings.py — FINAL WORKING VERSION
-from .shared import send_alert, client
+from .shared import send_alert
+from .helpers import client   # <-- ADD THIS LINE
 from .helpers import get_top_volume_stocks
 import yfinance as yf
 from datetime import datetime, timedelta
