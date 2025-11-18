@@ -1,76 +1,125 @@
-# bots/gap.py — ELITE 2025 GAP SNIPER (2–7 killers per week)
-from .shared import send_alert, client
-from .helpers import get_top_volume_stocks
-from datetime import datetime, time
+import os
+from datetime import date, timedelta
+from typing import List, Optional, Tuple
+
+try:
+    from massive import RESTClient
+except ImportError:
+    from polygon import RESTClient
+
+from bots.shared import POLYGON_KEY, MIN_RVOL_GLOBAL, MIN_VOLUME_GLOBAL, send_alert, get_dynamic_top_volume_universe
+
+_client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
+
+MIN_GAP_PCT = float(os.getenv("MIN_GAP_PCT", "5.0"))  # 5% default
+
+
+def _get_ticker_universe() -> List[str]:
+    env = os.getenv("TICKER_UNIVERSE")
+    if env:
+        return [t.strip().upper() for t in env.split(",") if t.strip()]
+    return get_dynamic_top_volume_universe(max_tickers=100, volume_coverage=0.90)
+
+
+def _calc_intraday_volume_and_price(sym: str, today: date) -> Optional[Tuple[float, float]]:
+    if not _client:
+        return None
+    s = today.isoformat()
+    try:
+        mins = list(
+            _client.list_aggs(
+                ticker=sym,
+                multiplier=1,
+                timespan="minute",
+                from_=s,
+                to=s,
+                limit=10_000,
+            )
+        )
+        if not mins:
+            return None
+        vol_today = float(sum(b.volume for b in mins))
+        last_price = float(mins[-1].close)
+        return last_price, vol_today
+    except Exception as e:
+        print(f"[gap] intraday fetch failed for {sym}: {e}")
+        return None
+
 
 async def run_gap():
-    now = datetime.now()
-    # Only run 9:30 – 10:30 AM EST (gap sweet spot)
-    if now.weekday() >= 5 or now.hour != 9 or now.minute > 59:
+    """
+    Gap up / gap down scanner.
+    """
+    if not POLYGON_KEY:
+        print("[gap] POLYGON_KEY not set; skipping scan.")
         return
-    if now.minute < 30:
+    if not _client:
+        print("[gap] Client not initialized; skipping scan.")
         return
 
-    top_stocks = get_top_volume_stocks(120)
+    universe = _get_ticker_universe()
+    today = date.today()
 
-    for sym in top_stocks:
+    for sym in universe:
         try:
-            # 1. Get yesterday's close & today's open
-            daily = client.get_aggs(sym, 1, "day", limit=3)
-            if len(daily) < 2:
-                continue
-            yesterday = daily[-2]
-            today = daily[-1]
-
-            gap_pct = (today.open - yesterday.close) / yesterday.close * 100
-
-            # 2. ELITE GAP FILTERS
-            if not (4.0 <= abs(gap_pct) <= 35.0):          # 4–35% gaps only
-                continue
-            if gap_pct < 0:                                 # Only gap-ups (fade-downs later)
-                continue
-
-            price = client.get_last_trade(sym).price
-
-            # 3. Volume explosion at open
-            if today.volume < yesterday.volume * 2.8:       # 2.8x+ yesterday's volume
-                continue
-
-            # 4. Price filter — no pennies, no mega-caps
-            if price < 8 or price > 180:
-                continue
-
-            # 5. Float filter — must be low enough to move
-            ticker_info = client.get_ticker_details(sym)
-            shares_float = getattr(ticker_info, 'shares_outstanding', 0) or 0
-            if shares_float == 0 or shares_float > 150_000_000:
-                continue
-
-            # 6. Catalyst check: news in last 24h?
-            news = client.list_ticker_news(sym, limit=5, published_utc_gte=(now - timedelta(days=1)).isoformat())
-            has_news = len(news) > 0 if news else False
-
-            # 7. Final trigger: holding above open + VWAP
-            if price < today.open * 0.985:                  # dipped below open = weak
-                continue
-
-            # GAP SCORE
-            score = min(100, int(
-                gap_pct * 2.2 +
-                (today.volume / yesterday.volume) * 10 +
-                (50 if has_news else 0) +
-                (30 if shares_float < 50_000_000 else 0)
-            ))
-
-            direction = "GAP & GO"
-            extra = (
-                f"{direction} · +{gap_pct:.1f}% GAP\n"
-                f"Float {shares_float/1_000_000:.1f}M · Vol {today.volume:,.0f} ({today.volume/yesterday.volume:.1f}x)\n"
-                f"Price ${price:.2f} · {'News catalyst' if has_news else 'No news'}\n"
-                f"Gap Score: {score}/100"
+            days = list(
+                _client.list_aggs(
+                    ticker=sym,
+                    multiplier=1,
+                    timespan="day",
+                    from_=(today - timedelta(days=10)).isoformat(),
+                    to=today.isoformat(),
+                    limit=15,
+                )
             )
-
-            await send_alert("gap", sym, price, round(today.volume/yesterday.volume, 1), extra)
-
-        except:
+        except Exception as e:
+            print(f"[gap] daily fetch failed for {sym}: {e}")
             continue
+
+        if len(days) < 2:
+            continue
+
+        prev = days[-2]
+        today_bar = days[-1]
+
+        prev_close = float(prev.close)
+        today_open = float(today_bar.open or today_bar.close)
+
+        if prev_close <= 0:
+            continue
+
+        gap_pct = (today_open - prev_close) / prev_close * 100.0
+        if abs(gap_pct) < MIN_GAP_PCT:
+            continue
+
+        hist = days[:-1]
+        if hist:
+            recent = hist[-20:] if len(hist) > 20 else hist
+            avg_vol = float(sum(d.volume for d in recent)) / len(recent)
+        else:
+            avg_vol = float(today_bar.volume)
+
+        if avg_vol <= 0:
+            rvol = 1.0
+        else:
+            rvol = float(today_bar.volume) / avg_vol
+
+        if rvol < MIN_RVOL_GLOBAL:
+            continue
+
+        intraday = _calc_intraday_volume_and_price(sym, today)
+        if not intraday:
+            continue
+        last_price, vol_today = intraday
+
+        if vol_today < MIN_VOLUME_GLOBAL:
+            continue
+
+        direction = "GAP UP" if gap_pct > 0 else "GAP DOWN"
+        extra = (
+            f"{direction} {gap_pct:.1f}%\n"
+            f"Prev Close ${prev_close:.2f} → Open ${today_open:.2f}\n"
+            f"RVOL {rvol:.1f}x · Intraday Vol {int(vol_today):,}"
+        )
+
+        send_alert("gap", sym, last_price, rvol, extra=extra)
