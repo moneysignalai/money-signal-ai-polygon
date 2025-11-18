@@ -1,12 +1,18 @@
-from .shared import send_alert
-from .helpers import client   # <-- ADD THIS LINE
+# bots/premarket.py — ELITE: ONLY +8% WITH VOLUME
+from .shared import send_alert, client
 from datetime import datetime
+
 async def run_premarket():
-    n = datetime.now()
-    if n.hour >= 9 or n.hour < 4 or n.minute % 15 != 0: return
+    now = datetime.now()
+    if now.hour < 4 or now.hour >= 9 or now.minute % 12 != 0:
+        return
+
     try:
-        movers = client.get_snapshot_gainers_losers("gainers", "stocks")
-        for m in movers[:15]:
-            if m.change_percent > 8:
-                await send_alert("premarket", m.ticker, m.last_quote.ask, 0, f"+{m.change_percent:.1f}%")
-    except: pass
+        movers = client.get_snapshot_gainers_losers(direction="gainers", market_type="stocks")
+        for m in movers[:20]:
+            if m.change_percent >= 8.0 and m.volume >= 500_000:
+                await send_alert("premarket", m.ticker, m.last_quote.ask, 0,
+                                 f"PRE-MARKET RUNNER +{m.change_percent:.1f}%\n"
+                                 f"Volume {m.volume:,} · Gapper setting up")
+    except:
+        pass
