@@ -1,17 +1,11 @@
-# bots/orb.py — WILL FIRE ALERTS AFTER 9:45 AM
-from .shared import client, send_alert
-from .helpers import get_top_500_universe
-from datetime import datetime, time
-
+from .shared import send_alert
+from .helpers import get_top_volume_stocks
+from datetime import datetime
 async def run_orb():
-    now = datetime.now()
-    if now.weekday() >= 5 or now.hour < 9 or (now.hour == 9 and now.minute < 30):
-        return
-
-    for sym in get_top_500_universe()[:30]:
+    n = datetime.now()
+    if n.weekday() >= 5 or n.hour < 9 or (n.hour == 9 and n.minute < 35): return
+    for sym in get_top_volume_stocks(120):
         try:
-            price = client.get_last_trade(sym).price
-            extra = f"ORB BREAKOUT {sym} @ ${price:.2f}\nPrice moving fast after 9:30 range"
-            await send_alert("orb", sym, price, 2.1, extra)
-        except:
-            continue
+            p = client.get_last_trade(sym).price
+            await send_alert("orb", sym, p, 2.5, "ORB BREAKOUT")
+        except: continue
