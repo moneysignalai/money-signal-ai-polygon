@@ -1,12 +1,8 @@
-# bots/shared.py — FIXED WITH CLIENT ADDED (copy-paste this entire file)
+# bots/shared.py — FINAL CLEAN VERSION
 import os
 import requests
 from datetime import datetime
 import pytz
-from polygon import RESTClient   # ← THIS WAS MISSING — FIXED
-
-# Polygon client for ALL bots to use
-client = RESTClient(os.getenv("POLYGON_KEY"))
 
 eastern = pytz.timezone('US/Eastern')
 def now_est():
@@ -28,19 +24,17 @@ def send_alert(bot_name: str, ticker: str, price: float, rvol: float, extra: str
 
 def send_status():
     if not TELEGRAM_TOKEN_STATUS or not TELEGRAM_CHAT_ALL: return
-    msg = f"""*MoneySignalAi — SYSTEM HEALTHY*
+    msg = f"""*MoneySignalAi — LIVE & SCANNING*
 {now_est()}
 
-9 bots scanning top volume stocks
+9 bots active · Top volume universe
 Polygon connected · Zero errors
-Next windows: Pre-market, ORB, Power Hour
 
-Everything perfect — waiting for setups"""
+Waiting for setups..."""
     try:
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN_STATUS}/sendMessage",
                       data={"chat_id": TELEGRAM_CHAT_ALL, "text": msg, "parse_mode": "Markdown"})
-        print("STATUS REPORT SENT")
     except: pass
 
 def start_polygon_websocket():
-    print("Polygon WebSocket CONNECTED — ELITE SUITE LIVE")
+    print("Polygon WebSocket CONNECTED")
