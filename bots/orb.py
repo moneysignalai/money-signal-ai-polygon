@@ -1,74 +1,120 @@
-# bots/orb.py — ELITE SNIPER VERSION (3–8 alerts/day, 70%+ win rate)
-from .shared import send_alert, client
-from .helpers import get_top_volume_stocks
-from datetime import datetime, time, timedelta
+import os
+from datetime import date, timedelta
+from typing import List
+
+try:
+    from massive import RESTClient
+except ImportError:
+    from polygon import RESTClient
+
+from bots.shared import POLYGON_KEY, MIN_RVOL_GLOBAL, MIN_VOLUME_GLOBAL, send_alert, get_dynamic_top_volume_universe
+
+_client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
+
+ORB_MINUTES = int(os.getenv("ORB_MINUTES", "15"))
+
+
+def _get_ticker_universe() -> List[str]:
+    env = os.getenv("TICKER_UNIVERSE")
+    if env:
+        return [t.strip().upper() for t in env.split(",") if t.strip()]
+    return get_dynamic_top_volume_universe(max_tickers=100, volume_coverage=0.90)
+
 
 async def run_orb():
-    now = datetime.now()
-    # Only run 9:35 AM – 11:00 AM EST (best ORB window)
-    if now.weekday() >= 5 or now.hour < 9 or now.hour > 11:
+    """
+    Opening Range Breakout (ORB) bot.
+    """
+    if not POLYGON_KEY:
+        print("[orb] POLYGON_KEY not set; skipping scan.")
         return
-    if now.hour == 9 and now.minute < 35:
+    if not _client:
+        print("[orb] Client not initialized; skipping scan.")
         return
 
-    for sym in get_top_volume_stocks(120):
+    universe = _get_ticker_universe()
+    today = date.today()
+    today_s = today.isoformat()
+
+    for sym in universe:
         try:
-            # 1. Get 9:30–9:45 range (true ORB)
-            start = datetime.combine(now.date(), time(9, 30))
-            end = start + timedelta(minutes=15)
-            bars = client.get_aggs(sym, 1, "minute", from_=start.date(), to=end.date(), limit=20)
-            if len(bars) < 10:
-                continue
-
-            df = __import__("pandas").DataFrame([b.__dict__ for b in bars])
-            orb_high = df["high"].max()
-            orb_low = df["low"].min()
-            orb_range = orb_high - orb_low
-
-            # Filter 1: Range must be decent size
-            if orb_range < 0.6:  # $0.60 minimum range
-                continue
-
-            current_price = client.get_last_trade(sym).price
-
-            # Filter 2: Clean breakout (at least 1.5× the range)
-            if current_price > orb_high:
-                direction = "LONG"
-                breakout_strength = (current_price - orb_high) / orb_range
-            elif current_price < orb_low:
-                direction = "SHORT"
-                breakout_strength = (orb_low - current_price) / orb_range
-            else:
-                continue
-
-            if breakout_strength < 1.5:  # must break by 150% of range
-                continue
-
-            # Filter 3: Volume surge on breakout
-            today_bars = client.get_aggs(sym, 1, "day", limit=2)
-            if len(today_bars) < 2:
-                continue
-            avg_vol = today_bars[0].volume
-            today_vol = today_bars[1].volume
-            if today_vol < avg_vol * 1.8:  # RVOL 1.8x+
-                continue
-
-            # Filter 4: Price > $8 (avoid penny junk)
-            if current_price < 8:
-                continue
-
-            # Filter 5: Relative volume rank (top 100 only)
-            # (already handled by get_top_volume_stocks)
-
-            extra = (
-                f"ORB {direction} BREAK\n"
-                f"Range: ${orb_low:.2f} – ${orb_high:.2f} (${orb_range:.2f})\n"
-                f"Break: {breakout_strength:.1f}x range strength\n"
-                f"RVOL {today_vol/avg_vol:.1f}x · Price ${current_price:.2f}\n"
-                f"High-conviction setup"
+            mins = list(
+                _client.list_aggs(
+                    ticker=sym,
+                    multiplier=1,
+                    timespan="minute",
+                    from_=today_s,
+                    to=today_s,
+                    limit=10_000,
+                )
             )
-
-            await send_alert("orb", sym, current_price, round(today_vol/avg_vol, 1), extra)
-
-        except:
+        except Exception as e:
+            print(f"[orb] minute fetch failed for {sym}: {e}")
             continue
+
+        if len(mins) < ORB_MINUTES + 5:
+            continue
+
+        orb_slice = mins[:ORB_MINUTES]
+        rest = mins[ORB_MINUTES:]
+        if not rest:
+            continue
+
+        orb_high = max(b.high for b in orb_slice)
+        orb_low = min(b.low for b in orb_slice)
+        last_bar = rest[-1]
+        last_price = float(last_bar.close)
+
+        try:
+            days = list(
+                _client.list_aggs(
+                    ticker=sym,
+                    multiplier=1,
+                    timespan="day",
+                    from_=(today - timedelta(days=30)).isoformat(),
+                    to=today_s,
+                    limit=50,
+                )
+            )
+        except Exception as e:
+            print(f"[orb] daily fetch failed for {sym}: {e}")
+            continue
+
+        if not days:
+            continue
+
+        today_day = days[-1]
+        hist = days[:-1]
+        if hist:
+            recent = hist[-20:] if len(hist) > 20 else hist
+            avg_vol = float(sum(d.volume for d in recent)) / len(recent)
+        else:
+            avg_vol = float(today_day.volume)
+
+        if avg_vol > 0:
+            rvol = float(today_day.volume) / avg_vol
+        else:
+            rvol = 1.0
+
+        if rvol < MIN_RVOL_GLOBAL:
+            continue
+
+        vol_today = float(today_day.volume)
+        if vol_today < MIN_VOLUME_GLOBAL:
+            continue
+
+        direction = None
+        if last_price > orb_high:
+            direction = "BREAKOUT UP"
+        elif last_price < orb_low:
+            direction = "BREAKDOWN DOWN"
+
+        if not direction:
+            continue
+
+        extra = (
+            f"{direction} of {ORB_MINUTES}-min opening range\n"
+            f"Range: {orb_low:.2f} – {orb_high:.2f}\n"
+            f"Last: {last_price:.2f} · RVOL {rvol:.1f}x · Vol {int(vol_today):,}"
+        )
+        send_alert("orb", sym, last_price, rvol, extra=extra)
