@@ -1,4 +1,5 @@
-from .shared import send_alert, client
+from .shared import send_alert
+from .helpers import client   # <-- ADD THIS LINE
 async def run_unusual():
     try:
         trades = client.list_trades("O:*", limit=800)
