@@ -1,4 +1,5 @@
-from .shared import send_alert, client
+from .shared import send_alert
+from .helpers import client   # <-- ADD THIS LINE
 from datetime import datetime
 async def run_premarket():
     n = datetime.now()
