@@ -15,6 +15,7 @@ from bots.squeeze import run_squeeze
 from bots.unusual import run_unusual
 from bots.volume import run_volume
 from bots.momentum_reversal import run_momentum_reversal
+from bots.premarket import run_premarket
 from bots.shared import (
     now_est,
     TELEGRAM_CHAT_ALL,
@@ -22,7 +23,7 @@ from bots.shared import (
     start_polygon_websocket,
 )
 
-app = FastAPI(title="MoneySignalAi — MEGA BOT (9 strategies)")
+app = FastAPI(title="MoneySignalAi — MEGA BOT (9 strategies + status)")
 
 
 @app.get("/")
@@ -33,10 +34,13 @@ def root():
 
 def send_status() -> None:
     """
-    Send a periodic mega-bot status message to Telegram.
+    Status-report bot.
 
-    Uses TELEGRAM_TOKEN_STATUS and TELEGRAM_CHAT_ALL from the environment.
-    If not configured, this quietly does nothing.
+    Uses:
+      - TELEGRAM_TOKEN_STATUS (status bot token)
+      - TELEGRAM_CHAT_ALL    (where to send the message)
+
+    Sends a summary that the scanners + loop are running.
     """
     if not TELEGRAM_CHAT_ALL:
         print("STATUS: TELEGRAM_CHAT_ALL not set")
@@ -48,19 +52,21 @@ def send_status() -> None:
         return
 
     message = f"""*MoneySignalAi — MEGA BOT STATUS*  
-{now_est()}  
+{now_est()}
 
-✅ Premarket / Top Volume scanner  
+✅ Premarket scanner  
+✅ Top Volume scanner  
 ✅ ORB strategy  
-✅ Short squeeze  
-✅ Unusual option buyers  
-✅ Cheap 0DTE + 3DTE  
-✅ Gap up / Gap down  
-✅ Earnings  
-✅ Momentum reversal  
+✅ Short Squeeze scanner  
+✅ Unusual Option Buyers  
+✅ Cheap 0DTE / 3DTE scanner  
+✅ Gap Up / Gap Down scanner  
+✅ Earnings Movers scanner  
+✅ Momentum Reversal scanner  
 
 Polygon: REST scanners active  
-Scanner loop: running every 30 seconds."""
+Loop: running every 30 seconds on Render.
+"""
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
@@ -81,30 +87,33 @@ Scanner loop: running every 30 seconds."""
 async def run_all_once() -> None:
     """
     Run one full scan of all bots in parallel.
-    Each bot internally decides what to alert on.
+
+    Each bot is async, and will decide internally whether it has any alerts.
     """
     tasks = [
-        run_cheap(),
-        run_earnings(),
-        run_gap(),
-        run_orb(),
-        run_squeeze(),
-        run_unusual(),
-        run_volume(),
-        run_momentum_reversal(),
+        run_premarket(),          # NEW: premarket snapshot bot
+        run_volume(),             # Top daily volume / intraday
+        run_gap(),                # Gap up / gap down
+        run_orb(),                # Opening range breakout
+        run_squeeze(),            # Short-squeeze style
+        run_unusual(),            # Unusual options flow
+        run_cheap(),              # Cheap 0DTE/3DTE
+        run_earnings(),           # Earnings movers
+        run_momentum_reversal(),  # Intraday momentum reversal
     ]
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     bot_names = [
-        "cheap",
-        "earnings",
+        "premarket",
+        "volume",
         "gap",
         "orb",
         "squeeze",
         "unusual",
-        "volume",
-        "momentum",
+        "cheap",
+        "earnings",
+        "momentum_reversal",
     ]
 
     for name, result in zip(bot_names, results):
@@ -128,11 +137,11 @@ def run_forever() -> None:
         cycle += 1
         print(f"SCAN #{cycle} @ {now_est()}")
         print(
-            "SCANNING: Premarket/Top Volume, ORB, Short Squeeze, "
-            "Unusual Options, Cheap 0DTE/3DTE, Gaps, Earnings, Momentum"
+            "SCANNING: Premarket, Volume, Gaps, ORB, Squeeze, "
+            "Unusual, Cheap 0DTE/3DTE, Earnings, Momentum Reversal"
         )
 
-        # every ~2 hours (30s * 240)
+        # Every ~2 hours: 30 seconds * 240 cycles
         if cycle % 240 == 0:
             send_status()
 
