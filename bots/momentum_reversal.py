@@ -1,5 +1,6 @@
 # bots/momentum_reversal.py — FINAL WORKING VERSION
-from .shared import send_alert, client
+from .shared import send_alert
+from .helpers import client   # <-- ADD THIS LINE
 from .helpers import get_top_volume_stocks
 from datetime import datetime
 
