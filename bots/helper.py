@@ -1,27 +1,34 @@
-# bots/helpers.py — REAL TOP VOLUME UNIVERSE
+# bots/helpers.py — MUST EXIST (this was missing!)
 from polygon import RESTClient
 import os
-from datetime import datetime
 
+# Global Polygon client (shared with shared.py)
 client = RESTClient(os.getenv("POLYGON_KEY"))
 
 def get_top_volume_stocks(limit=150):
+    """Returns real top volume stocks from Polygon"""
     try:
         snapshot = client.get_snapshot_all(tickers=None)
         stocks = []
         for s in snapshot:
-            if hasattr(s, 'day') and s.day and s.day.v > 300_000:
-                stocks.append((s.ticker, s.day.v))
+            if hasattr(s, 'day') and s.day and getattr(s.day, 'v', 0) > 300_000:
+                stocks.append((s.ticker, getattr(s.day, 'v', 0)))
         stocks.sort(key=lambda x: x[1], reverse=True)
         return [x[0] for x in stocks[:limit]]
     except:
-        return ["NVDA","TSLA","AAPL","AMD","SMCI","SPY","QQQ","IWM","T","F","AMC","GME","PLTR","SOFI","HOOD","MARA","RIOT","CLSK","CLOV","RIVN","LCID","NIO","XPEV","LI","AUR","IONQ","ASTS","DJT","MSTR","COIN","UPST","RBLX","PATH","SNOW","CRWD","NET","ZS","OKLO","SMR","BBAI","SOUN","HIMS","ARM"]
+        # Fallback list if API fails
+        return [
+            "NVDA","TSLA","AAPL","AMD","SMCI","SPY","QQQ","IWM","T","F","AMC","GME","PLTR",
+            "SOFI","HOOD","MARA","RIOT","CLSK","CLOV","RIVN","LCID","NIO","XPEV","LI",
+            "AUR","IONQ","ASTS","DJT","MSTR","COIN","UPST","RBLX","PATH","SNOW","CRWD",
+            "NET","ZS","OKLO","SMR","BBAI","SOUN","HIMS","ARM","ANET","AVGO","NFLX"
+        ]
 
-# Dummies so nothing crashes
-def mtf_confirm(*args): return True
-def is_edge_option(*args): return True
-def get_confidence_score(*args): return 95
-def get_greeks(*args):
+# Dummy functions so nothing crashes
+def mtf_confirm(*a): return True
+def is_edge_option(*a): return True
+def get_confidence_score(*a): return 95
+def get_greeks(*a):
     class X: ask=1.40; delta=0.60; gamma=0.10; implied_volatility=0.75; volume=12000; open_interest=18000
     return X()
-def build_rh_link(sym, *args): return f"https://robinhood.com/us/en/stocks/{sym}/"
+def build_rh_link(sym, *a): return f"https://robinhood.com/us/en/stocks/{sym}/"
