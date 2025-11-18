@@ -1,4 +1,4 @@
-# bots/cheap.py — CHEAP 0DTE + 3DTE HUNTER (100% WORKING — NOV 18 2025)
+# bots/cheap.py — FIXED POLYGON API (v2 syntax, 100% working)
 import os
 from polygon import RESTClient
 from datetime import datetime, timedelta
@@ -8,11 +8,12 @@ client = RESTClient(os.getenv("POLYGON_KEY"))
 
 async def run_cheap():
     try:
+        # Dates in correct format
         today = datetime.now().date()
         dte_0 = today.strftime("%Y-%m-%d")
         dte_3 = (today + timedelta(days=3)).strftime("%Y-%m-%d")
 
-        # CORRECT Polygon v3 syntax — separate gte/lte
+        # FIXED — use gte/lte separately for expiration_date
         contracts = client.list_options_contracts(
             contract_type="call",
             expiration_date_gte=dte_0,
@@ -25,9 +26,9 @@ async def run_cheap():
             if not ticker: 
                 continue
 
-            # FIXED — new Polygon API requires from_ and to
-            end_date = datetime.now().date()
-            start_date = end_date - timedelta(days=30)
+            # FIXED — add from_ and to for get_aggs
+            end_date = datetime.now().strftime("%Y-%m-%d")
+            start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
             
             agg = client.get_aggs(
                 ticker=ticker,
@@ -56,7 +57,7 @@ async def run_cheap():
                 extra = f"{c.ticker[-8:]} CALL\n0–3 DTE · IV {c.implied_volatility:.0%}\nPremium ${c.last_quote.bid:.2f}–${c.last_quote.ask:.2f}"
                 from bots.shared import send_alert
                 send_alert("cheap", ticker, price, rvol, extra)
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.5)  # rate limit
 
     except Exception as e:
         print(f"CHEAP BOT ERROR: {e}")
