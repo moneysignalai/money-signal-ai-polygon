@@ -1,4 +1,3 @@
-# bots/shared.py — FINAL VERSION (NO IMPORT OF CLIENT HERE)
 import os
 import requests
 from datetime import datetime
@@ -24,11 +23,11 @@ def send_alert(bot_name: str, ticker: str, price: float, rvol: float, extra: str
 
 def send_status():
     if not TELEGRAM_TOKEN_STATUS or not TELEGRAM_CHAT_ALL: return
-    msg = f"*MoneySignalAi — LIVE*\n{now_est()}\n\n9 bots running · Top volume active\nReady for setups"
+    msg = f"*MoneySignalAi — LIVE*\n{now_est()}\n\n9 bots running · Top volume active"
     try:
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN_STATUS}/sendMessage",
                       data={"chat_id": TELEGRAM_CHAT_ALL, "text": msg, "parse_mode": "Markdown"})
     except: pass
 
 def start_polygon_websocket():
-    print("Polygon connected — scanning")
+    print("Polygon connected")
