@@ -1,4 +1,5 @@
 from .shared import send_alert
+from .helpers import client   # <-- ADD THIS LINE
 from .helpers import get_top_volume_stocks
 from datetime import datetime
 async def run_orb():
