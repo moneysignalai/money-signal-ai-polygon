@@ -8,12 +8,11 @@ client = RESTClient(os.getenv("POLYGON_KEY"))
 
 async def run_cheap():
     try:
-        # Get today and +3 days
         today = datetime.now().date()
         dte_0 = today.strftime("%Y-%m-%d")
         dte_3 = (today + timedelta(days=3)).strftime("%Y-%m-%d")
 
-        # CORRECT WAY — use expiration_date_gte and lte separately
+        # CORRECT Polygon v3 syntax — separate gte/lte
         contracts = client.list_options_contracts(
             contract_type="call",
             expiration_date_gte=dte_0,
@@ -26,15 +25,27 @@ async def run_cheap():
             if not ticker: 
                 continue
 
-            # Get stock data
-            agg = client.get_aggs(ticker, 1, "day", limit=30)
+            # FIXED — new Polygon API requires from_ and to
+            end_date = datetime.now().date()
+            start_date = end_date - timedelta(days=30)
+            
+            agg = client.get_aggs(
+                ticker=ticker,
+                multiplier=1,
+                timespan="day",
+                from_=start_date,
+                to=end_date,
+                limit=1000
+            )
+
             if len(agg) < 2: 
                 continue
+                
             price = agg[-1].close
             if price > 25.0: 
                 continue
 
-            avg_vol = sum(a.volume for a in agg[:-1]) / 29
+            avg_vol = sum(a.volume for a in agg[:-1]) / len(agg[:-1])
             today_vol = agg[-1].volume
             rvol = round(today_vol / avg_vol, 1) if avg_vol > 0 else 0
 
