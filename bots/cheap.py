@@ -1,5 +1,6 @@
 # bots/cheap.py — ELITE 2025 VERSION (4–12 high-conviction alerts/day)
-from .shared import send_alert, client
+from .shared import send_alert
+from .helpers import client
 from datetime import datetime, timedelta
 
 async def run_cheap():
