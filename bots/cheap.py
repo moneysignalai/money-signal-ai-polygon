@@ -1,72 +1,125 @@
-# bots/cheap.py — ELITE 2025 VERSION (4–12 high-conviction alerts/day)
-from .shared import send_alert
-from .helpers import client
-from datetime import datetime, timedelta
+import os
+from datetime import date
+from typing import List, Optional
+
+try:
+    from massive import RESTClient
+except ImportError:
+    from polygon import RESTClient
+
+from bots.shared import POLYGON_KEY, send_alert, get_dynamic_top_volume_universe
+
+_client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
+
+MIN_CHEAP_OPTION_VOL = int(os.getenv("MIN_CHEAP_OPTION_VOL", "200"))
+CHEAP_MIN_PRICE = float(os.getenv("CHEAP_MIN_PRICE", "0.05"))
+CHEAP_MAX_PRICE = float(os.getenv("CHEAP_MAX_PRICE", "1.00"))
+MAX_CONTRACTS_PER_UNDERLYING = int(os.getenv("CHEAP_MAX_CONTRACTS_PER_UNDERLYING", "60"))
+
+
+def _get_ticker_universe() -> List[str]:
+    env = os.getenv("TICKER_UNIVERSE")
+    if env:
+        return [t.strip().upper() for t in env.split(",") if t.strip()]
+    return get_dynamic_top_volume_universe(max_tickers=100, volume_coverage=0.90)
+
+
+def _safe_parse_date(d: Optional[str]) -> Optional[date]:
+    if not d:
+        return None
+    try:
+        return date.fromisoformat(d)
+    except Exception:
+        return None
+
 
 async def run_cheap():
-    today = datetime.now().date()
-    # Scan 0–5 DTE calls only (0DTE + next week)
-    contracts = client.list_options_contracts(
-        contract_type="call",
-        expiration_date_gte=today.strftime("%Y-%m-%d"),
-        expiration_date_lte=(today + timedelta(days=5)).strftime("%Y-%m-%d"),
-        limit=1000
-    )
+    """
+    Cheap 0DTE / 3DTE options scanner.
+    """
+    if not POLYGON_KEY:
+        print("[cheap] POLYGON_KEY not set; skipping scan.")
+        return
+    if not _client:
+        print("[cheap] Client not initialized; skipping scan.")
+        return
 
-    seen = set()
-    for c in contracts:
-        ticker = c.underlying_ticker
-        if not ticker or ticker in seen or ticker.startswith("^"):
+    universe = _get_ticker_universe()
+    today = date.today()
+    today_s = today.isoformat()
+
+    for sym in universe:
+        try:
+            last_trade = _client.get_last_trade(ticker=sym)
+            underlying_px = float(last_trade.price)
+        except Exception as e:
+            print(f"[cheap] get_last_trade failed for {sym}: {e}")
             continue
-        seen.add(ticker)
 
         try:
-            # Daily bars for RVOL & price
-            bars = client.get_aggs(ticker, 1, "day", from_=(today - timedelta(days=60)).date(), limit=60)
-            if len(bars) < 20:
-                continue
-            df = __import__("pandas").DataFrame([b.__dict__ for b in bars])
-            price = df["close"].iloc[-1]
+            contracts_gen = _client.list_options_contracts(
+                underlying_ticker=sym,
+                as_of=today_s,
+                limit=1000,
+            )
+        except Exception as e:
+            print(f"[cheap] list_options_contracts failed for {sym}: {e}")
+            continue
 
-            # ELITE FILTERS — ONLY THE BEST
-            if not (10 <= price <= 80):                    # $10–$80 sweet spot
-                continue
-            if price < 15 and c.implied_volatility < 0.85: # sub-$15 needs huge IV
-                continue
-            if price >= 15 and c.implied_volatility < 0.55: # $15+ needs decent IV
-                continue
+        count = 0
+        for c in contracts_gen:
+            if count >= MAX_CONTRACTS_PER_UNDERLYING:
+                break
+            count += 1
 
-            # RVOL must be strong
-            avg_vol = df["volume"].iloc[:-1].mean()
-            today_vol = df["volume"].iloc[-1]
-            rvol = today_vol / avg_vol if avg_vol > 0 else 0
-            if rvol < 1.7:                                  # minimum 1.7x RVOL
+            exp = _safe_parse_date(getattr(c, "expiration_date", None))
+            if not exp:
                 continue
-
-            # Volume must be real (not just 100k shares)
-            if today_vol < 800_000:
+            dte = (exp - today).days
+            if dte < 0 or dte > 3:
                 continue
 
-            # Option must have decent liquidity
-            if c.last_quote.ask > 3.0 or c.last_quote.bid < 0.30:
-                continue
-            if c.volume < 300 and c.open_interest < 1000:   # some real interest
+            contract_ticker = getattr(c, "ticker", None)
+            if not contract_ticker:
                 continue
 
-            # Final killer filter: bid/ask spread < 25%
-            if c.last_quote.bid > 0 and (c.last_quote.ask - c.last_quote.bid) / c.last_quote.bid > 0.25:
+            try:
+                bars = list(
+                    _client.list_aggs(
+                        ticker=contract_ticker,
+                        multiplier=1,
+                        timespan="minute",
+                        from_=today_s,
+                        to=today_s,
+                        limit=5_000,
+                    )
+                )
+            except Exception as e:
+                print(f"[cheap] list_aggs failed for {contract_ticker}: {e}")
                 continue
 
-            # Build elite message
-            dte = (datetime.strptime(c.expiration_date, "%Y-%m-%d").date() - today).days
-            extra = (
-                f"CHEAP {dte}DTE CALL · ${price:.2f}\n"
-                f"IV {c.implied_volatility:.0%} · RVOL {rvol:.1f}x · Vol {today_vol:,.0f}\n"
-                f"Premium ${c.last_quote.bid:.2f}–${c.last_quote.ask:.2f} · Spread {(c.last_quote.ask-c.last_quote.bid)/c.last_quote.bid:.0%}\n"
-                f"Strike ${c.strike_price} · Vol {c.volume:,} · OI {c.open_interest:,}"
+            if not bars:
+                continue
+
+            vol_today = float(sum(b.volume for b in bars))
+            if vol_today < MIN_CHEAP_OPTION_VOL:
+                continue
+
+            avg_px = float(
+                sum(b.close * b.volume for b in bars) / max(vol_today, 1.0)
             )
 
-            await send_alert("cheap", ticker, price, round(rvol, 1), extra)
+            if not (CHEAP_MIN_PRICE <= avg_px <= CHEAP_MAX_PRICE):
+                continue
 
-        except:
-            continue
+            side = getattr(c, "contract_type", "unknown").upper()
+            strike = float(getattr(c, "strike_price", 0.0) or 0.0)
+            notional = avg_px * vol_today * 100.0
+
+            extra = (
+                f"Cheap {side} {contract_ticker}\n"
+                f"{sym} ≈ {underlying_px:.2f} | Strike {strike:.2f} | DTE {dte}\n"
+                f"Avg Price ${avg_px:.2f} · Volume {int(vol_today):,} · Notional ≈ ${notional:,.0f}"
+            )
+
+            send_alert("cheap", sym, underlying_px, 0.0, extra=extra)
