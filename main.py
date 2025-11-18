@@ -38,27 +38,31 @@ def send_status() -> None:
     Uses TELEGRAM_TOKEN_STATUS and TELEGRAM_CHAT_ALL from the environment.
     If not configured, this quietly does nothing.
     """
-    if not TELEGRAM_TOKEN_STATUS or not TELEGRAM_CHAT_ALL:
-        print("STATUS: missing TELEGRAM_TOKEN_STATUS or TELEGRAM_CHAT_ALL")
+    if not TELEGRAM_CHAT_ALL:
+        print("STATUS: TELEGRAM_CHAT_ALL not set")
+        return
+
+    token = TELEGRAM_TOKEN_STATUS
+    if not token:
+        print("STATUS: TELEGRAM_TOKEN_STATUS not set (skipping status send)")
         return
 
     message = f"""*MoneySignalAi — MEGA BOT STATUS*  
 {now_est()}  
 
-✅ Premarket scanner  
+✅ Premarket / Top Volume scanner  
 ✅ ORB strategy  
 ✅ Short squeeze  
 ✅ Unusual option buyers  
 ✅ Cheap 0DTE + 3DTE  
 ✅ Gap up / Gap down  
 ✅ Earnings  
-✅ Top daily volume  
 ✅ Momentum reversal  
 
-Polygon WebSocket: connected  
-Scanner: running every 30 seconds."""
+Polygon: REST scanners active  
+Scanner loop: running every 30 seconds."""
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN_STATUS}/sendMessage"
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
         requests.post(
             url,
@@ -77,9 +81,7 @@ Scanner: running every 30 seconds."""
 async def run_all_once() -> None:
     """
     Run one full scan of all bots in parallel.
-
-    For now this just calls every bot once. Each bot should internally
-    decide if it should do anything (e.g. time windows, filters).
+    Each bot internally decides what to alert on.
     """
     tasks = [
         run_cheap(),
@@ -126,8 +128,8 @@ def run_forever() -> None:
         cycle += 1
         print(f"SCAN #{cycle} @ {now_est()}")
         print(
-            "SCANNING: Premarket, ORB, Short Squeeze, "
-            "Unusual, Cheap 0DTE/3DTE, Gaps, Earnings, Volume, Momentum"
+            "SCANNING: Premarket/Top Volume, ORB, Short Squeeze, "
+            "Unusual Options, Cheap 0DTE/3DTE, Gaps, Earnings, Momentum"
         )
 
         # every ~2 hours (30s * 240)
