@@ -109,7 +109,7 @@ def run_forever():
         cycle += 1
         now = now_est()
         print(f"SCAN #{cycle} @ {now}")
-        if cycle % 60 == 0:  # every 30 minutes
+        if cycle % 260 == 0:  # every 2 hours
             send_status()
         asyncio.new_event_loop().run_until_complete(run_all_once())
         time.sleep(30)
