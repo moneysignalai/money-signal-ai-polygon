@@ -115,15 +115,6 @@ def run_forever():
         # ←←← ONLY CHANGE #1: Added scanning log so you can see it’s working
         print("SCANNING: Cheap, Earnings, Gap, ORB, Squeeze, Unusual, Volume, Momentum")
 
-        # ←←← ONLY CHANGE #2: One guaranteed alert so you SEE it works
-        if not alerted:
-            send_alert("orb", "SMCI", 19.10, 4.6,
-                "ORB breakout above 15-min high\n"
-                "Volume exploding · RVOL 4.6x\n"
-                "Target $23+ · Stop $18.30\n"
-                "LIVE RIGHT NOW — ELITE SETUP")
-            alerted = True
-
         if cycle % 260 == 0:  # every 2 hours
             send_status()
             
