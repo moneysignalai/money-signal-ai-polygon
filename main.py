@@ -111,15 +111,6 @@ def run_forever():
         cycle += 1
         now = now_est()
         print(f"SCAN #{cycle} @ {now}")
-        
-        # ONE GUARANTEED ALERT IN 30–60 SECONDS — PROOF IT WORKS
-        if not alerted:
-            send_alert("orb", "SMCI", 19.10, 4.6,
-                "ORB breakout above 15-min high\n"
-                "Volume exploding · RVOL 4.6x\n"
-                "Target $23+ · Stop $18.30\n"
-                "LIVE RIGHT NOW — ELITE SETUP")
-            alerted = True
 
         if cycle % 260 == 0:  # every 2 hours
             send_status()
