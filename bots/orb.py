@@ -104,17 +104,21 @@ async def run_orb():
             continue
 
         direction = None
+        emoji = ""
         if last_price > orb_high:
-            direction = "BREAKOUT UP"
+            direction = "Breakout above opening range"
+            emoji = "🚀"
         elif last_price < orb_low:
-            direction = "BREAKDOWN DOWN"
+            direction = "Breakdown below opening range"
+            emoji = "📉"
 
         if not direction:
             continue
 
         extra = (
-            f"{direction} of {ORB_MINUTES}-min opening range\n"
-            f"Range: {orb_low:.2f} – {orb_high:.2f}\n"
-            f"Last: {last_price:.2f} · RVOL {rvol:.1f}x · Vol {int(vol_today):,}"
+            f"{emoji} {direction} ({ORB_MINUTES}-min)\n"
+            f"📏 Range: {orb_low:.2f} – {orb_high:.2f}\n"
+            f"📦 Day Vol: {int(vol_today):,}"
         )
+
         send_alert("orb", sym, last_price, rvol, extra=extra)
