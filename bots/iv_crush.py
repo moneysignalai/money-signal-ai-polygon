@@ -1,289 +1,261 @@
 # bots/iv_crush.py
 
 import os
-from datetime import date, timedelta, datetime
-from typing import List, Any
 import math
-import pytz
+import time
+import logging
+from datetime import datetime, timezone
+from typing import List, Dict, Any
 
-try:
-    from massive import RESTClient
-except ImportError:
-    from polygon import RESTClient
+import requests
+from polygon import RESTClient  # or massive.RESTClient if you've migrated
 
-from bots.shared import (
-    POLYGON_KEY,
-    MIN_RVOL_GLOBAL,
-    MIN_VOLUME_GLOBAL,
-    send_alert,
-    get_dynamic_top_volume_universe,
-    grade_equity_setup,
-    is_etf_blacklisted,
-    chart_link,
-)
+# ───────────────────────────────
+# ENV & CONSTANTS
+# ───────────────────────────────
 
-_client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
-eastern = pytz.timezone("US/Eastern")
+POLYGON_KEY = os.getenv("POLYGON_KEY", "")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN_ALERTS", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ALL", "")
 
-MIN_PRICE = float(os.getenv("IVCRUSH_MIN_PRICE", "5.0"))
-MIN_RVOL = float(os.getenv("IVCRUSH_MIN_RVOL", "1.5"))
-MIN_DOLLAR_VOL = float(os.getenv("IVCRUSH_MIN_DOLLAR_VOL", "10000000"))  # $10M
+# Universe source:
+#   1) If you already have a static CSV/JSON of tickers, use that.
+#   2) Otherwise, we fall back to a "most active" style universe
+#      using /v2/snapshot/locale/us/markets/stocks/mostactive
+#      filtered down.
+MOST_ACTIVE_URL = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/mostactive"
 
-MAX_DTE_IV = int(os.getenv("IVCRUSH_MAX_DTE", "30"))
-MIN_DTE_IV = int(os.getenv("IVCRUSH_MIN_DTE", "5"))
+# IV Crush filters (tune as needed)
+IVC_MAX_DTE = int(os.getenv("IVC_MAX_DTE", "7"))              # max days to expiry
+IVC_MIN_IV = float(os.getenv("IVC_MIN_IV", "0.6"))            # 0.6 = 60% IV
+IVC_MIN_OPTION_VOLUME = int(os.getenv("IVC_MIN_OPTION_VOLUME", "500"))
+IVC_MIN_OPTION_OI = int(os.getenv("IVC_MIN_OPTION_OI", "200"))
+IVC_MIN_UNDERLYING_PRICE = float(os.getenv("IVC_MIN_UNDERLYING_PRICE", "5.0"))
+IVC_MAX_UNDERLYING_PRICE = float(os.getenv("IVC_MAX_UNDERLYING_PRICE", "250.0"))
 
-MIN_IV_DROP_PCT = float(os.getenv("IVCRUSH_MIN_IV_DROP_PCT", "30.0"))   # 30%+
-MAX_MOVE_REL_TO_IV = float(os.getenv("IVCRUSH_MAX_MOVE_REL_IV", "0.7"))  # actual move <= 70% of implied
+# Implied vs actual move logic:
+# IV is annualized; implied move over DTE days ≈ iv * sqrt(DTE / 365)
+# We'll convert that to percentage and compare to today's actual move.
+IVC_MIN_IMPLIED_MOVE_PCT = float(os.getenv("IVC_MIN_IMPLIED_MOVE_PCT", "8.0"))  # e.g. at least 8% move priced in
+IVC_MAX_REALIZED_TO_IMPLIED_RATIO = float(os.getenv("IVC_MAX_REALIZED_TO_IMPLIED_RATIO", "0.55"))
+# i.e. |realized move| <= 55% of implied move → "IV crush candidate"
 
-_alert_date: date | None = None
-_alerted: set[str] = set()
+# Telegram formatting
+TELEGRAM_API_BASE = "https://api.telegram.org"
 
-
-def _reset_if_new_day():
-    global _alert_date, _alerted
-    today = date.today()
-    if _alert_date != today:
-        _alert_date = today
-        _alerted = set()
-
-
-def _already(sym: str) -> bool:
-    _reset_if_new_day()
-    return sym in _alerted
+logger = logging.getLogger("iv_crush")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
-def _mark(sym: str):
-    _reset_if_new_day()
-    _alerted.add(sym)
+# ───────────────────────────────
+# Helpers
+# ───────────────────────────────
+
+def now_est_str() -> str:
+    """Human-readable EST timestamp for alerts."""
+    # Polygon data is US-focused; we label in EST for traders.
+    est = datetime.now(timezone.utc).astimezone()
+    return est.strftime("%I:%M %p %Z · %b %d")
 
 
-def _in_iv_window() -> bool:
-    """
-    IV crush is most interesting after earnings or big events.
-    We scan 7:00–16:00 ET.
-    """
-    now = datetime.now(eastern)
-    mins = now.hour * 60 + now.minute
-    return 7 * 60 <= mins <= 16 * 60
-
-
-def _universe() -> List[str]:
-    env = os.getenv("TICKER_UNIVERSE")
-    if env:
-        return [x.strip().upper() for x in env.split(",") if x.strip()]
-    return get_dynamic_top_volume_universe(max_tickers=150, volume_coverage=0.95)
-
-
-def _safe(o: Any, *names: str, default=None):
-    for n in names:
-        if hasattr(o, n):
-            v = getattr(o, n)
-            if v is not None:
-                return v
-    return default
-
-
-async def run_iv_crush():
-    """
-    IV Crush / Earnings Post-Mortem Bot:
-
-      • Underlying:
-          - Price >= MIN_PRICE
-          - RVOL >= max(MIN_RVOL, MIN_RVOL_GLOBAL)
-          - Dollar volume >= MIN_DOLLAR_VOL
-      • Options:
-          - Focus on near-the-money, short-dated (MIN_DTE_IV–MAX_DTE_IV).
-          - IV drop >= MIN_IV_DROP_PCT.
-          - Actual move smaller than the implied move (IV-based).
-    """
-    if not POLYGON_KEY or not _client:
-        print("[iv_crush] Missing client/API key.")
-        return
-    if not _in_iv_window():
-        print("[iv_crush] Outside IV crush window; skipping.")
+def send_telegram(message: str) -> None:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram env vars missing; printing instead:\n%s", message)
+        print(message)
         return
 
-    _reset_if_new_day()
-    universe = _universe()
-    today = date.today()
-    today_s = today.isoformat()
+    url = f"{TELEGRAM_API_BASE}/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
+    try:
+        resp = requests.post(url, data=payload, timeout=10)
+        if not resp.ok:
+            logger.error("Telegram send failed: %s %s", resp.status_code, resp.text)
+    except Exception as e:
+        logger.exception("Telegram send exception: %s", e)
 
-    for sym in universe:
-        if is_etf_blacklisted(sym):
-            continue
-        if _already(sym):
-            continue
 
-        # --- Daily context ---
+def get_most_active_universe(limit: int = 100) -> List[str]:
+    """
+    Simple universe: top 'limit' most active US stocks today.
+    Uses v2 snapshot endpoint. This is independent of your other bots'
+    universe logic, so it won't interfere with them.
+    """
+    params = {"apiKey": POLYGON_KEY}
+    try:
+        r = requests.get(MOST_ACTIVE_URL, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        tickers = [x["ticker"] for x in data.get("tickers", []) if "ticker" in x]
+        return tickers[:limit]
+    except Exception as e:
+        logger.exception("Failed to fetch most active universe: %s", e)
+        return []
 
+
+def days_to_expiry(expiration: str) -> int:
+    """
+    expiration: 'YYYY-MM-DD'
+    """
+    try:
+        exp = datetime.strptime(expiration, "%Y-%m-%d").date()
+        today = datetime.now(timezone.utc).date()
+        return (exp - today).days
+    except Exception:
+        return 9999
+
+
+def estimate_implied_move_pct(iv: float, dte: int) -> float:
+    """
+    Very rough estimate of implied move between now and expiry in %.
+    iv is annualized (e.g. 0.8 = 80%).
+    """
+    if iv <= 0 or dte <= 0:
+        return 0.0
+    return iv * math.sqrt(dte / 365.0) * 100.0
+
+
+# ───────────────────────────────
+# Core scan
+# ───────────────────────────────
+
+def analyze_underlying_iv_crush(client: RESTClient, ticker: str) -> List[str]:
+    """
+    For one underlying ticker:
+      - Pull the full options chain snapshot.
+      - Compute implied move for short-dated options with elevated IV.
+      - Compare with today's realized move on the stock.
+      - Return formatted alert strings for "IV crush candidates".
+    """
+    alerts: List[str] = []
+
+    # Fetch chain snapshot
+    # REST path: /v3/snapshot/options/{underlyingAsset}
+    # We'll call it via raw HTTP to avoid guessing the client method name.
+    url = f"https://api.polygon.io/v3/snapshot/options/{ticker}"
+    params = {"apiKey": POLYGON_KEY}
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.exception("IV crush snapshot fetch failed for %s: %s", ticker, e)
+        return alerts
+
+    results = data.get("results") or []
+    if not results:
+        return alerts
+
+    # Underlying info (same for all contracts)
+    underlying = results[0].get("underlying_asset") or {}
+    u_day = underlying.get("day") or {}
+    u_price = underlying.get("last") or underlying.get("close") or 0.0
+    u_change_pct = u_day.get("change_percent", 0.0) or 0.0
+
+    if not (IVC_MIN_UNDERLYING_PRICE <= float(u_price) <= IVC_MAX_UNDERLYING_PRICE):
+        return alerts
+
+    realized_move_pct = abs(float(u_change_pct)) * 100.0  # day.change_percent is typically decimal (e.g. -0.034)
+    ts_str = now_est_str()
+
+    for c in results:
         try:
-            days = list(
-                _client.list_aggs(
-                    ticker=sym,
-                    multiplier=1,
-                    timespan="day",
-                    from_=(today - timedelta(days=30)).isoformat(),
-                    to=today_s,
-                    limit=30,
-                )
-            )
-        except Exception as e:
-            print(f"[iv_crush] daily fetch failed for {sym}: {e}")
-            continue
+            details = c.get("details") or {}
+            day = c.get("day") or {}
+            iv = c.get("implied_volatility") or 0.0
+            oi = c.get("open_interest") or 0
+            opt_ticker = details.get("ticker") or c.get("ticker")
+            expiry = details.get("expiration_date")
+            contract_type = details.get("contract_type")
+            strike = details.get("strike_price", 0.0)
+            opt_volume = day.get("volume", 0)
+            opt_last = day.get("close") or day.get("last") or 0.0
 
-        if len(days) < 2:
-            continue
-
-        d0 = days[-1]
-        d1 = days[-2]
-
-        last_price = float(d0.close)
-        prev_close = float(d1.close)
-
-        if last_price < MIN_PRICE:
-            continue
-
-        move_pct = (
-            (last_price - prev_close) / prev_close * 100.0
-            if prev_close > 0 else 0.0
-        )
-
-        hist = days[:-1]
-        recent = hist[-20:] if len(hist) > 20 else hist
-        avg_vol = sum(d.volume for d in recent) / len(recent)
-        day_vol = float(d0.volume)
-        rvol = day_vol / avg_vol if avg_vol > 0 else 1.0
-
-        if rvol < max(MIN_RVOL, MIN_RVOL_GLOBAL):
-            continue
-        if day_vol < MIN_VOLUME_GLOBAL:
-            continue
-
-        dollar_vol = last_price * day_vol
-        if dollar_vol < MIN_DOLLAR_VOL:
-            continue
-
-        # --- Look at short-dated, near-the-money options for IV crush ---
-
-        try:
-            contracts = list(
-                _client.list_options_contracts(
-                    underlying_ticker=sym,
-                    expiration_date_gte=today_s,
-                    expiration_date_lte=(today + timedelta(days=MAX_DTE_IV)).isoformat(),
-                    limit=300,
-                )
-            )
-        except Exception as e:
-            print(f"[iv_crush] options fetch failed for {sym}: {e}")
-            continue
-
-        best = None
-
-        for c in contracts:
-            try:
-                ctype = (_safe(c, "contract_type", "type", default="") or "").lower()
-                if ctype not in ["call", "put"]:
-                    continue
-
-                exp = str(_safe(c, "expiration_date", default=""))[:10]
-                if not exp:
-                    continue
-                try:
-                    exp_dt = date.fromisoformat(exp)
-                except Exception:
-                    continue
-
-                dte = (exp_dt - today).days
-                if dte < MIN_DTE_IV or dte > MAX_DTE_IV:
-                    continue
-
-                strike = float(_safe(c, "strike_price", "strike", default=0.0) or 0.0)
-                if strike <= 0:
-                    continue
-
-                # focus near-the-money
-                moneyness_pct = abs(last_price - strike) / last_price * 100.0
-                if moneyness_pct > 10.0:
-                    # too far OTM/ITM for core IV crush read
-                    continue
-
-                iv = float(_safe(c, "implied_volatility", "iv", default=0.0) or 0.0)
-                prev_iv = float(_safe(c, "prev_day_implied_volatility", "prev_iv", default=0.0) or 0.0)
-
-                if iv <= 0 or prev_iv <= 0:
-                    # missing real IV data; skip
-                    continue
-
-                iv_drop_pct = (prev_iv - iv) / prev_iv * 100.0
-
-                if iv_drop_pct < MIN_IV_DROP_PCT:
-                    continue
-
-                # approximate expected move from previous IV
-                iv_annual = prev_iv / 100.0
-                expected_move_pct = iv_annual * math.sqrt(dte / 365.0) * 100.0
-
-                actual_move_abs = abs(move_pct)
-
-                # Only consider if actual move is smaller than priced-in move
-                if actual_move_abs > expected_move_pct * MAX_MOVE_REL_TO_IV:
-                    # The move actually exceeded or matched implied; not classic IV crush edge
-                    continue
-
-                # choose most extreme IV crush
-                data = {
-                    "contract": c,
-                    "ctype": ctype,
-                    "strike": strike,
-                    "dte": dte,
-                    "exp": exp,
-                    "iv": iv,
-                    "prev_iv": prev_iv,
-                    "iv_drop_pct": iv_drop_pct,
-                    "expected_move_pct": expected_move_pct,
-                    "actual_move_pct": move_pct,
-                    "moneyness": moneyness_pct,
-                }
-
-                if not best or iv_drop_pct > best["iv_drop_pct"]:
-                    best = data
-
-            except Exception as ee:
-                print(f"[iv_crush] error {sym}: {ee}")
+            if not opt_ticker or not expiry or contract_type not in ("call", "put"):
                 continue
 
-        if not best:
+            dte = days_to_expiry(expiry)
+
+            # Filters
+            if dte <= 0 or dte > IVC_MAX_DTE:
+                continue
+            if iv < IVC_MIN_IV:
+                continue
+            if opt_volume < IVC_MIN_OPTION_VOLUME or oi < IVC_MIN_OPTION_OI:
+                continue
+
+            implied_move_pct = estimate_implied_move_pct(iv, dte)
+            if implied_move_pct < IVC_MIN_IMPLIED_MOVE_PCT:
+                continue
+
+            # "Crush candidate": stock moved much less than what this IV is still implying
+            if implied_move_pct <= 0:
+                continue
+
+            ratio = realized_move_pct / implied_move_pct
+
+            if ratio <= IVC_MAX_REALIZED_TO_IMPLIED_RATIO:
+                direction = "CALL" if contract_type == "call" else "PUT"
+
+                msg = (
+                    f"🧊 *IV CRUSH CANDIDATE* — {ticker}\n"
+                    f"🕒 {ts_str}\n"
+                    f"💰 Price: ${u_price:,.2f} · Δ% {u_change_pct*100:.2f}%\n"
+                    f"────────────\n"
+                    f"🎯 Contract: `{opt_ticker}` ({direction})\n"
+                    f"📅 Exp: {expiry} · DTE: {dte}\n"
+                    f"🎯 Strike: ${float(strike):,.2f}\n"
+                    f"📊 IV (now): {iv*100:.1f}%\n"
+                    f"📦 Vol: {opt_volume:,} · OI: {oi:,}\n"
+                    f"📉 Implied move: ~{implied_move_pct:.1f}%\n"
+                    f"📉 Realized move today: ~{realized_move_pct:.1f}%\n"
+                    f"⚖️ Realized / Implied: {ratio:.2f}x\n"
+                    f"────────────\n"
+                    f"🔎 This contract is still pricing a much bigger move than the stock actually made.\n"
+                    f"    Classic post-event IV-crush setup.\n"
+                    f"🔗 Chart: https://www.tradingview.com/chart/?symbol={ticker}"
+                )
+
+                alerts.append(msg)
+
+        except Exception as e:
+            logger.exception("Error processing contract for %s: %s", ticker, e)
             continue
 
-        grade = grade_equity_setup(
-            abs(best["actual_move_pct"]),
-            rvol,
-            dollar_vol,
-        )
+    return alerts
 
-        emoji = "📉"
-        vol_emoji = "📊"
-        money_emoji = "💰"
-        divider = "────────────"
-        now_et = datetime.now(eastern)
-        timestamp = now_et.strftime("%I:%M %p EST · %b %d").lstrip("0")
 
-        ctype_up = best["ctype"].upper()
-        extra = (
-            f"{emoji} IV CRUSH — {sym}\n"
-            f"🕒 {timestamp}\n"
-            f"{money_emoji} ${last_price:.2f} · RVOL {rvol:.1f}x\n"
-            f"{divider}\n"
-            f"{vol_emoji} {ctype_up} {sym} {best['exp']} {best['strike']:.2f} {ctype_up[0]}\n"
-            f"📉 IV dropped {best['iv_drop_pct']:.1f}% (from {best['prev_iv']:.1f}% to {best['iv']:.1f}%)\n"
-            f"🎯 Expected move (from IV): ≈ {best['expected_move_pct']:.1f}%\n"
-            f"📊 Actual move: {best['actual_move_pct']:.1f}% (smaller than priced-in)\n"
-            f"📍 Moneyness: {best['moneyness']:.1f}% from spot\n"
-            f"💵 Dollar Volume: ≈ ${dollar_vol:,.0f}\n"
-            f"🎯 Setup Grade: {grade} · Edge: POST-EARNINGS VOL CRUSH\n"
-            f"🔗 Chart: {chart_link(sym)}"
-        )
+# ───────────────────────────────
+# Public entrypoint
+# ───────────────────────────────
 
-        _mark(sym)
-        send_alert("iv_crush", sym, last_price, rvol, extra=extra)
+def run_iv_crush() -> None:
+    """
+    Main entrypoint called by your scheduler/orchestrator.
+    """
+    if not POLYGON_KEY:
+        logger.error("POLYGON_KEY is not set; aborting IV Crush bot.")
+        return
+
+    client = RESTClient(POLYGON_KEY)
+
+    universe = get_most_active_universe(limit=80)
+    logger.info("[iv_crush] Universe size: %d", len(universe))
+
+    total_alerts = 0
+    for t in universe:
+        alerts = analyze_underlying_iv_crush(client, t)
+        for msg in alerts:
+            send_telegram(msg)
+            total_alerts += 1
+            # light pacing to be nice to Telegram
+            time.sleep(0.5)
+
+    logger.info("[iv_crush] Done. Alerts sent: %d", total_alerts)
+
+
+if __name__ == "__main__":
+    run_iv_crush()
