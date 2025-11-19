@@ -2,7 +2,7 @@
 
 import os
 from datetime import date, timedelta, datetime
-from typing import List, Any
+from typing import List
 import pytz
 import math
 
@@ -27,8 +27,9 @@ eastern = pytz.timezone("US/Eastern")
 
 MIN_PRICE = float(os.getenv("TREND_MIN_PRICE", "10.0"))
 BREAKOUT_LOOKBACK = int(os.getenv("TREND_BREAKOUT_LOOKBACK", "20"))
-BREAKOUT_MIN_PCT = float(os.getenv("TREND_BREAKOUT_MIN_PCT", "1.0"))  # % past range
-MIN_TREND_RVOL = float(os.getenv("TREND_MIN_RVOL", "2.0"))
+BREAKOUT_MIN_PCT = float(os.getenv("TREND_BREAKOUT_MIN_PCT", "2.0"))  # 2% past range
+MIN_TREND_RVOL = float(os.getenv("TREND_MIN_RVOL", "3.0"))
+MIN_TREND_DOLLAR_VOL = float(os.getenv("TREND_MIN_DOLLAR_VOL", "75000000"))  # $75M
 
 _alert_date: date | None = None
 _alerted: set[str] = set()
@@ -69,8 +70,8 @@ def _universe() -> List[str]:
 
 
 def _ema(values, period: int) -> float:
-    if not values or len(values) < period:
-        return sum(values) / len(values) if values else 0.0
+    if not values:
+        return 0.0
     k = 2 / (period + 1.0)
     ema_val = values[0]
     for v in values[1:]:
@@ -80,7 +81,7 @@ def _ema(values, period: int) -> float:
 
 async def run_trend_rider():
     """
-    TrendRider Bot:
+    TrendRider Bot — "only real breakouts".
 
       • Uptrend breakout:
           - 20 EMA > 50 EMA
@@ -92,6 +93,7 @@ async def run_trend_rider():
           - Price >= MIN_PRICE
           - RVOL >= max(MIN_TREND_RVOL, MIN_RVOL_GLOBAL)
           - Volume >= MIN_VOLUME_GLOBAL
+          - Dollar volume >= MIN_TREND_DOLLAR_VOL
     """
     if not POLYGON_KEY or not _client:
         print("[trend_rider] Missing client/API key.")
@@ -133,20 +135,15 @@ async def run_trend_rider():
         prev_bar = days[-2]
 
         closes = [float(d.close) for d in days]
-        highs = [float(d.high) for d in days]
-        lows = [float(d.low) for d in days]
-
         last_price = closes[-1]
         prev_close = closes[-2]
 
         if last_price < MIN_PRICE:
             continue
 
-        # EMAs for trend
         ema20 = _ema(closes[-60:], 20)
         ema50 = _ema(closes[-60:], 50)
 
-        # RVOL
         hist = days[:-1]
         recent = hist[-20:] if len(hist) > 20 else hist
         avg_vol = sum(d.volume for d in recent) / len(recent)
@@ -159,12 +156,14 @@ async def run_trend_rider():
             continue
 
         dollar_vol = last_price * day_vol
+        if dollar_vol < MIN_TREND_DOLLAR_VOL:
+            continue
+
         move_pct = (
             (last_price - prev_close) / prev_close * 100.0
             if prev_close > 0 else 0.0
         )
 
-        # Breakout levels
         lookback_slice = days[-(BREAKOUT_LOOKBACK + 1):-1]
         if len(lookback_slice) < BREAKOUT_LOOKBACK:
             continue
@@ -174,7 +173,6 @@ async def run_trend_rider():
         breakout_pct_above = (last_price - lb_high) / lb_high * 100.0 if lb_high > 0 else 0.0
         breakout_pct_below = (lb_low - last_price) / lb_low * 100.0 if lb_low > 0 else 0.0
 
-        # Decide if this is an uptrend breakout or downtrend breakdown
         uptrend = ema20 > ema50
         downtrend = ema20 < ema50
 
