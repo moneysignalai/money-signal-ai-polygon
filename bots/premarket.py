@@ -21,9 +21,16 @@ _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
 eastern = pytz.timezone("US/Eastern")
 
-MIN_PREMARKET_MOVE_PCT = float(os.getenv("MIN_PREMARKET_MOVE_PCT", "4.0"))
+MIN_PREMARKET_MOVE_PCT = float(os.getenv("MIN_PREMARKET_MOVE_PCT", "8.0"))
 MIN_PREMARKET_PRICE = float(os.getenv("MIN_PREMARKET_PRICE", "2.0"))
 MIN_PREMARKET_DOLLAR_VOL = float(os.getenv("MIN_PREMARKET_DOLLAR_VOL", "2_000_000"))
+
+
+def _in_premarket_window() -> bool:
+    """Only run 4:00–9:30 AM EST."""
+    now_et = datetime.now(eastern)
+    minutes = now_et.hour * 60 + now_et.minute
+    return 4 * 60 <= minutes < 9 * 60 + 30
 
 
 def _get_ticker_universe() -> List[str]:
@@ -47,16 +54,20 @@ def _is_premarket_bar(ts_ms: int) -> bool:
 
 async def run_premarket():
     """
-    Premarket movers:
+    Pre-Market Runner:
       • Move vs prior close >= MIN_PREMARKET_MOVE_PCT
       • Premarket price >= MIN_PREMARKET_PRICE
       • Premarket dollar volume >= MIN_PREMARKET_DOLLAR_VOL
+      • Only during 4:00–9:30 AM EST
     """
     if not POLYGON_KEY:
         print("[premarket] POLYGON_KEY not set; skipping scan.")
         return
     if not _client:
         print("[premarket] Client not initialized; skipping scan.")
+        return
+    if not _in_premarket_window():
+        print("[premarket] Outside 4:00–9:30 window; skipping scan.")
         return
 
     universe = _get_ticker_universe()
@@ -86,7 +97,7 @@ async def run_premarket():
         if len(days) < 1:
             continue
 
-        prev = days[-1]  # last completed day before today's session opens
+        prev = days[-1]
         prev_close = float(prev.close)
         if prev_close <= 0:
             continue
@@ -129,7 +140,7 @@ async def run_premarket():
             continue
 
         direction_emoji = "🚀" if move_pre_pct > 0 else "📉"
-        bias = "Long premarket momentum" if move_pre_pct > 0 else "Short / fade premarket move"
+        bias = "Long premarket runner" if move_pre_pct > 0 else "Fade extended premarket move"
 
         extra = (
             f"{direction_emoji} Premarket move: {move_pre_pct:.1f}% vs prior close\n"
