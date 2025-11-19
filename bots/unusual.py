@@ -1,7 +1,6 @@
 import os
 from datetime import date, timedelta, datetime
 from typing import List, Dict, Any
-
 import pytz
 
 try:
@@ -22,15 +21,13 @@ from bots.shared import (
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 eastern = pytz.timezone("US/Eastern")
 
-# ========= UNUSUAL SWEEPS CONFIG =============
+# ------------------- CONFIG -------------------
 
-# calls + puts both included now
-MAX_DTE = int(os.getenv("UNUSUAL_MAX_DTE", "45"))          # 0–45 DTE
+MAX_DTE = int(os.getenv("UNUSUAL_MAX_DTE", "45"))
 MIN_OPTION_VOLUME = int(os.getenv("UNUSUAL_MIN_VOLUME", "500"))
 MIN_OPTION_NOTIONAL = float(os.getenv("UNUSUAL_MIN_NOTIONAL", "200000"))
 MIN_UNDERLYING_PRICE = float(os.getenv("UNUSUAL_MIN_PRICE", "5.0"))
 
-# per-day de-dupe, per symbol
 _alert_date: date | None = None
 _alerted: set[str] = set()
 
@@ -54,8 +51,8 @@ def _mark(sym: str):
 
 
 def _in_rth() -> bool:
-    now_et = datetime.now(eastern)
-    mins = now_et.hour * 60 + now_et.minute
+    now = datetime.now(eastern)
+    mins = now.hour * 60 + now.minute
     return 9 * 60 + 30 <= mins <= 16 * 60
 
 
@@ -66,30 +63,29 @@ def _universe() -> List[str]:
     return get_dynamic_top_volume_universe(max_tickers=150, volume_coverage=0.95)
 
 
-def _safe(obj, *names, default=None):
+def _safe(o: Any, *names: str, default=None):
     for n in names:
-        if hasattr(obj, n):
-            v = getattr(obj, n)
+        if hasattr(o, n):
+            v = getattr(o, n)
             if v is not None:
                 return v
     return default
 
 
-# ============ MAIN BOT ===============
+# -----------------------------------------------------
+#                MAIN BOT
+# -----------------------------------------------------
 
 async def run_unusual():
     """
-    Unusual Option Sweeps — Calls + Puts
-    • Looks for BIG premium in a single line (same contract)
-    • Underlying RVOL + volume filters
-    • Works intraday only
+    UNUSUAL OPTION SWEEPS — CALLS + PUTS
+    Hybrid Format (Style C)
     """
     if not POLYGON_KEY or not _client:
-        print("[unusual] Missing POLYGON_KEY or client not ready")
+        print("[unusual] Missing client or API key.")
         return
-
     if not _in_rth():
-        print("[unusual] Outside RTH")
+        print("[unusual] Outside RTH.")
         return
 
     _reset_if_new_day()
@@ -100,12 +96,10 @@ async def run_unusual():
     for sym in universe:
         if is_etf_blacklisted(sym):
             continue
-
         if _already(sym):
-            # already alerted once today
             continue
 
-        # ----- Daily filters -----
+        # ---------- DAILY CONTEXT ----------
         try:
             days = list(
                 _client.list_aggs(
@@ -118,7 +112,7 @@ async def run_unusual():
                 )
             )
         except Exception as e:
-            print(f"[unusual] daily fail {sym}: {e}")
+            print(f"[unusual] daily fetch failed for {sym}: {e}")
             continue
 
         if len(days) < 2:
@@ -129,10 +123,11 @@ async def run_unusual():
 
         last_price = float(d0.close)
         prev_close = float(d1.close)
+
         if last_price < MIN_UNDERLYING_PRICE:
             continue
 
-        # RVOL
+        # compute RVOL
         hist = days[:-1]
         if hist:
             recent = hist[-20:] if len(hist) > 20 else hist
@@ -148,7 +143,7 @@ async def run_unusual():
         if day_vol < MIN_VOLUME_GLOBAL:
             continue
 
-        # ----- Options scan -----
+        # ---------- OPTIONS SCAN ----------
         try:
             opts = list(
                 _client.list_options_contracts(
@@ -159,10 +154,10 @@ async def run_unusual():
                 )
             )
         except Exception as e:
-            print(f"[unusual] option list fail {sym}: {e}")
+            print(f"[unusual] option fetch failed for {sym}: {e}")
             continue
 
-        best = None  # store biggest notional sweep
+        best = None  # biggest sweep
 
         for c in opts:
             try:
@@ -173,11 +168,13 @@ async def run_unusual():
                 exp = str(_safe(c, "expiration_date", default=""))[:10]
                 if not exp:
                     continue
+
                 try:
-                    exp_d = date.fromisoformat(exp)
+                    exp_dt = date.fromisoformat(exp)
                 except:
                     continue
-                dte = (exp_d - today).days
+
+                dte = (exp_dt - today).days
                 if dte < 0 or dte > MAX_DTE:
                     continue
 
@@ -202,6 +199,8 @@ async def run_unusual():
                 if notional < MIN_OPTION_NOTIONAL:
                     continue
 
+                moneyness = ((last_price - float(_safe(c, "strike_price", "strike", default=0)))) / last_price * 100
+
                 data = {
                     "contract": c,
                     "ctype": ctype,
@@ -212,37 +211,62 @@ async def run_unusual():
                     "notional": notional,
                     "dte": dte,
                     "exp": exp,
+                    "strike": float(_safe(c, "strike_price", "strike", default=0)),
+                    "moneyness": moneyness,
                 }
 
                 if not best or notional > best["notional"]:
                     best = data
 
             except Exception as ee:
-                print(f"[unusual] processing fail {sym}: {ee}")
+                print(f"[unusual] error {sym}: {ee}")
                 continue
 
         if not best:
             continue
 
         c = best["contract"]
-        strike = float(_safe(c, "strike_price", "strike", default=0.0) or 0.0)
-        ctype = best["ctype"].upper()
+        strike = best["strike"]
+        ctype = best["ctype"].upper()  # CALL or PUT
+
+        # pick emoji
+        type_emoji = "🟢" if ctype == "CALL" else "🔻"
+        flow_emoji = "🕵️"
+        money_emoji = "💰"
+        clock_emoji = "⏱️"
+        divider = "────────────"
 
         move_pct = (
             (last_price - prev_close) / prev_close * 100.0
-            if prev_close > 0
-            else 0.0
+            if prev_close > 0 else 0.0
         )
 
-        emoji = "🟢" if ctype == "CALL" else "🔻"
+        # sweep classification
+        if best["bid"] == 0 or best["ask"] == 0:
+            sweep_type = "Mixed Flow"
+        elif best["mid"] == best["ask"]:
+            sweep_type = "Aggressive ASK Buy"
+        elif best["mid"] == best["bid"]:
+            sweep_type = "Aggressive BID Hit"
+        else:
+            sweep_type = "Directional Sweep"
+
+        itm_otm = "ITM" if (ctype == "CALL" and last_price > strike) or (ctype == "PUT" and last_price < strike) else "OTM"
+
+        # Timestamp
+        now_et = datetime.now(eastern)
+        timestamp = now_et.strftime("%I:%M %p EST · %b %d")
 
         extra = (
-            f"{emoji} UNUSUAL {ctype} FLOW\n"
-            f"Underlying {sym} ≈ ${last_price:.2f} · RVOL {rvol:.1f}x\n"
-            f"Strike {strike:.2f} · Exp {best['exp']} ({best['dte']} DTE)\n"
-            f"Premium ≈ ${best['mid']:.2f} (Bid {best['bid']:.2f} / Ask {best['ask']:.2f})\n"
-            f"Opt Vol {best['vol']:,} · Notional ≈ ${best['notional']:,.0f}\n"
-            f"Day Move: {move_pct:.1f}% · Day Volume {int(day_vol):,}\n"
+            f"{flow_emoji} UNUSUAL — {sym}\n"
+            f"{clock_emoji} {timestamp}\n"
+            f"{money_emoji} ${last_price:.2f}\n"
+            f"{divider}\n"
+            f"{flow_emoji} Unusual {ctype} Sweep: {sym} {best['exp']} {strike:.2f} {ctype[0]}\n"
+            f"📌 Flow Type: {sweep_type}\n"
+            f"⏱ DTE: {best['dte']} · {itm_otm} · Moneyness {best['moneyness']:.1f}%\n"
+            f"📦 Volume: {best['vol']:,} contracts · Avg: ${best['mid']:.2f}\n"
+            f"💰 Notional: ≈ ${best['notional']:,.0f}\n"
             f"🔗 Chart: {chart_link(sym)}"
         )
 
