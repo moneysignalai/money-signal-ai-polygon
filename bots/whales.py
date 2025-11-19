@@ -25,10 +25,13 @@ eastern = pytz.timezone("US/Eastern")
 
 # ------------------- CONFIG -------------------
 
-MAX_DTE = int(os.getenv("WHALES_MAX_DTE", "60"))
-MIN_OPTION_VOLUME = int(os.getenv("WHALES_MIN_VOLUME", "1000"))
-MIN_OPTION_NOTIONAL = float(os.getenv("WHALES_MIN_NOTIONAL", "1000000"))  # $1M+
-MIN_UNDERLYING_PRICE = float(os.getenv("WHALES_MIN_PRICE", "5.0"))
+MAX_DTE = int(os.getenv("WHALES_MAX_DTE", "45"))  # focus nearer term
+MIN_OPTION_VOLUME = int(os.getenv("WHALES_MIN_VOLUME", "1500"))
+MIN_OPTION_NOTIONAL = float(os.getenv("WHALES_MIN_NOTIONAL", "2000000"))  # $2M+
+MIN_UNDERLYING_PRICE = float(os.getenv("WHALES_MIN_PRICE", "10.0"))
+MAX_UNDERLYING_PRICE = float(os.getenv("WHALES_MAX_PRICE", "500.0"))
+MIN_DOLLAR_VOL = float(os.getenv("WHALES_MIN_DOLLAR_VOL", "50000000"))  # $50M
+MIN_WHALES_RVOL = float(os.getenv("WHALES_MIN_RVOL", "3.0"))  # “oh wow” only
 
 _alert_date: date | None = None
 _alerted: set[str] = set()
@@ -54,7 +57,7 @@ def _mark(sym: str):
 
 def _in_rth() -> bool:
     """
-    Mon–Fri, 9:30–16:00 ET (regular options session).
+    Mon–Fri, 9:30–16:00 ET (core options session).
     """
     now = datetime.now(eastern)
     if now.weekday() >= 5:
@@ -74,7 +77,7 @@ def _universe() -> List[str]:
     env = os.getenv("TICKER_UNIVERSE")
     if env:
         return [x.strip().upper() for x in env.split(",") if x.strip()]
-    return get_dynamic_top_volume_universe(max_tickers=150, volume_coverage=0.95)
+    return get_dynamic_top_volume_universe(max_tickers=120, volume_coverage=0.97)
 
 
 def _safe(o: Any, *names: str, default=None):
@@ -88,18 +91,21 @@ def _safe(o: Any, *names: str, default=None):
 
 async def run_whales():
     """
-    WHALES BOT — Million-dollar options flow (CALLS + PUTS).
+    WHALES BOT — Million-dollar+ options flow (CALLS + PUTS), “oh wow” only.
 
-    • Underlying:
-        - Price >= MIN_UNDERLYING_PRICE
-        - RVOL >= max(MIN_RVOL_GLOBAL, 2.0)
-        - Volume >= MIN_VOLUME_GLOBAL
-    • Options:
-        - CALL or PUT
-        - DTE <= MAX_DTE
-        - Volume >= MIN_OPTION_VOLUME
-        - Notional >= MIN_OPTION_NOTIONAL
-    • One largest whale per symbol per day.
+    Underlying filters:
+      • Price ∈ [MIN_UNDERLYING_PRICE, MAX_UNDERLYING_PRICE]
+      • RVOL ≥ max(MIN_WHALES_RVOL, MIN_RVOL_GLOBAL)
+      • Volume ≥ MIN_VOLUME_GLOBAL
+      • Dollar volume ≥ MIN_DOLLAR_VOL
+
+    Option filters:
+      • CALL or PUT
+      • 0 < DTE ≤ MAX_DTE
+      • Volume ≥ MIN_OPTION_VOLUME
+      • Notional ≥ MIN_OPTION_NOTIONAL
+
+    One largest whale per symbol per day.
     """
     if not POLYGON_KEY or not _client:
         print("[whales] Missing client/API key.")
@@ -142,7 +148,8 @@ async def run_whales():
 
         last_price = float(d0.close)
         prev_close = float(d1.close)
-        if last_price < MIN_UNDERLYING_PRICE:
+
+        if last_price < MIN_UNDERLYING_PRICE or last_price > MAX_UNDERLYING_PRICE:
             continue
 
         hist = days[:-1]
@@ -155,9 +162,13 @@ async def run_whales():
         day_vol = float(d0.volume)
         rvol = day_vol / avg_vol if avg_vol > 0 else 1.0
 
-        if rvol < max(MIN_RVOL_GLOBAL, 2.0):
+        dollar_vol = last_price * day_vol
+
+        if rvol < max(MIN_WHALES_RVOL, MIN_RVOL_GLOBAL):
             continue
         if day_vol < MIN_VOLUME_GLOBAL:
+            continue
+        if dollar_vol < MIN_DOLLAR_VOL:
             continue
 
         move_pct = (
@@ -225,11 +236,8 @@ async def run_whales():
                     continue
 
                 data = {
-                    "contract": c,
                     "ctype": ctype,
                     "mid": mid,
-                    "bid": bid,
-                    "ask": ask,
                     "vol": vol,
                     "notional": notional,
                     "dte": dte,
@@ -248,7 +256,6 @@ async def run_whales():
             continue
 
         ctype = best["ctype"].upper()
-        strike = best["strike"]
         now_et = datetime.now(eastern)
         timestamp = now_et.strftime("%I:%M %p EST · %b %d").lstrip("0")
 
@@ -259,14 +266,14 @@ async def run_whales():
         divider = "────────────"
 
         extra = (
-            f"{whale_emoji} *WHALE FLOW* — {ctype}\n"
+            f"{whale_emoji} *WHALE FLOW* — {sym}\n"
             f"{clock_emoji} {timestamp}\n"
             f"{money_emoji} Underlying: ${last_price:.2f} · RVOL {rvol:.1f}x\n"
             f"{divider}\n"
-            f"{direction_emoji} {sym} {best['exp']} {strike:.2f} {ctype[0]}\n"
+            f"{direction_emoji} {sym} {best['exp']} {best['strike']:.2f} {ctype[0]}\n"
             f"📦 Volume: {best['vol']:,} · Avg: ${best['mid']:.2f}\n"
             f"💰 Notional: ≈ ${best['notional']:,.0f}\n"
-            f"📊 Day Move: {move_pct:.1f}% · Volume {int(day_vol):,}\n"
+            f"📊 Day Move: {move_pct:.1f}% · Dollar Vol ≈ ${dollar_vol:,.0f}\n"
             f"🔗 Chart: {chart_link(sym)}"
         )
 
