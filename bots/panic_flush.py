@@ -25,10 +25,10 @@ _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 eastern = pytz.timezone("US/Eastern")
 
 MIN_PRICE = float(os.getenv("PANIC_MIN_PRICE", "5.0"))
-MIN_DROP_PCT = float(os.getenv("PANIC_MIN_DROP_PCT", "10.0"))  # -10%+
-MIN_PANIC_RVOL = float(os.getenv("PANIC_MIN_RVOL", "3.0"))
-MIN_DOLLAR_VOL = float(os.getenv("PANIC_MIN_DOLLAR_VOL", "20000000"))  # $20M
-NEAR_LOW_PCT = float(os.getenv("PANIC_NEAR_LOW_PCT", "3.0"))  # within 3% of 52W low
+MIN_DROP_PCT = float(os.getenv("PANIC_MIN_DROP_PCT", "12.0"))  # -12%+
+MIN_PANIC_RVOL = float(os.getenv("PANIC_MIN_RVOL", "4.0"))
+MIN_DOLLAR_VOL = float(os.getenv("PANIC_MIN_DOLLAR_VOL", "30000000"))  # $30M+
+NEAR_LOW_PCT = float(os.getenv("PANIC_NEAR_LOW_PCT", "2.0"))  # within 2% of 52w low
 
 _alert_date: date | None = None
 _alerted: set[str] = set()
@@ -67,13 +67,14 @@ def _universe() -> List[str]:
 
 async def run_panic_flush():
     """
-    Panic Flush Bot:
+    Panic Flush Bot — real capitulation days.
 
       • Price >= MIN_PRICE
       • Day move <= -MIN_DROP_PCT
       • RVOL >= max(MIN_PANIC_RVOL, MIN_RVOL_GLOBAL)
       • Dollar volume >= MIN_DOLLAR_VOL
       • Close within NEAR_LOW_PCT of 52-week low.
+      • Today’s low is a new 30-day low.
     """
     if not POLYGON_KEY or not _client:
         print("[panic_flush] Missing client/API key.")
@@ -108,7 +109,7 @@ async def run_panic_flush():
             print(f"[panic_flush] daily fetch failed for {sym}: {e}")
             continue
 
-        if len(days) < 30:
+        if len(days) < 40:
             continue
 
         today_bar = days[-1]
@@ -125,10 +126,8 @@ async def run_panic_flush():
             if prev_close > 0 else 0.0
         )
         if move_pct > -MIN_DROP_PCT:
-            # not a big enough flush
             continue
 
-        # RVOL
         hist = days[:-1]
         recent = hist[-20:] if len(hist) > 20 else hist
         avg_vol = sum(d.volume for d in recent) / len(recent)
@@ -144,7 +143,6 @@ async def run_panic_flush():
         if dollar_vol < MIN_DOLLAR_VOL:
             continue
 
-        # 52-week low proximity
         lows = [float(d.low) for d in days]
         low_52w = min(lows)
         if low_52w <= 0:
@@ -152,8 +150,14 @@ async def run_panic_flush():
 
         distance_from_low_pct = (last_price - low_52w) / low_52w * 100.0
         if distance_from_low_pct > NEAR_LOW_PCT:
-            # not close enough to the 52-week low
             continue
+
+        # Today’s low must be a new 30-day low
+        last_30 = days[-31:-1]
+        if last_30:
+            min_last_30 = min(float(d.low) for d in last_30)
+            if float(today_bar.low) > min_last_30:
+                continue
 
         grade = grade_equity_setup(abs(move_pct), rvol, dollar_vol)
 
@@ -170,10 +174,10 @@ async def run_panic_flush():
             f"{money_emoji} ${last_price:.2f} · RVOL {rvol:.1f}x\n"
             f"{divider}\n"
             f"{skull_emoji} Down {abs(move_pct):.1f}% today\n"
-            f"📉 Near 52-week low: last ${last_price:.2f} vs low ${low_52w:.2f} "
-            f"(dist {distance_from_low_pct:.1f}%)\n"
+            f"📉 New 30-day low today near 52-week low\n"
+            f"📉 52w low: ${low_52w:.2f} (dist {distance_from_low_pct:.1f}%)\n"
             f"📦 Volume: {int(day_vol):,} · Dollar Vol ≈ ${dollar_vol:,.0f}\n"
-            f"🎯 Setup Grade: {grade} · Bias: PANIC ZONE (bounce or short-continuation)\n"
+            f"🎯 Setup Grade: {grade} · Bias: PANIC ZONE\n"
             f"🔗 Chart: {chart_link(sym)}"
         )
 
