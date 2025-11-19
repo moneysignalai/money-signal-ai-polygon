@@ -7,13 +7,20 @@ try:
 except ImportError:
     from polygon import RESTClient
 
-from bots.shared import POLYGON_KEY, MIN_VOLUME_GLOBAL, send_alert, get_dynamic_top_volume_universe
+from bots.shared import (
+    POLYGON_KEY,
+    MIN_VOLUME_GLOBAL,
+    MIN_RVOL_GLOBAL,
+    send_alert,
+    get_dynamic_top_volume_universe,
+)
 
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
-MIN_SQUEEZE_PCT = float(os.getenv("MIN_SQUEEZE_PCT", "12.0"))    # 12%+ move
-MIN_SQUEEZE_RVOL = float(os.getenv("MIN_SQUEEZE_RVOL", "4.0"))   # 4x RVOL
-MIN_SQUEEZE_PRICE = float(os.getenv("MIN_SQUEEZE_PRICE", "2.0")) # filter out sub-$2 junk
+# ENV-tunable filters for squeeze quality
+MIN_SQUEEZE_PCT = float(os.getenv("MIN_SQUEEZE_PCT", "12.0"))     # % move vs yesterday
+MIN_SQUEEZE_RVOL = float(os.getenv("MIN_SQUEEZE_RVOL", "4.0"))    # min RVOL for squeeze
+MIN_SQUEEZE_PRICE = float(os.getenv("MIN_SQUEEZE_PRICE", "2.0"))  # filter out sub-$2 junk
 
 
 def _get_ticker_universe() -> List[str]:
@@ -26,6 +33,12 @@ def _get_ticker_universe() -> List[str]:
 async def run_squeeze():
     """
     Short-squeeze style scanner.
+
+    Requirements:
+      • Move >= MIN_SQUEEZE_PCT since yesterday's close
+      • Last price >= MIN_SQUEEZE_PRICE
+      • RVOL >= max(MIN_SQUEEZE_RVOL, MIN_RVOL_GLOBAL)
+      • Volume >= MIN_VOLUME_GLOBAL
     """
     if not POLYGON_KEY:
         print("[squeeze] POLYGON_KEY not set; skipping scan.")
@@ -66,13 +79,14 @@ async def run_squeeze():
 
         last_price = float(today_bar.close)
         if last_price < MIN_SQUEEZE_PRICE:
-            # cut out 11-cent penny stock type names
+            # ignore ultra-cheap penny stock squeezes
             continue
 
         change_pct = (last_price - prev_close) / prev_close * 100.0
         if change_pct < MIN_SQUEEZE_PCT:
             continue
 
+        # RVOL calculation
         hist = days[:-1]
         if hist:
             recent = hist[-20:] if len(hist) > 20 else hist
@@ -85,7 +99,8 @@ async def run_squeeze():
         else:
             rvol = 1.0
 
-        if rvol < MIN_SQUEEZE_RVOL:
+        # Respect both global and squeeze-specific RVOL thresholds
+        if rvol < max(MIN_SQUEEZE_RVOL, MIN_RVOL_GLOBAL):
             continue
 
         vol_today = float(today_bar.volume)
@@ -95,6 +110,7 @@ async def run_squeeze():
         high = float(today_bar.high)
         move_emoji = "🚀" if change_pct > 0 else "📉"
 
+        # Clean, emoji-structured block (no RVOL repetition here)
         extra = (
             f"{move_emoji} Short-squeeze style move: {change_pct:.1f}% today\n"
             f"📈 Prev Close: ${prev_close:.2f} → Close: ${last_price:.2f} (High: ${high:.2f})\n"
