@@ -25,6 +25,8 @@ _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 eastern = pytz.timezone("US/Eastern")
 
 ORB_MINUTES = int(os.getenv("ORB_MINUTES", "15"))
+ORB_MIN_RANGE_PCT = float(os.getenv("ORB_MIN_RANGE_PCT", "0.5"))   # min range as % of price
+ORB_MIN_BREAK_FRAC = float(os.getenv("ORB_MIN_BREAK_FRAC", "0.25"))  # how far beyond edge vs range
 
 
 def _in_orb_window() -> bool:
@@ -45,8 +47,9 @@ async def run_orb():
     """
     Opening Range Breakout (ORB) bot:
       • Uses first ORB_MINUTES to define range
-      • Break above high = long breakout
-      • Break below low = short breakdown
+      • Only triggers on strong, clean breakouts/breakdowns:
+          - Range must be meaningful vs price (ORB_MIN_RANGE_PCT)
+          - Last price must be at least ORB_MIN_BREAK_FRAC * range beyond edge
     """
     if not POLYGON_KEY:
         print("[orb] POLYGON_KEY not set; skipping scan.")
@@ -66,6 +69,7 @@ async def run_orb():
         if is_etf_blacklisted(sym):
             continue
 
+        # Minute bars
         try:
             mins = list(
                 _client.list_aggs(
@@ -94,7 +98,18 @@ async def run_orb():
         last_bar = rest[-1]
         last_price = float(last_bar.close)
 
-        # Daily bars
+        range_size = float(orb_high - orb_low)
+        if range_size <= 0:
+            continue
+
+        mid_price = (orb_high + orb_low) / 2.0
+        range_pct_vs_price = range_size / mid_price * 100.0 if mid_price > 0 else 0.0
+
+        # Require a meaningful opening range vs price (avoid tiny/noise ranges)
+        if range_pct_vs_price < ORB_MIN_RANGE_PCT:
+            continue
+
+        # Daily bars for RVOL / context
         try:
             days = list(
                 _client.list_aggs(
@@ -136,14 +151,24 @@ async def run_orb():
         if vol_today < MIN_VOLUME_GLOBAL:
             continue
 
+        # Clean breakout/breakdown requirement
         direction = None
         emoji = ""
+        edge_price = None
+
+        # Distance beyond edge
         if last_price > orb_high:
-            direction = "Breakout above opening range"
-            emoji = "🚀"
+            dist = last_price - orb_high
+            if dist >= ORB_MIN_BREAK_FRAC * range_size:
+                direction = "Breakout above opening range"
+                emoji = "🚀"
+                edge_price = orb_high
         elif last_price < orb_low:
-            direction = "Breakdown below opening range"
-            emoji = "📉"
+            dist = orb_low - last_price
+            if dist >= ORB_MIN_BREAK_FRAC * range_size:
+                direction = "Breakdown below opening range"
+                emoji = "📉"
+                edge_price = orb_low
 
         if not direction:
             continue
@@ -153,19 +178,18 @@ async def run_orb():
         grade = grade_equity_setup(abs(move_pct), rvol, dv)
         bias = "Long ORB breakout" if last_price > orb_high else "Short ORB breakdown"
 
-        # Simple trade idea: risk = range size, target = 1.5R
-        range_size = orb_high - orb_low
-        if range_size > 0:
+        # Simple trade idea: range-based R multiple
+        if edge_price is not None:
             if last_price > orb_high:
-                entry = orb_high
+                entry = edge_price
                 risk = orb_low
-                risk_per_share = entry - risk
+                risk_per_share = max(entry - risk, 0.01)
                 target = entry + 1.5 * risk_per_share
                 idea = f"Long > {entry:.2f}, risk {risk:.2f}, target ~{target:.2f}"
             else:
-                entry = orb_low
+                entry = edge_price
                 risk = orb_high
-                risk_per_share = risk - entry
+                risk_per_share = max(risk - entry, 0.01)
                 target = entry - 1.5 * risk_per_share
                 idea = f"Short < {entry:.2f}, risk {risk:.2f}, target ~{target:.2f}"
         else:
@@ -173,7 +197,7 @@ async def run_orb():
 
         extra = (
             f"{emoji} {direction} ({ORB_MINUTES}-min)\n"
-            f"📏 Range: {orb_low:.2f} – {orb_high:.2f}\n"
+            f"📏 Range: {orb_low:.2f} – {orb_high:.2f} (size {range_size:.2f}, {range_pct_vs_price:.2f}% of price)\n"
             f"📈 Prev Close: ${prev_close:.2f} → Last: ${last_price:.2f} ({move_pct:.1f}%)\n"
             f"📦 Day Vol: {int(vol_today):,}\n"
             f"🎯 Setup Grade: {grade}\n"
