@@ -13,14 +13,16 @@ from bots.shared import (
     MIN_RVOL_GLOBAL,
     send_alert,
     get_dynamic_top_volume_universe,
+    grade_equity_setup,
+    is_etf_blacklisted,
+    chart_link,
 )
 
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
-# ENV-tunable filters for squeeze quality
-MIN_SQUEEZE_PCT = float(os.getenv("MIN_SQUEEZE_PCT", "12.0"))     # % move vs yesterday
-MIN_SQUEEZE_RVOL = float(os.getenv("MIN_SQUEEZE_RVOL", "4.0"))    # min RVOL for squeeze
-MIN_SQUEEZE_PRICE = float(os.getenv("MIN_SQUEEZE_PRICE", "2.0"))  # filter out sub-$2 junk
+MIN_SQUEEZE_PCT = float(os.getenv("MIN_SQUEEZE_PCT", "12.0"))
+MIN_SQUEEZE_RVOL = float(os.getenv("MIN_SQUEEZE_RVOL", "4.0"))
+MIN_SQUEEZE_PRICE = float(os.getenv("MIN_SQUEEZE_PRICE", "2.0"))
 
 
 def _get_ticker_universe() -> List[str]:
@@ -52,6 +54,9 @@ async def run_squeeze():
     today_s = today.isoformat()
 
     for sym in universe:
+        if is_etf_blacklisted(sym):
+            continue
+
         try:
             days = list(
                 _client.list_aggs(
@@ -79,14 +84,12 @@ async def run_squeeze():
 
         last_price = float(today_bar.close)
         if last_price < MIN_SQUEEZE_PRICE:
-            # ignore ultra-cheap penny stock squeezes
             continue
 
         change_pct = (last_price - prev_close) / prev_close * 100.0
         if change_pct < MIN_SQUEEZE_PCT:
             continue
 
-        # RVOL calculation
         hist = days[:-1]
         if hist:
             recent = hist[-20:] if len(hist) > 20 else hist
@@ -99,7 +102,6 @@ async def run_squeeze():
         else:
             rvol = 1.0
 
-        # Respect both global and squeeze-specific RVOL thresholds
         if rvol < max(MIN_SQUEEZE_RVOL, MIN_RVOL_GLOBAL):
             continue
 
@@ -108,13 +110,31 @@ async def run_squeeze():
             continue
 
         high = float(today_bar.high)
-        move_emoji = "🚀" if change_pct > 0 else "📉"
+        dv = last_price * vol_today
+        grade = grade_equity_setup(change_pct, rvol, dv)
 
-        # Clean, emoji-structured block (no RVOL repetition here)
+        move_emoji = "🚀" if change_pct > 0 else "📉"
+        bias = "Long momentum" if change_pct > 0 else "Short momentum"
+
+        # Position vs HOD
+        if high > 0:
+            from_high_pct = (high - last_price) / high * 100.0
+        else:
+            from_high_pct = 0.0
+
+        if abs(from_high_pct) < 1.0:
+            hod_text = "at/near HOD"
+        else:
+            hod_text = f"{from_high_pct:.1f}% below HOD"
+
         extra = (
             f"{move_emoji} Short-squeeze style move: {change_pct:.1f}% today\n"
             f"📈 Prev Close: ${prev_close:.2f} → Close: ${last_price:.2f} (High: ${high:.2f})\n"
-            f"📦 Volume: {int(vol_today):,}"
+            f"📦 Volume: {int(vol_today):,}\n"
+            f"🎯 Setup Grade: {grade}\n"
+            f"📌 Bias: {bias}\n"
+            f"📍 Position vs High: {hod_text}\n"
+            f"🔗 Chart: {chart_link(sym)}"
         )
 
         send_alert("squeeze", sym, last_price, rvol, extra=extra)
