@@ -2,118 +2,125 @@ import os
 import threading
 import time
 import asyncio
+from datetime import datetime
+import pytz
 
-import requests
-from fastapi import FastAPI
 import uvicorn
+from fastapi import FastAPI
 
-from bots.cheap import run_cheap
-from bots.earnings import run_earnings
+# --------- BOT IMPORTS ---------
+# Core original bots (9-in-1)
+from bots.premarket import run_premarket           # make sure bots/premarket.py exists
 from bots.gap import run_gap
 from bots.orb import run_orb
-from bots.squeeze import run_squeeze
-from bots.unusual import run_unusual
 from bots.volume import run_volume
+from bots.cheap import run_cheap
+from bots.unusual import run_unusual
+from bots.squeeze import run_squeeze
+from bots.earnings import run_earnings
 from bots.momentum_reversal import run_momentum_reversal
-from bots.premarket import run_premarket
-from bots.shared import (
-    now_est,
-    TELEGRAM_CHAT_ALL,
-    TELEGRAM_TOKEN_STATUS,
-    start_polygon_websocket,
-)
 
-app = FastAPI(title="MoneySignalAi — MEGA BOT (9 strategies + status)")
+# Status / heartbeat bot
+from bots.status_report import run_status_report
+
+# New advanced bots
+from bots.whales import run_whales
+from bots.trend_rider import run_trend_rider
+from bots.swing_pullback import run_swing_pullback
+from bots.panic_flush import run_panic_flush
+from bots.dark_pool_radar import run_dark_pool_radar
+from bots.iv_crush import run_iv_crush
+
+
+eastern = pytz.timezone("US/Eastern")
+
+
+def now_est_str() -> str:
+    return datetime.now(eastern).strftime("%I:%M %p EST · %b %d").lstrip("0")
+
+
+app = FastAPI(title="MoneySignalAi — Multi-Bot Suite")
 
 
 @app.get("/")
 def root():
-    """Health check endpoint for Render."""
-    return {"status": "LIVE", "time": now_est()}
+    """Simple health endpoint for Render / browser checks."""
+    return {
+        "status": "LIVE",
+        "timestamp": now_est_str(),
+        "bots": [
+            "premarket",
+            "gap",
+            "orb",
+            "volume",
+            "cheap",
+            "unusual",
+            "squeeze",
+            "earnings",
+            "momentum_reversal",
+            "whales",
+            "trend_rider",
+            "swing_pullback",
+            "panic_flush",
+            "dark_pool_radar",
+            "iv_crush",
+        ],
+    }
 
 
-def send_status() -> None:
+async def run_all_once():
     """
-    Status-report bot.
+    Kick off all bots once.
 
-    Uses:
-      - TELEGRAM_TOKEN_STATUS (status bot token)
-      - TELEGRAM_CHAT_ALL    (where to send the message)
-
-    Sends a summary that the scanners + loop are running.
-    """
-    if not TELEGRAM_CHAT_ALL:
-        print("STATUS: TELEGRAM_CHAT_ALL not set")
-        return
-
-    token = TELEGRAM_TOKEN_STATUS
-    if not token:
-        print("STATUS: TELEGRAM_TOKEN_STATUS not set (skipping status send)")
-        return
-
-    message = f"""*MoneySignalAi — MEGA BOT STATUS*  
-{now_est()}
-
-✅ Premarket scanner  
-✅ Top Volume scanner  
-✅ ORB strategy  
-✅ Short Squeeze scanner  
-✅ Unusual Option Buyers  
-✅ Cheap 0DTE / 3DTE scanner  
-✅ Gap Up / Gap Down scanner  
-✅ Earnings Movers scanner  
-✅ Momentum Reversal scanner  
-
-Polygon: REST scanners active  
-Loop: running every 30 seconds on Render.
-"""
-
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    try:
-        requests.post(
-            url,
-            data={
-                "chat_id": TELEGRAM_CHAT_ALL,
-                "text": message,
-                "parse_mode": "Markdown",
-            },
-            timeout=10,
-        )
-        print("STATUS SENT")
-    except Exception as e:
-        print(f"STATUS SEND FAILED: {e}")
-
-
-async def run_all_once() -> None:
-    """
-    Run one full scan of all bots in parallel.
-
-    Each bot is async, and will decide internally whether it has any alerts.
+    IMPORTANT:
+    - Each bot has its own time-window checks inside the file.
+    - This function just calls everything; if it's outside a bot's window,
+      that bot prints "Outside window; skipping" and returns quickly.
     """
     tasks = [
-        run_premarket(),          # NEW: premarket snapshot bot
-        run_volume(),             # Top daily volume / intraday
-        run_gap(),                # Gap up / gap down
-        run_orb(),                # Opening range breakout
-        run_squeeze(),            # Short-squeeze style
-        run_unusual(),            # Unusual options flow
-        run_cheap(),              # Cheap 0DTE/3DTE
-        run_earnings(),           # Earnings movers
-        run_momentum_reversal(),  # Intraday momentum reversal
+        # Core 9
+        run_premarket(),
+        run_gap(),
+        run_orb(),
+        run_volume(),
+        run_cheap(),
+        run_unusual(),
+        run_squeeze(),
+        run_earnings(),
+        run_momentum_reversal(),
+
+        # New bots
+        run_whales(),
+        run_trend_rider(),
+        run_swing_pullback(),
+        run_panic_flush(),
+        run_dark_pool_radar(),
+        run_iv_crush(),
+
+        # Status / heartbeat (sends only at specific times)
+        run_status_report(),
     ]
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
+    # Log any exceptions instead of crashing the loop
     bot_names = [
         "premarket",
-        "volume",
         "gap",
         "orb",
-        "squeeze",
-        "unusual",
+        "volume",
         "cheap",
+        "unusual",
+        "squeeze",
         "earnings",
         "momentum_reversal",
+        "whales",
+        "trend_rider",
+        "swing_pullback",
+        "panic_flush",
+        "dark_pool_radar",
+        "iv_crush",
+        "status_report",
     ]
 
     for name, result in zip(bot_names, results):
@@ -121,41 +128,40 @@ async def run_all_once() -> None:
             print(f"[ERROR] Bot {name} raised: {result}")
 
 
-def run_forever() -> None:
+def run_forever():
     """
-    Background thread: create a single event loop and keep
-    running all bots every 30 seconds.
+    Background loop: runs run_all_once() every 60 seconds.
+
+    - All time filters are implemented inside each bot.
+    - If the market is closed, most bots just return immediately.
     """
-    print("MoneySignalAi MEGA BOT LIVE")
-    start_polygon_websocket()
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     cycle = 0
+    print(f"[main] MoneySignalAi multi-bot loop starting at {now_est_str()}")
     while True:
         cycle += 1
-        print(f"SCAN #{cycle} @ {now_est()}")
         print(
-            "SCANNING: Premarket, Volume, Gaps, ORB, Squeeze, "
-            "Unusual, Cheap 0DTE/3DTE, Earnings, Momentum Reversal"
+            f"SCANNING CYCLE #{cycle} — "
+            "Premarket, Gap, ORB, Volume, Cheap, Unusual, Squeeze, Earnings, "
+            "Momentum, Whales, TrendRider, Pullback, PanicFlush, DarkPool, IV Crush"
         )
 
-        # Every ~2 hours: 30 seconds * 240 cycles
-        if cycle % 240 == 0:
-            send_status()
-
         try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
             loop.run_until_complete(run_all_once())
-        except Exception as e:
-            print(f"[FATAL] run_all_once crashed: {e}")
+        finally:
+            loop.close()
 
-        time.sleep(30)
+        # Adjust this if you want more or less frequency
+        time.sleep(60)
 
 
 @app.on_event("startup")
 async def startup_event():
-    """Start the scanner thread when FastAPI boots on Render."""
+    """
+    When FastAPI starts (Render boot / redeploy), start the scanner loop
+    in a background thread so the HTTP server stays responsive.
+    """
     threading.Thread(target=run_forever, daemon=True).start()
 
 
