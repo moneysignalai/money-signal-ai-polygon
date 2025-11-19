@@ -1,6 +1,8 @@
 import os
-from datetime import date, timedelta
-from typing import List
+from datetime import date, timedelta, datetime
+from typing import List, Optional, Tuple
+
+import pytz
 
 try:
     from massive import RESTClient
@@ -9,8 +11,8 @@ except ImportError:
 
 from bots.shared import (
     POLYGON_KEY,
-    MIN_VOLUME_GLOBAL,
     MIN_RVOL_GLOBAL,
+    MIN_VOLUME_GLOBAL,
     send_alert,
     get_dynamic_top_volume_universe,
     grade_equity_setup,
@@ -19,10 +21,25 @@ from bots.shared import (
 )
 
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
+eastern = pytz.timezone("US/Eastern")
 
-MIN_SQUEEZE_PCT = float(os.getenv("MIN_SQUEEZE_PCT", "12.0"))
-MIN_SQUEEZE_RVOL = float(os.getenv("MIN_SQUEEZE_RVOL", "4.0"))
-MIN_SQUEEZE_PRICE = float(os.getenv("MIN_SQUEEZE_PRICE", "2.0"))
+# Squeeze thresholds
+MIN_SQUEEZE_PRICE = float(os.getenv("MIN_SQUEEZE_PRICE", "3.0"))
+MIN_SQUEEZE_MOVE_PCT = float(os.getenv("MIN_SQUEEZE_MOVE_PCT", "9.0"))   # % gain vs prior close
+MIN_SQUEEZE_RVOL = float(os.getenv("MIN_SQUEEZE_RVOL", "4.0"))           # RVOL explosion
+MIN_SQUEEZE_DOLLAR_VOL = float(os.getenv("MIN_SQUEEZE_DOLLAR_VOL", "20000000"))  # $20M
+
+# Optional short-interest filter
+USE_SHORT_INTEREST_FILTER = os.getenv("USE_SHORT_INTEREST_FILTER", "false").lower() == "true"
+MIN_SHORT_PERCENT = float(os.getenv("MIN_SHORT_PERCENT", "22.0"))
+MIN_DTC = float(os.getenv("MIN_DTC", "5.5"))  # days-to-cover
+
+
+def _in_squeeze_window() -> bool:
+    """Short Squeeze Pro: RTH 9:30–16:00 EST."""
+    now_et = datetime.now(eastern)
+    minutes = now_et.hour * 60 + now_et.minute
+    return 9 * 60 + 30 <= minutes <= 16 * 60
 
 
 def _get_ticker_universe() -> List[str]:
@@ -32,21 +49,46 @@ def _get_ticker_universe() -> List[str]:
     return get_dynamic_top_volume_universe(max_tickers=100, volume_coverage=0.90)
 
 
+def get_short_interest(sym: str) -> Optional[Tuple[float, float]]:
+    """
+    Hook for short-interest data.
+
+    Return:
+        (short_percent_of_float, days_to_cover)
+
+    For now this is a stub that returns None.
+    Later you can wire this into a DB or API that you populate
+    from FINRA/Nasdaq/Ortex/etc and flip USE_SHORT_INTEREST_FILTER=true.
+    """
+    # Example of what a real implementation might look like:
+    # rec = your_short_db.get(sym)
+    # if not rec: return None
+    # return (rec.short_percent, rec.days_to_cover)
+    return None
+
+
 async def run_squeeze():
     """
-    Short-squeeze style scanner.
+    Short Squeeze Pro (behavioral version):
 
-    Requirements:
-      • Move >= MIN_SQUEEZE_PCT since yesterday's close
-      • Last price >= MIN_SQUEEZE_PRICE
-      • RVOL >= max(MIN_SQUEEZE_RVOL, MIN_RVOL_GLOBAL)
-      • Volume >= MIN_VOLUME_GLOBAL
+      • Price >= MIN_SQUEEZE_PRICE
+      • Gain vs prior close >= MIN_SQUEEZE_MOVE_PCT
+      • Day RVOL >= max(MIN_SQUEEZE_RVOL, MIN_RVOL_GLOBAL)
+      • Day volume >= MIN_VOLUME_GLOBAL
+      • Dollar volume >= MIN_SQUEEZE_DOLLAR_VOL
+      • Optional short-interest gate if USE_SHORT_INTEREST_FILTER is true:
+          - short% of float >= MIN_SHORT_PERCENT
+          - days-to-cover >= MIN_DTC
+      • Only during 9:30–16:00 EST
     """
     if not POLYGON_KEY:
         print("[squeeze] POLYGON_KEY not set; skipping scan.")
         return
     if not _client:
         print("[squeeze] Client not initialized; skipping scan.")
+        return
+    if not _in_squeeze_window():
+        print("[squeeze] Outside 9:30–16:00 window; skipping scan.")
         return
 
     universe = _get_ticker_universe()
@@ -57,6 +99,7 @@ async def run_squeeze():
         if is_etf_blacklisted(sym):
             continue
 
+        # Daily bars for % move & RVOL
         try:
             days = list(
                 _client.list_aggs(
@@ -76,18 +119,16 @@ async def run_squeeze():
             continue
 
         today_bar = days[-1]
-        prev = days[-2]
+        prev_bar = days[-2]
 
-        prev_close = float(prev.close)
-        if prev_close <= 0:
-            continue
-
+        prev_close = float(prev_bar.close)
         last_price = float(today_bar.close)
-        if last_price < MIN_SQUEEZE_PRICE:
+
+        if last_price < MIN_SQUEEZE_PRICE or prev_close <= 0:
             continue
 
-        change_pct = (last_price - prev_close) / prev_close * 100.0
-        if change_pct < MIN_SQUEEZE_PCT:
+        move_pct = (last_price - prev_close) / prev_close * 100.0
+        if move_pct < MIN_SQUEEZE_MOVE_PCT:
             continue
 
         hist = days[:-1]
@@ -105,20 +146,54 @@ async def run_squeeze():
         if rvol < max(MIN_SQUEEZE_RVOL, MIN_RVOL_GLOBAL):
             continue
 
-        vol_today = float(today_bar.volume)
-        if vol_today < MIN_VOLUME_GLOBAL:
+        day_vol = float(today_bar.volume)
+        if day_vol < MIN_VOLUME_GLOBAL:
             continue
 
-        high = float(today_bar.high)
-        dv = last_price * vol_today
-        grade = grade_equity_setup(change_pct, rvol, dv)
+        dollar_vol = last_price * day_vol
+        if dollar_vol < MIN_SQUEEZE_DOLLAR_VOL:
+            continue
 
-        move_emoji = "🚀" if change_pct > 0 else "📉"
-        bias = "Long momentum" if change_pct > 0 else "Short momentum"
+        # Optional short-interest gate
+        si_text = "Short data: N/A"
+        if USE_SHORT_INTEREST_FILTER:
+            si = get_short_interest(sym)
+            if not si:
+                # If we strictly require short data, skip when missing
+                print(f"[squeeze] Missing short-interest for {sym}; skipping due to USE_SHORT_INTEREST_FILTER.")
+                continue
 
-        # Position vs HOD
-        if high > 0:
-            from_high_pct = (high - last_price) / high * 100.0
+            short_pct, dtc = si
+            if short_pct < MIN_SHORT_PERCENT or dtc < MIN_DTC:
+                continue
+
+            si_text = f"Short {short_pct:.1f}% · DTC {dtc:.1f} days"
+
+        # Intraday context: position vs HOD
+        try:
+            mins = list(
+                _client.list_aggs(
+                    ticker=sym,
+                    multiplier=1,
+                    timespan="minute",
+                    from_=today_s,
+                    to=today_s,
+                    limit=10_000,
+                )
+            )
+        except Exception as e:
+            print(f"[squeeze] minute fetch failed for {sym}: {e}")
+            mins = []
+
+        if mins:
+            day_high = max(float(b.high) for b in mins)
+            day_low = min(float(b.low) for b in mins)
+        else:
+            day_high = float(today_bar.high)
+            day_low = float(today_bar.low)
+
+        if day_high > 0:
+            from_high_pct = (day_high - last_price) / day_high * 100.0
         else:
             from_high_pct = 0.0
 
@@ -127,13 +202,19 @@ async def run_squeeze():
         else:
             hod_text = f"{from_high_pct:.1f}% below HOD"
 
+        dv = dollar_vol
+        grade = grade_equity_setup(abs(move_pct), rvol, dv)
+
+        bias = "Nuclear long squeeze candidate" if move_pct > 0 else "Violent downside squeeze / liquidation"
+
         extra = (
-            f"{move_emoji} Short-squeeze style move: {change_pct:.1f}% today\n"
-            f"📈 Prev Close: ${prev_close:.2f} → Close: ${last_price:.2f} (High: ${high:.2f})\n"
-            f"📦 Volume: {int(vol_today):,}\n"
+            f"🔥 Short Squeeze Behaviour Detected\n"
+            f"📈 Prev Close: ${prev_close:.2f} → Close: ${last_price:.2f} ({move_pct:.1f}%)\n"
+            f"📏 Day Range: Low ${day_low:.2f} – High ${day_high:.2f} · Close {hod_text}\n"
+            f"📊 RVOL: {rvol:.1f}x · Volume: {int(day_vol):,} (≈ ${dollar_vol:,.0f})\n"
+            f"📌 {si_text}\n"
             f"🎯 Setup Grade: {grade}\n"
             f"📌 Bias: {bias}\n"
-            f"📍 Position vs High: {hod_text}\n"
             f"🔗 Chart: {chart_link(sym)}"
         )
 
