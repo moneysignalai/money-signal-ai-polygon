@@ -224,6 +224,7 @@ These are examples of how Telegram messages look.
 In your own alerts the tickers, numbers, and times will be live.
 
 🐋 Whale Flow
+
 🐋 WHALE FLOW — META
 🕒 10:35 AM EST · Nov 21
 💰 Underlying: $317.22 · RVOL 3.9x
@@ -234,6 +235,7 @@ In your own alerts the tickers, numbers, and times will be live.
 🔗 Chart: https://www.tradingview.com/chart/?symbol=META
 
 🌑 Dark Pool Radar
+
 🌑 DARK POOL RADAR — AMD
 🕒 7:42 PM EST · Nov 21
 💰 $117.88 · RVOL 2.8x
@@ -245,6 +247,7 @@ In your own alerts the tickers, numbers, and times will be live.
 🔗 Chart: https://www.tradingview.com/chart/?symbol=AMD
 
 🔥 Cheap 0DTE / 3DTE
+
 🔥 CHEAP — BBAI
 🕒 12:14 PM EST · Nov 21
 💰 Last: $5.98
@@ -257,6 +260,7 @@ In your own alerts the tickers, numbers, and times will be live.
 
 
 🛠 Developer Notes
+
 	•	All bots are structured as async coroutines (async def run_xxx()).
 	•	bots/shared.py centralizes:
 	•	Global ENV
@@ -279,11 +283,13 @@ Check:
 SCANNING: Premarket, Volume, Gaps, ORB, ...
 
 3.	Are your global filters too strict?
+
 	•	Try temporarily:
 MIN_RVOL_GLOBAL=2.0
 MIN_VOLUME_GLOBAL=500000
 
 ❓ Why am I getting too many alerts?
+
 	•	Raise thresholds:
 MIN_RVOL_GLOBAL=3.0
 MIN_VOLUME_GLOBAL=1500000
@@ -294,10 +300,12 @@ DARK_MIN_TOTAL_NOTIONAL=40000000
 TICKER_UNIVERSE=AAPL,MSFT,TSLA,NVDA,META,AMZN
 
 ❓ Does this place trades for me?
+
 No.
 This is an information and alert system only. You (or your own trading system) decide whether to trade.
 
 🧭 Roadmap
+
 	•	🧬 Greeks Extreme Bot (gamma, vanna, charm pressure extremes)
 	•	⚖️ Options vs Equity Divergence Bot (flow doesn’t match price)
 	•	🧲 Liquidity Vacuum Detector (thin-book sweeps)
@@ -328,5 +336,4 @@ PRs, issues, and ideas are welcome.
   Built for traders who don’t have time to babysit every chart. ⚡<br>
   <b>Let the bots watch the market. You just watch the alerts.</b>
 </p>
-```
 
