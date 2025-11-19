@@ -18,8 +18,9 @@ from bots.shared import (
 
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
-MIN_OPTION_CONTRACT_VOLUME = int(os.getenv("MIN_OPTION_CONTRACT_VOLUME", "5000"))
+MIN_OPTION_CONTRACT_VOLUME = int(os.getenv("MIN_OPTION_CONTRACT_VOLUME", "2000"))
 MAX_CONTRACTS_PER_UNDERLYING = int(os.getenv("MAX_CONTRACTS_PER_UNDERLYING", "40"))
+MIN_UNUSUAL_NOTIONAL = float(os.getenv("MIN_UNUSUAL_NOTIONAL", "200000"))  # $200k default
 
 
 def _get_ticker_universe() -> List[str]:
@@ -44,7 +45,7 @@ def _decode_contract_pretty(sym: str, contract_ticker: str, exp: Optional[date],
     try:
         pretty_date = exp.strftime("%m/%d/%Y")
         side_letter = side[0].upper() if side else "?"
-        return f"{sym} {pretty_date} {strike:.2f} {side_letter}"
+        return f"{sym} {pretty_date:.10s} {strike:.2f} {side_letter}"
     except Exception:
         return f"{contract_ticker} ({side} {strike:.2f})"
 
@@ -84,16 +85,14 @@ def _scan_unusual_for_symbol(sym: str):
         if not exp:
             continue
 
-        days_to_exp = (exp - today).days
-        if days_to_exp < 0 or days_to_exp > 7:
+        dte = (exp - today).days
+        if dte < 0 or dte > 7:  # short-dated sweeps only
             continue
 
         strike = float(getattr(c, "strike_price", 0.0) or 0.0)
-        if strike <= 0:
+        if strike <= 0 or underlying_px <= 0:
             continue
 
-        if underlying_px <= 0:
-            continue
         moneyness = abs(strike - underlying_px) / underlying_px
         if moneyness > 0.20:
             continue
@@ -102,6 +101,7 @@ def _scan_unusual_for_symbol(sym: str):
         if not contract_ticker:
             continue
 
+        # Contract tape
         try:
             bars = list(
                 _client.list_aggs(
@@ -125,13 +125,17 @@ def _scan_unusual_for_symbol(sym: str):
             continue
 
         total_prem = float(sum(b.close * b.volume for b in bars))
-        notional = total_prem * 100.0
         avg_price = total_prem / max(vol_today, 1.0)
+        notional = total_prem * 100.0
+
+        # Core spec: $200k+ in the SAME contract
+        if notional < MIN_UNUSUAL_NOTIONAL:
+            continue
 
         side = getattr(c, "contract_type", "unknown").upper()
         pretty_name = _decode_contract_pretty(sym, contract_ticker, exp, side, strike)
 
-        # ITM / OTM
+        # ITM / OTM tag
         if side.startswith("C"):
             itm = underlying_px > strike
         elif side.startswith("P"):
@@ -141,12 +145,12 @@ def _scan_unusual_for_symbol(sym: str):
         itm_tag = "ITM" if itm else "OTM"
 
         moneyness_pct = moneyness * 100.0
-        flow_desc = describe_option_flow(side, days_to_exp, moneyness)
+        flow_desc = describe_option_flow(side, dte, moneyness)
 
         extra = (
-            f"🎯 {side} flow: {pretty_name}\n"
+            f"🕵️ Unusual {side} sweep: {pretty_name}\n"
             f"📌 Flow Type: {flow_desc}\n"
-            f"⏱ DTE: {days_to_exp} · {itm_tag} · Moneyness {moneyness_pct:.1f}%\n"
+            f"⏱ DTE: {dte} · {itm_tag} · Moneyness {moneyness_pct:.1f}%\n"
             f"📦 Volume: {int(vol_today):,} contracts · Avg: ${avg_price:.2f}\n"
             f"💰 Notional: ≈ ${notional:,.0f}\n"
             f"🔗 Chart: {chart_link(sym)}"
@@ -158,6 +162,14 @@ def _scan_unusual_for_symbol(sym: str):
 
 
 async def run_unusual():
+    """
+    Unusual Options Sweeps:
+      • Short-dated (<=7 DTE)
+      • Near-the-money (<=20% from spot)
+      • Volume above MIN_OPTION_CONTRACT_VOLUME
+      • Notional >= MIN_UNUSUAL_NOTIONAL (default $200k)
+      • No explicit time-window guard → "all day"
+    """
     if not POLYGON_KEY:
         print("[unusual] POLYGON_KEY not set; skipping scan.")
         return
