@@ -1,6 +1,8 @@
 import os
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 from typing import List
+
+import pytz
 
 try:
     from massive import RESTClient
@@ -20,7 +22,16 @@ from bots.shared import (
 
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
+eastern = pytz.timezone("US/Eastern")
+
 ORB_MINUTES = int(os.getenv("ORB_MINUTES", "15"))
+
+
+def _in_orb_window() -> bool:
+    """Only run 9:45–11:00 EST."""
+    now_et = datetime.now(eastern)
+    minutes = now_et.hour * 60 + now_et.minute
+    return 9 * 60 + 45 <= minutes <= 11 * 60
 
 
 def _get_ticker_universe() -> List[str]:
@@ -32,13 +43,19 @@ def _get_ticker_universe() -> List[str]:
 
 async def run_orb():
     """
-    Opening Range Breakout (ORB) bot.
+    Opening Range Breakout (ORB) bot:
+      • Uses first ORB_MINUTES to define range
+      • Break above high = long breakout
+      • Break below low = short breakdown
     """
     if not POLYGON_KEY:
         print("[orb] POLYGON_KEY not set; skipping scan.")
         return
     if not _client:
         print("[orb] Client not initialized; skipping scan.")
+        return
+    if not _in_orb_window():
+        print("[orb] Outside 9:45–11:00 window; skipping scan.")
         return
 
     universe = _get_ticker_universe()
@@ -77,7 +94,7 @@ async def run_orb():
         last_bar = rest[-1]
         last_price = float(last_bar.close)
 
-        # Daily bars for RVOL / volume / prev close
+        # Daily bars
         try:
             days = list(
                 _client.list_aggs(
@@ -136,6 +153,24 @@ async def run_orb():
         grade = grade_equity_setup(abs(move_pct), rvol, dv)
         bias = "Long ORB breakout" if last_price > orb_high else "Short ORB breakdown"
 
+        # Simple trade idea: risk = range size, target = 1.5R
+        range_size = orb_high - orb_low
+        if range_size > 0:
+            if last_price > orb_high:
+                entry = orb_high
+                risk = orb_low
+                risk_per_share = entry - risk
+                target = entry + 1.5 * risk_per_share
+                idea = f"Long > {entry:.2f}, risk {risk:.2f}, target ~{target:.2f}"
+            else:
+                entry = orb_low
+                risk = orb_high
+                risk_per_share = risk - entry
+                target = entry - 1.5 * risk_per_share
+                idea = f"Short < {entry:.2f}, risk {risk:.2f}, target ~{target:.2f}"
+        else:
+            idea = "Use range high/low as trigger & risk."
+
         extra = (
             f"{emoji} {direction} ({ORB_MINUTES}-min)\n"
             f"📏 Range: {orb_low:.2f} – {orb_high:.2f}\n"
@@ -143,6 +178,7 @@ async def run_orb():
             f"📦 Day Vol: {int(vol_today):,}\n"
             f"🎯 Setup Grade: {grade}\n"
             f"📌 Bias: {bias}\n"
+            f"🧠 Idea: {idea}\n"
             f"🔗 Chart: {chart_link(sym)}"
         )
 
