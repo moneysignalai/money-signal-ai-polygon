@@ -7,15 +7,26 @@ try:
 except ImportError:
     from polygon import RESTClient
 
-from bots.shared import POLYGON_KEY, MIN_RVOL_GLOBAL, MIN_VOLUME_GLOBAL, send_alert, get_dynamic_top_volume_universe
+from bots.shared import (
+    POLYGON_KEY,
+    MIN_RVOL_GLOBAL,
+    MIN_VOLUME_GLOBAL,
+    send_alert,
+    get_dynamic_top_volume_universe,
+)
 
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
 EARNINGS_LOOKBACK_DAYS = int(os.getenv("EARNINGS_LOOKBACK_DAYS", "2"))
-MIN_EARNINGS_MOVE_PCT = float(os.getenv("MIN_EARNINGS_MOVE_PCT", "3.0"))
+MIN_EARNINGS_MOVE_PCT = float(os.getenv("MIN_EARNINGS_MOVE_PCT", "5.0"))
+MIN_EARNINGS_PRICE = float(os.getenv("MIN_EARNINGS_PRICE", "2.0"))  # avoid sub-$2 junk
 
 
 def _get_ticker_universe() -> List[str]:
+    """
+    If EARNINGS_TICKER_UNIVERSE is set, use that (comma-separated list).
+    Otherwise, fall back to global TICKER_UNIVERSE or dynamic top-volume universe.
+    """
     env = os.getenv("EARNINGS_TICKER_UNIVERSE") or os.getenv("TICKER_UNIVERSE")
     if env:
         return [t.strip().upper() for t in env.split(",") if t.strip()]
@@ -23,6 +34,10 @@ def _get_ticker_universe() -> List[str]:
 
 
 def _had_recent_earnings_news(sym: str, client: RESTClient, today: date) -> bool:
+    """
+    Very lightweight check: did this ticker have news mentioning 'earnings' or 'results'
+    in the last EARNINGS_LOOKBACK_DAYS?
+    """
     start = (today - timedelta(days=EARNINGS_LOOKBACK_DAYS)).isoformat()
     try:
         news_iter = client.list_ticker_news(
@@ -37,6 +52,8 @@ def _had_recent_earnings_news(sym: str, client: RESTClient, today: date) -> bool
         published = getattr(n, "published_utc", None)
         if not published:
             continue
+
+        # basic date filter
         if isinstance(published, str) and published[:10] < start:
             continue
 
@@ -50,6 +67,13 @@ def _had_recent_earnings_news(sym: str, client: RESTClient, today: date) -> bool
 async def run_earnings():
     """
     Earnings-driven movers.
+
+    Requirements:
+      - recent earnings-related news
+      - move >= MIN_EARNINGS_MOVE_PCT since yesterday's close
+      - price >= MIN_EARNINGS_PRICE
+      - RVOL >= MIN_RVOL_GLOBAL
+      - volume >= MIN_VOLUME_GLOBAL
     """
     if not POLYGON_KEY:
         print("[earnings] POLYGON_KEY not set; skipping scan.")
@@ -63,6 +87,7 @@ async def run_earnings():
     today_s = today.isoformat()
 
     for sym in universe:
+        # Quick guard: ignore symbols with no earnings-related news
         if not _had_recent_earnings_news(sym, _client, today):
             continue
 
@@ -91,7 +116,12 @@ async def run_earnings():
         if prev_close <= 0:
             continue
 
-        move_pct = (float(today_bar.close) - prev_close) / prev_close * 100.0
+        last_price = float(today_bar.close)
+        if last_price < MIN_EARNINGS_PRICE:
+            # filter out low-priced junk earnings names
+            continue
+
+        move_pct = (last_price - prev_close) / prev_close * 100.0
         if abs(move_pct) < MIN_EARNINGS_MOVE_PCT:
             continue
 
@@ -114,12 +144,11 @@ async def run_earnings():
         if vol_today < MIN_VOLUME_GLOBAL:
             continue
 
-        last_price = float(today_bar.close)
-
+        # Structured, emoji-based block (no duplicate RVOL line)
         extra = (
-            f"Earnings move {move_pct:.1f}% today\n"
-            f"Prev Close ${prev_close:.2f} → Close ${last_price:.2f}\n"
-            f"RVOL {rvol:.1f}x · Volume {int(vol_today):,}"
+            f"📣 Earnings move: {move_pct:.1f}% today\n"
+            f"📈 Prev Close: ${prev_close:.2f} → Close: ${last_price:.2f}\n"
+            f"📦 Volume: {int(vol_today):,}"
         )
 
         send_alert("earnings", sym, last_price, rvol, extra=extra)
