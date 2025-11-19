@@ -11,7 +11,7 @@ from bots.shared import POLYGON_KEY, send_alert, get_dynamic_top_volume_universe
 
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
-MIN_OPTION_CONTRACT_VOLUME = int(os.getenv("MIN_OPTION_CONTRACT_VOLUME", "2000"))
+MIN_OPTION_CONTRACT_VOLUME = int(os.getenv("MIN_OPTION_CONTRACT_VOLUME", "5000"))
 MAX_CONTRACTS_PER_UNDERLYING = int(os.getenv("MAX_CONTRACTS_PER_UNDERLYING", "40"))
 
 
@@ -31,6 +31,21 @@ def _safe_parse_date(d: Optional[str]) -> Optional[date]:
         return None
 
 
+def _decode_contract_pretty(sym: str, contract_ticker: str, exp: Optional[date], side: str, strike: float) -> str:
+    """
+    Try to turn "O:ACHR251121C00009000" into something like:
+      "ACHR 11/21/2025 9.00 C"
+    """
+    if not exp:
+        return f"{contract_ticker} ({side} {strike:.2f})"
+    try:
+        pretty_date = exp.strftime("%m/%d/%Y")
+        side_letter = side[0].upper() if side else "?"
+        return f"{sym} {pretty_date} {strike:.2f} {side_letter}"
+    except Exception:
+        return f"{contract_ticker} ({side} {strike:.2f})"
+
+
 def _scan_unusual_for_symbol(sym: str):
     if not _client:
         return []
@@ -38,6 +53,7 @@ def _scan_unusual_for_symbol(sym: str):
     today = date.today()
     today_s = today.isoformat()
 
+    # Underlying last price
     try:
         last_trade = _client.get_last_trade(ticker=sym)
         underlying_px = float(last_trade.price)
@@ -74,8 +90,11 @@ def _scan_unusual_for_symbol(sym: str):
         if strike <= 0:
             continue
 
+        # Near the money: ±20% band
+        if underlying_px <= 0:
+            continue
         moneyness = abs(strike - underlying_px) / underlying_px
-        if moneyness > 0.2:
+        if moneyness > 0.20:
             continue
 
         contract_ticker = getattr(c, "ticker", None)
@@ -104,16 +123,29 @@ def _scan_unusual_for_symbol(sym: str):
         if vol_today < MIN_OPTION_CONTRACT_VOLUME:
             continue
 
-        notional = float(sum(b.close * b.volume for b in bars)) * 100.0
-        avg_price = notional / (vol_today * 100.0) if vol_today > 0 else 0.0
+        total_prem = float(sum(b.close * b.volume for b in bars))
+        notional = total_prem * 100.0
+        avg_price = total_prem / max(vol_today, 1.0)
 
         side = getattr(c, "contract_type", "unknown").upper()
+        pretty_name = _decode_contract_pretty(sym, contract_ticker, exp, side, strike)
+
+        # ITM / OTM
+        if side.startswith("C"):
+            itm = underlying_px > strike
+        elif side.startswith("P"):
+            itm = underlying_px < strike
+        else:
+            itm = False
+        itm_tag = "ITM" if itm else "OTM"
+
+        moneyness_pct = moneyness * 100.0
+
         extra = (
-            f"Unusual {side} flow in {contract_ticker}\n"
-            f"Underlying {sym} ≈ {underlying_px:.2f}\n"
-            f"Strike {strike:.2f} · DTE {days_to_exp}\n"
-            f"Volume {int(vol_today):,} contracts · Avg Price ${avg_price:.2f}\n"
-            f"Notional ≈ ${notional:,.0f}"
+            f"🎯 {side} flow: {pretty_name}\n"
+            f"⏱ DTE: {days_to_exp} · {itm_tag} · Moneyness {moneyness_pct:.1f}%\n"
+            f"📦 Volume: {int(vol_today):,} contracts · Avg: ${avg_price:.2f}\n"
+            f"💰 Notional: ≈ ${notional:,.0f}"
         )
 
         alerts.append((sym, underlying_px, 0.0, extra))
@@ -138,4 +170,5 @@ async def run_unusual():
             continue
 
         for _sym, last_price, rvol, extra in alerts:
-            send_alert("unusual", _sym, last_price, rvol, extra=extra)
+            # rvol is per underlying; we don't compute it here → pass 0.0
+            send_alert("unusual", _sym, last_price, 0.0, extra=extra)
