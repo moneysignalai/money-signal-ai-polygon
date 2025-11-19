@@ -13,16 +13,15 @@ eastern = pytz.timezone("US/Eastern")
 
 
 def now_est() -> str:
-    # Example: "09:34 AM EST · Nov 18"
+    # Example: "06:58 PM EST · Nov 18"
     return datetime.now(eastern).strftime("%I:%M %p EST · %b %d")
 
 
 # ---------- Global filters (tweak via ENV if needed) ----------
 
-# These are *base* filters used by several bots.
-# You can tighten them via ENV if you want fewer, higher-conviction alerts.
-MIN_RVOL_GLOBAL = float(os.getenv("MIN_RVOL_GLOBAL", "2.0"))        # was 1.5 → now 2.0
-MIN_VOLUME_GLOBAL = int(os.getenv("MIN_VOLUME_GLOBAL", "500000"))   # was 300k → now 500k
+# Base global filters for multiple bots
+MIN_RVOL_GLOBAL = float(os.getenv("MIN_RVOL_GLOBAL", "2.0"))
+MIN_VOLUME_GLOBAL = int(os.getenv("MIN_VOLUME_GLOBAL", "500000"))
 RSI_OVERSOLD = 35
 RSI_OVERBOUGHT = 65
 
@@ -41,6 +40,19 @@ TELEGRAM_TOKEN_STATUS = os.getenv("TELEGRAM_TOKEN_STATUS", "")
 
 
 # ---------- Telegram helpers ----------
+
+_EMOJI_MAP = {
+    "premarket": "🌅",
+    "volume": "📊",
+    "gap": "🕳️",
+    "orb": "📏",
+    "squeeze": "🧨",
+    "unusual": "🕵️",
+    "cheap": "💸",
+    "earnings": "📣",
+    "momentum_reversal": "🔄",
+}
+
 
 def _pick_alert_token(bot_name: str) -> str:
     """
@@ -65,10 +77,12 @@ def send_alert(
     """
     Core Telegram send function used by all bots.
 
-    Adds:
-      - EST timestamp
-      - Bot/strategy name in header
-      - Standardized price/RVOL formatting
+    Layout:
+
+    🌅 [06:58 PM EST · Nov 18]  PREMARKET — `AAPL`
+    💰 Last: $189.23 · 📊 RVOL 3.1x
+
+    (bot-specific details...)
     """
     if not TELEGRAM_CHAT_ALL:
         print("ALERT SKIPPED: TELEGRAM_CHAT_ALL not set")
@@ -81,20 +95,19 @@ def send_alert(
 
     timestamp = now_est()
     title = bot_name.upper().replace("_", " ")
+    emoji = _EMOJI_MAP.get(bot_name.lower(), "📈")
 
-    # Header with time + scanner name
-    # Example:
-    # [09:35 AM EST · Nov 18] PREMARKET — AAPL
-    header = f"*[{timestamp}]*  *{title}* — {symbol}"
+    # Header
+    header = f"{emoji} *[{timestamp}]*  *{title}* — `{symbol}`"
 
-    # Base line: price (+ RVOL when available)
-    line1 = f"Last: ${last_price:.2f}"
+    # Core line: price (+ RVOL if provided)
+    line1 = f"💰 Last: ${last_price:.2f}"
     if rvol > 0:
-        line1 += f" · RVOL {rvol:.1f}x"
+        line1 += f" · 📊 RVOL {rvol:.1f}x"
 
     msg = f"{header}\n{line1}"
 
-    # Strategy-specific details come through `extra`
+    # Strategy-specific block
     if extra:
         msg += f"\n\n{extra}"
 
