@@ -1,6 +1,8 @@
 import os
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 from typing import List
+
+import pytz
 
 try:
     from massive import RESTClient
@@ -20,9 +22,20 @@ from bots.shared import (
 
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
-MIN_GAP_PCT = float(os.getenv("MIN_GAP_PCT", "4.0"))        # min % gap vs prev close
-MIN_GAP_PRICE = float(os.getenv("MIN_GAP_PRICE", "2.0"))    # min price
-MIN_GAP_RVOL = float(os.getenv("MIN_GAP_RVOL", "2.0"))      # min RVOL for valid gap
+eastern = pytz.timezone("US/Eastern")
+
+# % gap threshold
+MIN_GAP_PCT = float(os.getenv("MIN_GAP_PCT", "4.0"))      # min |gap|
+MAX_GAP_PCT = float(os.getenv("MAX_GAP_PCT", "35.0"))     # max |gap|
+MIN_GAP_PRICE = float(os.getenv("MIN_GAP_PRICE", "2.0"))  # min last price
+MIN_GAP_RVOL = float(os.getenv("MIN_GAP_RVOL", "2.5"))    # min RVOL
+
+
+def _in_gap_window() -> bool:
+    """Only run 9:30–10:30 AM EST."""
+    now_et = datetime.now(eastern)
+    minutes = now_et.hour * 60 + now_et.minute
+    return 9 * 60 + 30 <= minutes <= 10 * 60 + 30
 
 
 def _get_ticker_universe() -> List[str]:
@@ -34,17 +47,22 @@ def _get_ticker_universe() -> List[str]:
 
 async def run_gap():
     """
-    Gap scanner:
-      • Open vs prior close >= MIN_GAP_PCT
-      • Price >= MIN_GAP_PRICE
+    Gap Radar:
+      • |Gap| between MIN_GAP_PCT and MAX_GAP_PCT vs prior close
+      • Works for both gap-up and gap-down
+      • Last price >= MIN_GAP_PRICE
       • RVOL >= max(MIN_GAP_RVOL, MIN_RVOL_GLOBAL)
       • Volume >= MIN_VOLUME_GLOBAL
+      • Only during 9:30–10:30 AM EST
     """
     if not POLYGON_KEY:
         print("[gap] POLYGON_KEY not set; skipping scan.")
         return
     if not _client:
         print("[gap] Client not initialized; skipping scan.")
+        return
+    if not _in_gap_window():
+        print("[gap] Outside 9:30–10:30 window; skipping scan.")
         return
 
     universe = _get_ticker_universe()
@@ -85,8 +103,12 @@ async def run_gap():
         if last_price < MIN_GAP_PRICE:
             continue
 
+        # gap % (open vs prev close)
         gap_pct = (open_today - prev_close) / prev_close * 100.0
-        if abs(gap_pct) < MIN_GAP_PCT:
+        gap_mag = abs(gap_pct)
+
+        # Both directions allowed, but magnitude must be in band
+        if not (MIN_GAP_PCT <= gap_mag <= MAX_GAP_PCT):
             continue
 
         # RVOL
@@ -110,25 +132,37 @@ async def run_gap():
             continue
 
         total_move_pct = (last_price - prev_close) / prev_close * 100.0
-        if open_today > 0:
-            intraday_pct = (last_price - open_today) / open_today * 100.0
-        else:
-            intraday_pct = 0.0
+        intraday_pct = (
+            (last_price - open_today) / open_today * 100.0
+            if open_today > 0 else 0.0
+        )
 
         dv = last_price * vol_today
         grade = grade_equity_setup(abs(total_move_pct), rvol, dv)
-        if total_move_pct > 0:
-            bias = "Long gap-and-go"
-        else:
-            bias = "Short / fade gap"
 
-        direction_emoji = "🚀" if gap_pct > 0 else "📉"
+        # Direction-specific bias + emoji
+        if gap_pct > 0:
+            direction = "Gap-Up"
+            emoji = "🚀"
+            bias = (
+                "Long gap-and-go momentum"
+                if total_move_pct > 0
+                else "Caution: gap-up with weak follow-through"
+            )
+        else:
+            direction = "Gap-Down"
+            emoji = "⚠️"
+            bias = (
+                "Short / fade gap-down breakdown"
+                if total_move_pct < 0
+                else "Caution: gap-down being bought"
+            )
 
         extra = (
-            f"{direction_emoji} Gap vs prior close: {gap_pct:.1f}%\n"
-            f"📈 Prev Close: ${prev_close:.2f} → Open: ${open_today:.2f} → Close: ${last_price:.2f}\n"
+            f"{emoji} {direction}: {gap_pct:.1f}% vs prior close\n"
+            f"📈 Prev Close: ${prev_close:.2f} → Open: ${open_today:.2f} → Last: ${last_price:.2f}\n"
             f"📊 Intraday from open: {intraday_pct:.1f}% · Total move: {total_move_pct:.1f}%\n"
-            f"📦 Volume: {int(vol_today):,}\n"
+            f"📦 Day Volume: {int(vol_today):,}\n"
             f"🎯 Setup Grade: {grade}\n"
             f"📌 Bias: {bias}\n"
             f"🔗 Chart: {chart_link(sym)}"
