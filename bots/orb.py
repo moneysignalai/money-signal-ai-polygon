@@ -7,7 +7,16 @@ try:
 except ImportError:
     from polygon import RESTClient
 
-from bots.shared import POLYGON_KEY, MIN_RVOL_GLOBAL, MIN_VOLUME_GLOBAL, send_alert, get_dynamic_top_volume_universe
+from bots.shared import (
+    POLYGON_KEY,
+    MIN_RVOL_GLOBAL,
+    MIN_VOLUME_GLOBAL,
+    send_alert,
+    get_dynamic_top_volume_universe,
+    grade_equity_setup,
+    is_etf_blacklisted,
+    chart_link,
+)
 
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
@@ -37,6 +46,9 @@ async def run_orb():
     today_s = today.isoformat()
 
     for sym in universe:
+        if is_etf_blacklisted(sym):
+            continue
+
         try:
             mins = list(
                 _client.list_aggs(
@@ -65,6 +77,7 @@ async def run_orb():
         last_bar = rest[-1]
         last_price = float(last_bar.close)
 
+        # Daily bars for RVOL / volume / prev close
         try:
             days = list(
                 _client.list_aggs(
@@ -80,10 +93,13 @@ async def run_orb():
             print(f"[orb] daily fetch failed for {sym}: {e}")
             continue
 
-        if not days:
+        if len(days) < 2:
             continue
 
         today_day = days[-1]
+        prev_day = days[-2]
+        prev_close = float(prev_day.close)
+
         hist = days[:-1]
         if hist:
             recent = hist[-20:] if len(hist) > 20 else hist
@@ -115,10 +131,19 @@ async def run_orb():
         if not direction:
             continue
 
+        move_pct = (last_price - prev_close) / prev_close * 100.0 if prev_close > 0 else 0.0
+        dv = last_price * vol_today
+        grade = grade_equity_setup(abs(move_pct), rvol, dv)
+        bias = "Long ORB breakout" if last_price > orb_high else "Short ORB breakdown"
+
         extra = (
             f"{emoji} {direction} ({ORB_MINUTES}-min)\n"
             f"📏 Range: {orb_low:.2f} – {orb_high:.2f}\n"
-            f"📦 Day Vol: {int(vol_today):,}"
+            f"📈 Prev Close: ${prev_close:.2f} → Last: ${last_price:.2f} ({move_pct:.1f}%)\n"
+            f"📦 Day Vol: {int(vol_today):,}\n"
+            f"🎯 Setup Grade: {grade}\n"
+            f"📌 Bias: {bias}\n"
+            f"🔗 Chart: {chart_link(sym)}"
         )
 
         send_alert("orb", sym, last_price, rvol, extra=extra)
