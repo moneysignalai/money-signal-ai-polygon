@@ -51,6 +51,7 @@ def _get_ticker_universe() -> List[str]:
 async def run_volume():
     """
     Volume Monster:
+
       • Any 1-min bar with volume >= MIN_MONSTER_BAR_SHARES
       • Underlying price >= MIN_MONSTER_PRICE
       • Day RVOL >= max(MIN_VOLUME_RVOL, MIN_RVOL_GLOBAL)
@@ -154,7 +155,7 @@ async def run_volume():
         for b in mins:
             if b.volume >= MIN_MONSTER_BAR_SHARES:
                 monster_bar = b
-        # if multiple qualify, we'll just use the last one
+        # if multiple qualify, use the last one that did
 
         if not monster_bar:
             continue
