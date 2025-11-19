@@ -22,16 +22,46 @@ from bots.shared import (
 )
 
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
-
 eastern = pytz.timezone("US/Eastern")
 
-MIN_MONSTER_BAR_SHARES = int(os.getenv("MIN_MONSTER_BAR_SHARES", "8000000"))
-MIN_MONSTER_PRICE = float(os.getenv("MIN_MONSTER_PRICE", "2.0"))
-MIN_VOLUME_RVOL = float(os.getenv("MIN_VOLUME_RVOL", "2.5"))
+# ---------------- CONFIG (with sane, looser defaults) ----------------
 
-# run this bot at most every 8 minutes
-_MONSTER_REFRESH_SEC = int(os.getenv("MONSTER_REFRESH_SEC", "480"))
+# "Monster" 1-minute bar threshold (shares)
+# You can override via ENV, but you don't have to.
+MIN_MONSTER_BAR_SHARES = int(os.getenv("MIN_MONSTER_BAR_SHARES", "2000000"))  # 2M by default
+
+# Minimum price for the underlying
+MIN_MONSTER_PRICE = float(os.getenv("MIN_MONSTER_PRICE", "2.0"))
+
+# Per-bot RVOL floor (we still also respect MIN_RVOL_GLOBAL)
+MIN_VOLUME_RVOL = float(os.getenv("MIN_VOLUME_RVOL", "2.0"))
+
+# Run this bot at most once every X seconds (to avoid hammering Polygon)
+_MONSTER_REFRESH_SEC = int(os.getenv("MONSTER_REFRESH_SEC", "480"))  # 8 minutes
+
 _last_run_ts = 0.0
+
+# Per-day, per-symbol de-dupe: one alert per ticker per day
+_alert_date: date | None = None
+_alerted_syms: set[str] = set()
+
+
+def _reset_if_new_day() -> None:
+    global _alert_date, _alerted_syms
+    today = date.today()
+    if _alert_date != today:
+        _alert_date = today
+        _alerted_syms = set()
+
+
+def _already_alerted(sym: str) -> bool:
+    _reset_if_new_day()
+    return sym in _alerted_syms
+
+
+def _mark_alerted(sym: str) -> None:
+    _reset_if_new_day()
+    _alerted_syms.add(sym)
 
 
 def _in_rth_window() -> bool:
@@ -45,19 +75,22 @@ def _get_ticker_universe() -> List[str]:
     env = os.getenv("TICKER_UNIVERSE")
     if env:
         return [t.strip().upper() for t in env.split(",") if t.strip()]
+    # Default: dynamic top-volume universe (~100 tickers, ~90% of market volume)
     return get_dynamic_top_volume_universe(max_tickers=100, volume_coverage=0.90)
 
 
 async def run_volume():
     """
-    Volume Monster:
+    Volume Monster Bot (loosened):
 
-      • Any 1-min bar with volume >= MIN_MONSTER_BAR_SHARES
-      • Underlying price >= MIN_MONSTER_PRICE
-      • Day RVOL >= max(MIN_VOLUME_RVOL, MIN_RVOL_GLOBAL)
-      • Day volume >= MIN_VOLUME_GLOBAL
-      • Only during 9:30–16:00 EST
-      • Bot-level throttle: at most once every MONSTER_REFRESH_SEC
+      • Scan top-volume universe during RTH (9:30–16:00 EST).
+      • Underlying close price >= MIN_MONSTER_PRICE.
+      • Day RVOL >= max(MIN_VOLUME_RVOL, MIN_RVOL_GLOBAL).
+      • Day volume >= MIN_VOLUME_GLOBAL.
+      • At least one 1-minute bar with volume >= MIN_MONSTER_BAR_SHARES
+          (default 2,000,000 shares; was 8M before).
+      • Throttled to once every MONSTER_REFRESH_SEC (default 480 sec).
+      • Each symbol alerts at most once per day (per-day de-dupe).
     """
     global _last_run_ts
 
@@ -77,6 +110,7 @@ async def run_volume():
         return
     _last_run_ts = now_ts
 
+    _reset_if_new_day()
     universe = _get_ticker_universe()
     today = date.today()
     today_s = today.isoformat()
@@ -84,8 +118,12 @@ async def run_volume():
     for sym in universe:
         if is_etf_blacklisted(sym):
             continue
+        if _already_alerted(sym):
+            # we've already fired a monster-volume alert for this name today
+            continue
 
-        # daily bars for RVOL / move
+        # ----- DAILY CONTEXT: price, RVOL, volume, move -----
+
         try:
             days = list(
                 _client.list_aggs(
@@ -105,8 +143,9 @@ async def run_volume():
             continue
 
         today_bar = days[-1]
-        prev = days[-2]
-        prev_close = float(prev.close)
+        prev_bar = days[-2]
+
+        prev_close = float(prev_bar.close)
         last_price = float(today_bar.close)
 
         if last_price < MIN_MONSTER_PRICE:
@@ -119,19 +158,18 @@ async def run_volume():
         else:
             avg_vol = float(today_bar.volume)
 
-        if avg_vol > 0:
-            rvol = float(today_bar.volume) / avg_vol
-        else:
-            rvol = 1.0
+        day_vol = float(today_bar.volume)
+        rvol = day_vol / avg_vol if avg_vol > 0 else 1.0
 
+        # Both global and bot-level RVOL floors
         if rvol < max(MIN_VOLUME_RVOL, MIN_RVOL_GLOBAL):
             continue
 
-        day_vol = float(today_bar.volume)
         if day_vol < MIN_VOLUME_GLOBAL:
             continue
 
-        # minute bars for monster bar detection
+        # ----- INTRADAY MINUTE BARS: search for a monster bar -----
+
         try:
             mins = list(
                 _client.list_aggs(
@@ -150,22 +188,26 @@ async def run_volume():
         if not mins:
             continue
 
-        # look for any 1-min bar with massive shares
         monster_bar = None
         for b in mins:
             if b.volume >= MIN_MONSTER_BAR_SHARES:
+                # keep the latest bar that qualifies
                 monster_bar = b
-        # if multiple qualify, use the last one that did
 
         if not monster_bar:
+            # no individual bar large enough
             continue
 
         monster_vol = float(monster_bar.volume)
         monster_price = float(monster_bar.close)
 
-        move_pct = (last_price - prev_close) / prev_close * 100.0 if prev_close > 0 else 0.0
-        dv = last_price * day_vol
-        grade = grade_equity_setup(abs(move_pct), rvol, dv)
+        move_pct = (
+            (last_price - prev_close) / prev_close * 100.0
+            if prev_close > 0
+            else 0.0
+        )
+        dollar_vol = last_price * day_vol
+        grade = grade_equity_setup(abs(move_pct), rvol, dollar_vol)
 
         if move_pct > 0:
             bias = "Aggressive buying (monster 1-min volume)"
@@ -178,10 +220,12 @@ async def run_volume():
             f"📊 Monster 1-min bar: {int(monster_vol):,} shares\n"
             f"💹 Bar Close: ${monster_price:.2f}\n"
             f"📈 Prev Close: ${prev_close:.2f} → Day Close: ${last_price:.2f} ({move_pct:.1f}%)\n"
-            f"📦 Day Volume: {int(day_vol):,} (≈ ${dv:,.0f} notional)\n"
+            f"📦 Day Volume: {int(day_vol):,} (≈ ${dollar_vol:,.0f} notional)\n"
+            f"📊 RVOL: {rvol:.1f}x\n"
             f"🎯 Setup Grade: {grade}\n"
             f"📌 Bias: {bias}\n"
             f"🔗 Chart: {chart_link(sym)}"
         )
 
+        _mark_alerted(sym)
         send_alert("volume", sym, last_price, rvol, extra=extra)
