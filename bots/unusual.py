@@ -1,6 +1,8 @@
 import os
-from datetime import date
-from typing import List, Optional
+from datetime import date, timedelta, datetime
+from typing import List, Dict, Any
+
+import pytz
 
 try:
     from massive import RESTClient
@@ -9,181 +11,240 @@ except ImportError:
 
 from bots.shared import (
     POLYGON_KEY,
+    MIN_RVOL_GLOBAL,
+    MIN_VOLUME_GLOBAL,
     send_alert,
     get_dynamic_top_volume_universe,
-    describe_option_flow,
     chart_link,
     is_etf_blacklisted,
 )
 
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
+eastern = pytz.timezone("US/Eastern")
 
-MIN_OPTION_CONTRACT_VOLUME = int(os.getenv("MIN_OPTION_CONTRACT_VOLUME", "2000"))
-MAX_CONTRACTS_PER_UNDERLYING = int(os.getenv("MAX_CONTRACTS_PER_UNDERLYING", "40"))
-MIN_UNUSUAL_NOTIONAL = float(os.getenv("MIN_UNUSUAL_NOTIONAL", "200000"))  # $200k default
+# ========= UNUSUAL SWEEPS CONFIG =============
+
+# calls + puts both included now
+MAX_DTE = int(os.getenv("UNUSUAL_MAX_DTE", "45"))          # 0–45 DTE
+MIN_OPTION_VOLUME = int(os.getenv("UNUSUAL_MIN_VOLUME", "500"))
+MIN_OPTION_NOTIONAL = float(os.getenv("UNUSUAL_MIN_NOTIONAL", "200000"))
+MIN_UNDERLYING_PRICE = float(os.getenv("UNUSUAL_MIN_PRICE", "5.0"))
+
+# per-day de-dupe, per symbol
+_alert_date: date | None = None
+_alerted: set[str] = set()
 
 
-def _get_ticker_universe() -> List[str]:
+def _reset_if_new_day():
+    global _alert_date, _alerted
+    today = date.today()
+    if _alert_date != today:
+        _alert_date = today
+        _alerted = set()
+
+
+def _already(sym: str) -> bool:
+    _reset_if_new_day()
+    return sym in _alerted
+
+
+def _mark(sym: str):
+    _reset_if_new_day()
+    _alerted.add(sym)
+
+
+def _in_rth() -> bool:
+    now_et = datetime.now(eastern)
+    mins = now_et.hour * 60 + now_et.minute
+    return 9 * 60 + 30 <= mins <= 16 * 60
+
+
+def _universe() -> List[str]:
     env = os.getenv("TICKER_UNIVERSE")
     if env:
-        return [t.strip().upper() for t in env.split(",") if t.strip()]
-    return get_dynamic_top_volume_universe(max_tickers=100, volume_coverage=0.90)
+        return [x.strip().upper() for x in env.split(",") if x.strip()]
+    return get_dynamic_top_volume_universe(max_tickers=150, volume_coverage=0.95)
 
 
-def _safe_parse_date(d: Optional[str]) -> Optional[date]:
-    if not d:
-        return None
-    try:
-        return date.fromisoformat(d)
-    except Exception:
-        return None
+def _safe(obj, *names, default=None):
+    for n in names:
+        if hasattr(obj, n):
+            v = getattr(obj, n)
+            if v is not None:
+                return v
+    return default
 
 
-def _decode_contract_pretty(sym: str, contract_ticker: str, exp: Optional[date], side: str, strike: float) -> str:
-    if not exp:
-        return f"{contract_ticker} ({side} {strike:.2f})"
-    try:
-        pretty_date = exp.strftime("%m/%d/%Y")
-        side_letter = side[0].upper() if side else "?"
-        return f"{sym} {pretty_date:.10s} {strike:.2f} {side_letter}"
-    except Exception:
-        return f"{contract_ticker} ({side} {strike:.2f})"
-
-
-def _scan_unusual_for_symbol(sym: str):
-    if not _client:
-        return []
-
-    today = date.today()
-    today_s = today.isoformat()
-
-    try:
-        last_trade = _client.get_last_trade(ticker=sym)
-        underlying_px = float(last_trade.price)
-    except Exception as e:
-        print(f"[unusual] get_last_trade failed for {sym}: {e}")
-        return []
-
-    try:
-        contracts_gen = _client.list_options_contracts(
-            underlying_ticker=sym,
-            as_of=today_s,
-            limit=1000,
-        )
-    except Exception as e:
-        print(f"[unusual] list_options_contracts failed for {sym}: {e}")
-        return []
-
-    alerts = []
-    count = 0
-    for c in contracts_gen:
-        if count >= MAX_CONTRACTS_PER_UNDERLYING:
-            break
-        count += 1
-
-        exp = _safe_parse_date(getattr(c, "expiration_date", None))
-        if not exp:
-            continue
-
-        dte = (exp - today).days
-        if dte < 0 or dte > 7:  # short-dated sweeps only
-            continue
-
-        strike = float(getattr(c, "strike_price", 0.0) or 0.0)
-        if strike <= 0 or underlying_px <= 0:
-            continue
-
-        moneyness = abs(strike - underlying_px) / underlying_px
-        if moneyness > 0.20:
-            continue
-
-        contract_ticker = getattr(c, "ticker", None)
-        if not contract_ticker:
-            continue
-
-        # Contract tape
-        try:
-            bars = list(
-                _client.list_aggs(
-                    ticker=contract_ticker,
-                    multiplier=1,
-                    timespan="minute",
-                    from_=today_s,
-                    to=today_s,
-                    limit=5_000,
-                )
-            )
-        except Exception as e:
-            print(f"[unusual] list_aggs failed for {contract_ticker}: {e}")
-            continue
-
-        if not bars:
-            continue
-
-        vol_today = float(sum(b.volume for b in bars))
-        if vol_today < MIN_OPTION_CONTRACT_VOLUME:
-            continue
-
-        total_prem = float(sum(b.close * b.volume for b in bars))
-        avg_price = total_prem / max(vol_today, 1.0)
-        notional = total_prem * 100.0
-
-        # Core spec: $200k+ in the SAME contract
-        if notional < MIN_UNUSUAL_NOTIONAL:
-            continue
-
-        side = getattr(c, "contract_type", "unknown").upper()
-        pretty_name = _decode_contract_pretty(sym, contract_ticker, exp, side, strike)
-
-        # ITM / OTM tag
-        if side.startswith("C"):
-            itm = underlying_px > strike
-        elif side.startswith("P"):
-            itm = underlying_px < strike
-        else:
-            itm = False
-        itm_tag = "ITM" if itm else "OTM"
-
-        moneyness_pct = moneyness * 100.0
-        flow_desc = describe_option_flow(side, dte, moneyness)
-
-        extra = (
-            f"🕵️ Unusual {side} sweep: {pretty_name}\n"
-            f"📌 Flow Type: {flow_desc}\n"
-            f"⏱ DTE: {dte} · {itm_tag} · Moneyness {moneyness_pct:.1f}%\n"
-            f"📦 Volume: {int(vol_today):,} contracts · Avg: ${avg_price:.2f}\n"
-            f"💰 Notional: ≈ ${notional:,.0f}\n"
-            f"🔗 Chart: {chart_link(sym)}"
-        )
-
-        alerts.append((sym, underlying_px, 0.0, extra))
-
-    return alerts
-
+# ============ MAIN BOT ===============
 
 async def run_unusual():
     """
-    Unusual Options Sweeps:
-      • Short-dated (<=7 DTE)
-      • Near-the-money (<=20% from spot)
-      • Volume above MIN_OPTION_CONTRACT_VOLUME
-      • Notional >= MIN_UNUSUAL_NOTIONAL (default $200k)
-      • No explicit time-window guard → "all day"
+    Unusual Option Sweeps — Calls + Puts
+    • Looks for BIG premium in a single line (same contract)
+    • Underlying RVOL + volume filters
+    • Works intraday only
     """
-    if not POLYGON_KEY:
-        print("[unusual] POLYGON_KEY not set; skipping scan.")
+    if not POLYGON_KEY or not _client:
+        print("[unusual] Missing POLYGON_KEY or client not ready")
         return
 
-    universe = _get_ticker_universe()
+    if not _in_rth():
+        print("[unusual] Outside RTH")
+        return
+
+    _reset_if_new_day()
+    universe = _universe()
+    today = date.today()
+    today_s = today.isoformat()
+
     for sym in universe:
         if is_etf_blacklisted(sym):
             continue
 
-        try:
-            alerts = _scan_unusual_for_symbol(sym)
-        except Exception as e:
-            print(f"[unusual] scan failed for {sym}: {e}")
+        if _already(sym):
+            # already alerted once today
             continue
 
-        for _sym, last_price, rvol, extra in alerts:
-            send_alert("unusual", _sym, last_price, 0.0, extra=extra)
+        # ----- Daily filters -----
+        try:
+            days = list(
+                _client.list_aggs(
+                    ticker=sym,
+                    multiplier=1,
+                    timespan="day",
+                    from_=(today - timedelta(days=40)).isoformat(),
+                    to=today_s,
+                    limit=50,
+                )
+            )
+        except Exception as e:
+            print(f"[unusual] daily fail {sym}: {e}")
+            continue
+
+        if len(days) < 2:
+            continue
+
+        d0 = days[-1]
+        d1 = days[-2]
+
+        last_price = float(d0.close)
+        prev_close = float(d1.close)
+        if last_price < MIN_UNDERLYING_PRICE:
+            continue
+
+        # RVOL
+        hist = days[:-1]
+        if hist:
+            recent = hist[-20:] if len(hist) > 20 else hist
+            avg_vol = sum(d.volume for d in recent) / len(recent)
+        else:
+            avg_vol = d0.volume
+
+        day_vol = float(d0.volume)
+        rvol = day_vol / avg_vol if avg_vol > 0 else 1.0
+
+        if rvol < MIN_RVOL_GLOBAL:
+            continue
+        if day_vol < MIN_VOLUME_GLOBAL:
+            continue
+
+        # ----- Options scan -----
+        try:
+            opts = list(
+                _client.list_options_contracts(
+                    underlying_ticker=sym,
+                    expiration_date_gte=today_s,
+                    expiration_date_lte=(today + timedelta(days=MAX_DTE)).isoformat(),
+                    limit=800,
+                )
+            )
+        except Exception as e:
+            print(f"[unusual] option list fail {sym}: {e}")
+            continue
+
+        best = None  # store biggest notional sweep
+
+        for c in opts:
+            try:
+                ctype = (_safe(c, "contract_type", "type", default="") or "").lower()
+                if ctype not in ["call", "put"]:
+                    continue
+
+                exp = str(_safe(c, "expiration_date", default=""))[:10]
+                if not exp:
+                    continue
+                try:
+                    exp_d = date.fromisoformat(exp)
+                except:
+                    continue
+                dte = (exp_d - today).days
+                if dte < 0 or dte > MAX_DTE:
+                    continue
+
+                q = _safe(c, "last_quote", default=None)
+                if not q:
+                    continue
+
+                bid = float(_safe(q, "bid_price", "bid", default=0.0) or 0.0)
+                ask = float(_safe(q, "ask_price", "ask", default=0.0) or 0.0)
+                if bid <= 0 and ask <= 0:
+                    continue
+
+                mid = (bid + ask) / 2 if bid > 0 and ask > 0 else max(bid, ask)
+                if mid <= 0:
+                    continue
+
+                vol = int(_safe(c, "volume", default=0) or 0)
+                if vol < MIN_OPTION_VOLUME:
+                    continue
+
+                notional = mid * vol * 100.0
+                if notional < MIN_OPTION_NOTIONAL:
+                    continue
+
+                data = {
+                    "contract": c,
+                    "ctype": ctype,
+                    "mid": mid,
+                    "bid": bid,
+                    "ask": ask,
+                    "vol": vol,
+                    "notional": notional,
+                    "dte": dte,
+                    "exp": exp,
+                }
+
+                if not best or notional > best["notional"]:
+                    best = data
+
+            except Exception as ee:
+                print(f"[unusual] processing fail {sym}: {ee}")
+                continue
+
+        if not best:
+            continue
+
+        c = best["contract"]
+        strike = float(_safe(c, "strike_price", "strike", default=0.0) or 0.0)
+        ctype = best["ctype"].upper()
+
+        move_pct = (
+            (last_price - prev_close) / prev_close * 100.0
+            if prev_close > 0
+            else 0.0
+        )
+
+        emoji = "🟢" if ctype == "CALL" else "🔻"
+
+        extra = (
+            f"{emoji} UNUSUAL {ctype} FLOW\n"
+            f"Underlying {sym} ≈ ${last_price:.2f} · RVOL {rvol:.1f}x\n"
+            f"Strike {strike:.2f} · Exp {best['exp']} ({best['dte']} DTE)\n"
+            f"Premium ≈ ${best['mid']:.2f} (Bid {best['bid']:.2f} / Ask {best['ask']:.2f})\n"
+            f"Opt Vol {best['vol']:,} · Notional ≈ ${best['notional']:,.0f}\n"
+            f"Day Move: {move_pct:.1f}% · Day Volume {int(day_vol):,}\n"
+            f"🔗 Chart: {chart_link(sym)}"
+        )
+
+        _mark(sym)
+        send_alert("unusual", sym, last_price, rvol, extra=extra)
