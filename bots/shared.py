@@ -1,326 +1,208 @@
-# bots/shared.py — core config + Telegram helpers + dynamic universe
+# bots/shared.py — MoneySignalAi shared helpers
+
 import os
-import time
+import math
 from datetime import datetime
-from typing import List, Dict, Tuple
+from typing import List
 
-import pytz
 import requests
+import pytz
 
-# ---------- Time helpers ----------
+# ---------------- TIME / ENV ----------------
 
 eastern = pytz.timezone("US/Eastern")
 
 
 def now_est() -> str:
-    # Example: "07:08 PM EST · Nov 18"
-    return datetime.now(eastern).strftime("%I:%M %p EST · %b %d")
+    """Formatted timestamp in EST for alerts/status."""
+    return datetime.now(eastern).strftime("%I:%M %p EST · %b %d").lstrip("0")
 
 
-# ---------- Global filters (tweak via ENV if needed) ----------
-
-MIN_RVOL_GLOBAL = float(os.getenv("MIN_RVOL_GLOBAL", "2.0"))
-MIN_VOLUME_GLOBAL = int(os.getenv("MIN_VOLUME_GLOBAL", "500000"))
-RSI_OVERSOLD = 35
-RSI_OVERBOUGHT = 65
-
-# ---------- Environment variables ----------
-
+# Core ENV
 POLYGON_KEY = os.getenv("POLYGON_KEY", "")
 
-TELEGRAM_CHAT_ALL = os.getenv("TELEGRAM_CHAT_ALL", "")
+# Global filters (can be overridden in Render ENV)
+MIN_RVOL_GLOBAL = float(os.getenv("MIN_RVOL_GLOBAL", "2.5"))
+MIN_VOLUME_GLOBAL = float(os.getenv("MIN_VOLUME_GLOBAL", "800000"))
+
+# Telegram
 TELEGRAM_TOKEN_ALERTS = os.getenv("TELEGRAM_TOKEN_ALERTS", "")
+TELEGRAM_CHAT_ALL = os.getenv("TELEGRAM_CHAT_ALL", "")
 TELEGRAM_TOKEN_STATUS = os.getenv("TELEGRAM_TOKEN_STATUS", "")
 
-# Alert throttle: minimum seconds between alerts for the same (bot, symbol)
-ALERT_THROTTLE_SEC = int(os.getenv("ALERT_THROTTLE_SEC", "900"))  # default 15 minutes
-
-# ---------- Emoji map per bot ----------
-
-_EMOJI_MAP = {
-    "premarket": "🌅",
-    "volume": "📊",
-    "gap": "🕳️",
-    "orb": "📏",
-    "squeeze": "🧨",
-    "unusual": "🕵️",
-    "cheap": "💸",
-    "earnings": "📣",
-    "momentum_reversal": "🔄",
-}
-
-# ---------- ETF blacklist ----------
-
-_default_etfs = "SPY,QQQ,IWM,DIA,IEMG,XLK,XLF,XLV,XLY,XLP,XLE,XLB,XLU,SMH"
-_ETF_ENV = os.getenv("ETF_BLACKLIST", _default_etfs)
-ETF_BLACKLIST = {s.strip().upper() for s in _ETF_ENV.split(",") if s.strip()}
-
-# ---------- Alert tracking ----------
-
-_LAST_ALERT_SENT: Dict[Tuple[str, str], float] = {}
-_ALERT_COUNTS: Dict[str, int] = {}
+TELEGRAM_API_BASE = "https://api.telegram.org"
 
 
-def is_etf_blacklisted(symbol: str) -> bool:
-    """Return True if symbol is in the ETF blacklist."""
-    return symbol.upper() in ETF_BLACKLIST
+# ---------------- TELEGRAM HELPERS ----------------
 
-
-def _record_alert(bot_name: str, symbol: str) -> bool:
-    """
-    Returns True if we should send an alert (not throttled),
-    False if it should be skipped due to throttle.
-    """
-    now_ts = time.time()
-    key = (bot_name.lower(), symbol.upper())
-    last_ts = _LAST_ALERT_SENT.get(key)
-    if last_ts is not None and (now_ts - last_ts) < ALERT_THROTTLE_SEC:
-        # Throttled
-        print(f"THROTTLED [{bot_name}] {symbol}")
-        return False
-
-    _LAST_ALERT_SENT[key] = now_ts
-    _ALERT_COUNTS[bot_name] = _ALERT_COUNTS.get(bot_name, 0) + 1
-    return True
-
-
-def get_alert_counts_snapshot(reset: bool = False) -> Dict[str, int]:
-    """
-    Snapshot of how many alerts each bot sent since last reset.
-    If reset=True, clears counters after returning.
-    """
-    snap = dict(_ALERT_COUNTS)
-    if reset:
-        _ALERT_COUNTS.clear()
-    return snap
-
-
-# ---------- Helpers for grading & sentiment ----------
-
-def grade_equity_setup(move_pct: float, rvol: float, dollar_volume: float) -> str:
-    """
-    Very simple grading for equity moves.
-
-    Inputs:
-      move_pct     - % move today
-      rvol         - relative volume
-      dollar_volume- price * shares traded
-
-    Returns: "A+", "A", "B", or "C"
-    """
-    dv = dollar_volume
-
-    if move_pct >= 15 and rvol >= 8 and dv >= 150_000_000:
-        return "A+"
-    if move_pct >= 10 and rvol >= 4 and dv >= 75_000_000:
-        return "A"
-    if move_pct >= 5 and rvol >= 2 and dv >= 25_000_000:
-        return "B"
-    return "C"
-
-
-def describe_option_flow(side: str, dte: int, moneyness: float) -> str:
-    """
-    side: "C" or "P"
-    dte: days to expiration
-    moneyness: abs(strike - underlying) / underlying (0.10 = 10% from spot)
-    """
-    s = side.upper() if side else "?"
-
-    if s == "C":
-        direction = "Bullish calls"
-    elif s == "P":
-        direction = "Bearish puts / hedge"
-    else:
-        direction = "Mixed flow"
-
-    # Classification based on DTE + moneyness
-    if dte <= 1 and moneyness > 0.10:
-        style = "lottery / speculative"
-    elif dte <= 3 and moneyness <= 0.10:
-        style = "short-term directional"
-    elif dte <= 14:
-        style = "swing positioning"
-    else:
-        style = "longer-dated positioning"
-
-    return f"{direction}, {style}"
-
-
-def chart_link(symbol: str) -> str:
-    """
-    Build a chart link for the symbol. Default is TradingView.
-    Can be overridden with CHART_BASE env if you prefer another site.
-    """
-    base = os.getenv("CHART_BASE", "https://www.tradingview.com/chart/?symbol=")
-    return f"{base}{symbol.upper()}"
-
-
-# ---------- Telegram helpers ----------
-
-def _pick_alert_token(bot_name: str) -> str:
-    if TELEGRAM_TOKEN_ALERTS:
-        return TELEGRAM_TOKEN_ALERTS
-    if TELEGRAM_TOKEN_STATUS:
-        return TELEGRAM_TOKEN_STATUS
-    return ""
-
-
-def send_alert(
-    bot_name: str,
-    symbol: str,
-    last_price: float,
-    rvol: float,
-    extra: str = "",
-) -> None:
-    """
-    Core Telegram send function used by all bots.
-
-    Layout:
-
-    🧨 SQUEEZE — `OLMA`
-    🕒 07:08 PM EST · Nov 18
-    💰 $20.14 · 📊 RVOL 87.9x
-    ────────────
-    ...strategy-specific block...
-    """
-    if not TELEGRAM_CHAT_ALL:
-        print("ALERT SKIPPED: TELEGRAM_CHAT_ALL not set")
+def _send_telegram_raw(token: str, chat_id: str, text: str) -> None:
+    """Low-level Telegram send; prints to console if misconfigured."""
+    if not token or not chat_id:
+        print("[telegram] missing token/chat_id — dumping message:")
+        print(text)
         return
 
-    token = _pick_alert_token(bot_name)
-    if not token:
-        print("ALERT SKIPPED: no Telegram token configured (TELEGRAM_TOKEN_ALERTS)")
-        return
-
-    # Throttle per (bot, symbol)
-    if not _record_alert(bot_name, symbol):
-        return
-
-    timestamp = now_est()
-    title = bot_name.upper().replace("_", " ")
-    emoji = _EMOJI_MAP.get(bot_name.lower(), "📈")
-
-    header_line = f"{emoji} *{title}* — `{symbol}`"
-    time_line = f"🕒 {timestamp}"
-
-    price_line = f"💰 ${last_price:.2f}"
-    if rvol > 0:
-        price_line += f" · 📊 RVOL {rvol:.1f}x"
-
-    msg = f"{header_line}\n{time_line}\n{price_line}\n────────────"
-
-    if extra:
-        msg += f"\n{extra}"
-
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    url = f"{TELEGRAM_API_BASE}/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown",
+    }
     try:
-        requests.post(
-            url,
-            data={"chat_id": TELEGRAM_CHAT_ALL, "text": msg, "parse_mode": "Markdown"},
-            timeout=10,
-        )
-        print(f"ALERT SENT [{bot_name}] {symbol}")
+        resp = requests.post(url, data=payload, timeout=10)
+        if not resp.ok:
+            print(f"[telegram] send failed {resp.status_code}: {resp.text}")
     except Exception as e:
-        print(f"ALERT FAILED [{bot_name}] {symbol}: {e}")
+        print(f"[telegram] exception: {e}")
 
 
-def send_status_message(text: str) -> None:
-    if not TELEGRAM_CHAT_ALL:
+def send_alert(bot_name: str, ticker: str, price: float, rvol: float, extra: str = ""):
+    """
+    Main alert function used by all bots.
+
+    • If `extra` is provided, it's treated as the FULL message (we don't wrap it).
+    • If `extra` is empty, we send a simple generic header.
+    """
+    if extra:
+        text = extra
+    else:
+        header = f"🔔 {bot_name.upper()} — {ticker}\n"
+        meta = f"💰 ${price:.2f} · RVOL {rvol:.1f}x\n"
+        text = header + meta
+
+    _send_telegram_raw(TELEGRAM_TOKEN_ALERTS, TELEGRAM_CHAT_ALL, text)
+
+
+def send_status(message: str) -> None:
+    """Optional: send status/health pings via TELEGRAM_TOKEN_STATUS."""
+    token = TELEGRAM_TOKEN_STATUS
+    chat_id = os.getenv("TELEGRAM_CHAT_STATUS", "") or TELEGRAM_CHAT_ALL
+    if not token or not chat_id:
+        print("[status] missing token/chat_id, printing message:")
+        print(message)
         return
-    token = TELEGRAM_TOKEN_STATUS or TELEGRAM_TOKEN_ALERTS
-    if not token:
-        return
-
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    try:
-        requests.post(
-            url,
-            data={"chat_id": TELEGRAM_CHAT_ALL, "text": text, "parse_mode": "Markdown"},
-            timeout=10,
-        )
-    except Exception:
-        pass
+    _send_telegram_raw(token, chat_id, message)
 
 
-def start_polygon_websocket():
-    print("Polygon/WebSocket placeholder — using REST scanners only for now.")
+# ---------------- UNIVERSE / UTILITIES ----------------
+
+def chart_link(ticker: str) -> str:
+    """TradingView chart link."""
+    return f"https://www.tradingview.com/chart/?symbol={ticker.upper()}"
 
 
-# ---------- Dynamic top-volume universe ----------
-
-DYNAMIC_UNIVERSE_REFRESH_SEC = int(os.getenv("DYNAMIC_UNIVERSE_REFRESH_SEC", "300"))
-
-_dynamic_universe_cache = {
-    "tickers": [],  # type: List[str]
-    "ts": 0.0,
+# Very simple ETF/index blacklist so some bots stay focused on single names
+ETF_BLACKLIST = {
+    "SPY",
+    "QQQ",
+    "IWM",
+    "DIA",
+    "VXX",
+    "UVXY",
+    "SPXL",
+    "SPXS",
+    "SQQQ",
+    "TQQQ",
 }
+
+
+def is_etf_blacklisted(ticker: str) -> bool:
+    return ticker.upper() in ETF_BLACKLIST
 
 
 def get_dynamic_top_volume_universe(
-    max_tickers: int = 100,
-    volume_coverage: float = 0.90,
+    max_tickers: int = 150,
+    volume_coverage: float = 0.95,
 ) -> List[str]:
     """
-    Build a dynamic universe of liquid names that covers ~90% of total volume.
+    Build a dynamic universe based on Polygon's 'most active' snapshot.
+
+    • Pulls /v2/snapshot/locale/us/markets/stocks/mostactive
+    • Ranks by volume (shares)
+    • Stops when either:
+        - we hit `max_tickers`, OR
+        - cumulative volume >= `volume_coverage` of total.
     """
-    now_ts = time.time()
-    if (
-        _dynamic_universe_cache["tickers"]
-        and (now_ts - _dynamic_universe_cache["ts"]) < DYNAMIC_UNIVERSE_REFRESH_SEC
-    ):
-        return _dynamic_universe_cache["tickers"]
-
     if not POLYGON_KEY:
-        print("[universe] POLYGON_KEY not set; returning cached/static universe.")
-        return _dynamic_universe_cache["tickers"] or []
+        print("[shared] POLYGON_KEY missing; universe fallback to empty list.")
+        return []
 
-    url = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
-
+    url = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/mostactive"
+    params = {"apiKey": POLYGON_KEY}
     try:
-        resp = requests.get(url, params={"apiKey": POLYGON_KEY}, timeout=15)
+        resp = requests.get(url, params=params, timeout=10)
         resp.raise_for_status()
         data = resp.json()
-        raw_tickers = data.get("tickers", [])
     except Exception as e:
-        print(f"[universe] Snapshot fetch failed: {e}")
-        return _dynamic_universe_cache["tickers"] or []
+        print(f"[shared] failed to fetch most active universe: {e}")
+        return []
 
-    vols = []
-    for t in raw_tickers:
-        try:
-            sym = t.get("ticker")
-            day = t.get("day") or {}
-            vol = float(day.get("v") or 0.0)
-            if not sym or vol <= 0:
-                continue
-            vols.append((sym, vol))
-        except Exception:
+    tickers_data = data.get("tickers", []) or []
+    # Sort by raw volume descending
+    tickers_data.sort(key=lambda x: x.get("day", {}).get("v", 0), reverse=True)
+
+    total_vol = sum(x.get("day", {}).get("v", 0) for x in tickers_data)
+    picked: List[str] = []
+    running_vol = 0
+
+    for row in tickers_data:
+        sym = row.get("ticker")
+        if not sym:
             continue
+        v = row.get("day", {}).get("v", 0) or 0
 
-    if not vols:
-        print("[universe] Snapshot contained no usable tickers.")
-        return _dynamic_universe_cache["tickers"] or []
+        picked.append(sym)
+        running_vol += v
 
-    vols.sort(key=lambda x: x[1], reverse=True)
-    total_vol = float(sum(v for _, v in vols))
-    selected: List[str] = []
-    cumulative = 0.0
-
-    for sym, vol in vols:
-        selected.append(sym)
-        cumulative += vol
-
-        if len(selected) >= max_tickers:
+        if len(picked) >= max_tickers:
+            break
+        if total_vol > 0 and (running_vol / total_vol) >= volume_coverage:
             break
 
-        if total_vol > 0 and (cumulative / total_vol) >= volume_coverage:
-            break
+    return picked
 
-    _dynamic_universe_cache["tickers"] = selected
-    _dynamic_universe_cache["ts"] = now_ts
 
-    coverage_pct = (cumulative / total_vol * 100.0) if total_vol else 0.0
-    print(f"[universe] Selected {len(selected)} tickers covering {coverage_pct:.1f}% of volume.")
+# ---------------- GRADING / SCORING ----------------
 
-    return selected
+def grade_equity_setup(move_pct: float, rvol: float, dollar_vol: float) -> str:
+    """
+    Rough letter grade for equity setups.
+
+    • move_pct: abs(% move today)
+    • rvol: relative volume (current / avg)
+    • dollar_vol: price * volume (approx)
+
+    Returns: "A+", "A", "B", or "C"
+    """
+    score = 0
+
+    # Move component
+    if move_pct >= 3:
+        score += 1
+    if move_pct >= 7:
+        score += 1
+    if move_pct >= 12:
+        score += 1
+
+    # RVOL component
+    if rvol >= 2:
+        score += 1
+    if rvol >= 4:
+        score += 1
+
+    # Dollar volume component
+    if dollar_vol >= 25_000_000:
+        score += 1
+    if dollar_vol >= 75_000_000:
+        score += 1
+    if dollar_vol >= 200_000_000:
+        score += 1
+
+    if score >= 6:
+        return "A+"
+    elif score >= 4:
+        return "A"
+    elif score >= 2:
+        return "B"
+    else:
+        return "C"
