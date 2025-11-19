@@ -7,7 +7,14 @@ try:
 except ImportError:
     from polygon import RESTClient
 
-from bots.shared import POLYGON_KEY, send_alert, get_dynamic_top_volume_universe
+from bots.shared import (
+    POLYGON_KEY,
+    send_alert,
+    get_dynamic_top_volume_universe,
+    describe_option_flow,
+    chart_link,
+    is_etf_blacklisted,
+)
 
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
@@ -32,10 +39,6 @@ def _safe_parse_date(d: Optional[str]) -> Optional[date]:
 
 
 def _decode_contract_pretty(sym: str, contract_ticker: str, exp: Optional[date], side: str, strike: float) -> str:
-    """
-    Try to turn "O:ACHR251121C00009000" into something like:
-      "ACHR 11/21/2025 9.00 C"
-    """
     if not exp:
         return f"{contract_ticker} ({side} {strike:.2f})"
     try:
@@ -53,7 +56,6 @@ def _scan_unusual_for_symbol(sym: str):
     today = date.today()
     today_s = today.isoformat()
 
-    # Underlying last price
     try:
         last_trade = _client.get_last_trade(ticker=sym)
         underlying_px = float(last_trade.price)
@@ -90,7 +92,6 @@ def _scan_unusual_for_symbol(sym: str):
         if strike <= 0:
             continue
 
-        # Near the money: ±20% band
         if underlying_px <= 0:
             continue
         moneyness = abs(strike - underlying_px) / underlying_px
@@ -140,12 +141,15 @@ def _scan_unusual_for_symbol(sym: str):
         itm_tag = "ITM" if itm else "OTM"
 
         moneyness_pct = moneyness * 100.0
+        flow_desc = describe_option_flow(side, days_to_exp, moneyness)
 
         extra = (
             f"🎯 {side} flow: {pretty_name}\n"
+            f"📌 Flow Type: {flow_desc}\n"
             f"⏱ DTE: {days_to_exp} · {itm_tag} · Moneyness {moneyness_pct:.1f}%\n"
             f"📦 Volume: {int(vol_today):,} contracts · Avg: ${avg_price:.2f}\n"
-            f"💰 Notional: ≈ ${notional:,.0f}"
+            f"💰 Notional: ≈ ${notional:,.0f}\n"
+            f"🔗 Chart: {chart_link(sym)}"
         )
 
         alerts.append((sym, underlying_px, 0.0, extra))
@@ -154,15 +158,15 @@ def _scan_unusual_for_symbol(sym: str):
 
 
 async def run_unusual():
-    """
-    Unusual options buyer scanner.
-    """
     if not POLYGON_KEY:
         print("[unusual] POLYGON_KEY not set; skipping scan.")
         return
 
     universe = _get_ticker_universe()
     for sym in universe:
+        if is_etf_blacklisted(sym):
+            continue
+
         try:
             alerts = _scan_unusual_for_symbol(sym)
         except Exception as e:
@@ -170,5 +174,4 @@ async def run_unusual():
             continue
 
         for _sym, last_price, rvol, extra in alerts:
-            # rvol is per underlying; we don't compute it here → pass 0.0
             send_alert("unusual", _sym, last_price, 0.0, extra=extra)
