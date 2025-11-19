@@ -24,17 +24,17 @@ _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
 eastern = pytz.timezone("US/Eastern")
 
-MIN_RUN_PCT = float(os.getenv("MIN_REVERSAL_RUN_PCT", "8.0"))       # move up from open to HOD
+MIN_RUN_PCT = float(os.getenv("MIN_REVERSAL_RUN_PCT", "8.0"))          # move up from open to HOD
 MIN_PULLBACK_PCT = float(os.getenv("MIN_REVERSAL_PULLBACK_PCT", "3.0"))  # from HOD down to close
 MIN_REVERSAL_PRICE = float(os.getenv("MIN_REVERSAL_PRICE", "2.0"))
 MIN_REVERSAL_RVOL = float(os.getenv("MIN_REVERSAL_RVOL", "2.5"))
 
 
 def _in_reversal_window() -> bool:
-    """Only run 9:30–16:00 EST."""
+    """Only run AFTER 11:30 AM EST (through close)."""
     now_et = datetime.now(eastern)
     minutes = now_et.hour * 60 + now_et.minute
-    return 9 * 60 + 30 <= minutes <= 16 * 60
+    return 11 * 60 + 30 <= minutes <= 16 * 60
 
 
 def _get_ticker_universe() -> List[str]:
@@ -46,12 +46,13 @@ def _get_ticker_universe() -> List[str]:
 
 async def run_momentum_reversal():
     """
-    Momentum Reversal:
+    Momentum Reversal (late-day):
+
       • Stock runs ≥ MIN_RUN_PCT from open to HOD
       • Then pulls back ≥ MIN_PULLBACK_PCT from HOD to close
       • Price >= MIN_REVERSAL_PRICE
       • RVOL + volume filters
-      • Use as dip-buy / short-entry context
+      • Only scans after 11:30 AM EST
     """
     if not POLYGON_KEY:
         print("[momentum_reversal] POLYGON_KEY not set; skipping scan.")
@@ -60,7 +61,7 @@ async def run_momentum_reversal():
         print("[momentum_reversal] Client not initialized; skipping scan.")
         return
     if not _in_reversal_window():
-        print("[momentum_reversal] Outside 9:30–16:00 window; skipping scan.")
+        print("[momentum_reversal] Outside 11:30–16:00 window; skipping scan.")
         return
 
     universe = _get_ticker_universe()
@@ -161,11 +162,21 @@ async def run_momentum_reversal():
             else "Potential short entry after failed run"
         )
 
+        if day_high > 0:
+            from_high_pct = (day_high - last_price) / day_high * 100.0
+        else:
+            from_high_pct = 0.0
+
+        if abs(from_high_pct) < 1.0:
+            hod_text = "at/near HOD"
+        else:
+            hod_text = f"{from_high_pct:.1f}% below HOD"
+
         extra = (
-            f"🔄 Momentum reversal after strong run\n"
+            f"🔄 Late-day momentum reversal\n"
             f"🚀 Run from open to high: {run_pct:.1f}%\n"
             f"📉 Pullback from high to close: {pullback_pct:.1f}%\n"
-            f"📏 Day Range: Low ${day_low:.2f} – High ${day_high:.2f} · Close ${last_price:.2f}\n"
+            f"📏 Day Range: Low ${day_low:.2f} – High ${day_high:.2f} · Close ${last_price:.2f} ({hod_text})\n"
             f"📈 Prev Close: ${prev_close:.2f} → Close: ${last_price:.2f} ({move_pct:.1f}%)\n"
             f"📦 Volume: {int(vol_today):,}\n"
             f"🎯 Setup Grade: {grade}\n"
