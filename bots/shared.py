@@ -2,7 +2,7 @@
 import os
 import time
 from datetime import datetime
-from typing import List
+from typing import List, Dict, Tuple
 
 import pytz
 import requests
@@ -32,6 +32,9 @@ TELEGRAM_CHAT_ALL = os.getenv("TELEGRAM_CHAT_ALL", "")
 TELEGRAM_TOKEN_ALERTS = os.getenv("TELEGRAM_TOKEN_ALERTS", "")
 TELEGRAM_TOKEN_STATUS = os.getenv("TELEGRAM_TOKEN_STATUS", "")
 
+# Alert throttle: minimum seconds between alerts for the same (bot, symbol)
+ALERT_THROTTLE_SEC = int(os.getenv("ALERT_THROTTLE_SEC", "900"))  # default 15 minutes
+
 # ---------- Emoji map per bot ----------
 
 _EMOJI_MAP = {
@@ -46,6 +49,114 @@ _EMOJI_MAP = {
     "momentum_reversal": "🔄",
 }
 
+# ---------- ETF blacklist ----------
+
+_default_etfs = "SPY,QQQ,IWM,DIA,IEMG,XLK,XLF,XLV,XLY,XLP,XLE,XLB,XLU,SMH"
+_ETF_ENV = os.getenv("ETF_BLACKLIST", _default_etfs)
+ETF_BLACKLIST = {s.strip().upper() for s in _ETF_ENV.split(",") if s.strip()}
+
+# ---------- Alert tracking ----------
+
+_LAST_ALERT_SENT: Dict[Tuple[str, str], float] = {}
+_ALERT_COUNTS: Dict[str, int] = {}
+
+
+def is_etf_blacklisted(symbol: str) -> bool:
+    """Return True if symbol is in the ETF blacklist."""
+    return symbol.upper() in ETF_BLACKLIST
+
+
+def _record_alert(bot_name: str, symbol: str) -> bool:
+    """
+    Returns True if we should send an alert (not throttled),
+    False if it should be skipped due to throttle.
+    """
+    now_ts = time.time()
+    key = (bot_name.lower(), symbol.upper())
+    last_ts = _LAST_ALERT_SENT.get(key)
+    if last_ts is not None and (now_ts - last_ts) < ALERT_THROTTLE_SEC:
+        # Throttled
+        print(f"THROTTLED [{bot_name}] {symbol}")
+        return False
+
+    _LAST_ALERT_SENT[key] = now_ts
+    _ALERT_COUNTS[bot_name] = _ALERT_COUNTS.get(bot_name, 0) + 1
+    return True
+
+
+def get_alert_counts_snapshot(reset: bool = False) -> Dict[str, int]:
+    """
+    Snapshot of how many alerts each bot sent since last reset.
+    If reset=True, clears counters after returning.
+    """
+    snap = dict(_ALERT_COUNTS)
+    if reset:
+        _ALERT_COUNTS.clear()
+    return snap
+
+
+# ---------- Helpers for grading & sentiment ----------
+
+def grade_equity_setup(move_pct: float, rvol: float, dollar_volume: float) -> str:
+    """
+    Very simple grading for equity moves.
+
+    Inputs:
+      move_pct     - % move today
+      rvol         - relative volume
+      dollar_volume- price * shares traded
+
+    Returns: "A+", "A", "B", or "C"
+    """
+    dv = dollar_volume
+
+    if move_pct >= 15 and rvol >= 8 and dv >= 150_000_000:
+        return "A+"
+    if move_pct >= 10 and rvol >= 4 and dv >= 75_000_000:
+        return "A"
+    if move_pct >= 5 and rvol >= 2 and dv >= 25_000_000:
+        return "B"
+    return "C"
+
+
+def describe_option_flow(side: str, dte: int, moneyness: float) -> str:
+    """
+    side: "C" or "P"
+    dte: days to expiration
+    moneyness: abs(strike - underlying) / underlying (0.10 = 10% from spot)
+    """
+    s = side.upper() if side else "?"
+
+    if s == "C":
+        direction = "Bullish calls"
+    elif s == "P":
+        direction = "Bearish puts / hedge"
+    else:
+        direction = "Mixed flow"
+
+    # Classification based on DTE + moneyness
+    if dte <= 1 and moneyness > 0.10:
+        style = "lottery / speculative"
+    elif dte <= 3 and moneyness <= 0.10:
+        style = "short-term directional"
+    elif dte <= 14:
+        style = "swing positioning"
+    else:
+        style = "longer-dated positioning"
+
+    return f"{direction}, {style}"
+
+
+def chart_link(symbol: str) -> str:
+    """
+    Build a chart link for the symbol. Default is TradingView.
+    Can be overridden with CHART_BASE env if you prefer another site.
+    """
+    base = os.getenv("CHART_BASE", "https://www.tradingview.com/chart/?symbol=")
+    return f"{base}{symbol.upper()}"
+
+
+# ---------- Telegram helpers ----------
 
 def _pick_alert_token(bot_name: str) -> str:
     if TELEGRAM_TOKEN_ALERTS:
@@ -82,17 +193,17 @@ def send_alert(
         print("ALERT SKIPPED: no Telegram token configured (TELEGRAM_TOKEN_ALERTS)")
         return
 
+    # Throttle per (bot, symbol)
+    if not _record_alert(bot_name, symbol):
+        return
+
     timestamp = now_est()
     title = bot_name.upper().replace("_", " ")
     emoji = _EMOJI_MAP.get(bot_name.lower(), "📈")
 
-    # Line 1: strategy + symbol (short so it doesn't wrap)
     header_line = f"{emoji} *{title}* — `{symbol}`"
-
-    # Line 2: time
     time_line = f"🕒 {timestamp}"
 
-    # Line 3: price + optional RVOL
     price_line = f"💰 ${last_price:.2f}"
     if rvol > 0:
         price_line += f" · 📊 RVOL {rvol:.1f}x"
