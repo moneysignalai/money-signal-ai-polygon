@@ -1,6 +1,6 @@
 import os
 from datetime import date, timedelta, datetime
-from typing import List, Dict, Any
+from typing import List, Any
 import pytz
 
 try:
@@ -51,9 +51,28 @@ def _mark(sym: str):
 
 
 def _in_rth() -> bool:
+    """
+    U.S. options regular session:
+      • Monday–Friday only
+      • 9:30 AM – 4:00 PM Eastern
+    """
     now = datetime.now(eastern)
+
+    # 0 = Monday, 6 = Sunday
+    if now.weekday() >= 5:
+        # Saturday or Sunday
+        print("[unusual] Weekend; skipping scan.")
+        return False
+
     mins = now.hour * 60 + now.minute
-    return 9 * 60 + 30 <= mins <= 16 * 60
+    in_window = 9 * 60 + 30 <= mins <= 16 * 60
+
+    if in_window:
+        print("[unusual] Inside 09:30–16:00 RTH; scanning unusual sweeps.")
+    else:
+        print("[unusual] Outside 09:30–16:00 RTH; skipping scan.")
+
+    return in_window
 
 
 def _universe() -> List[str]:
@@ -85,7 +104,6 @@ async def run_unusual():
         print("[unusual] Missing client or API key.")
         return
     if not _in_rth():
-        print("[unusual] Outside RTH.")
         return
 
     _reset_if_new_day()
@@ -199,7 +217,11 @@ async def run_unusual():
                 if notional < MIN_OPTION_NOTIONAL:
                     continue
 
-                moneyness = ((last_price - float(_safe(c, "strike_price", "strike", default=0)))) / last_price * 100
+                strike = float(_safe(c, "strike_price", "strike", default=0.0) or 0.0)
+                if strike <= 0:
+                    continue
+
+                moneyness = (last_price - strike) / last_price * 100.0
 
                 data = {
                     "contract": c,
@@ -211,7 +233,7 @@ async def run_unusual():
                     "notional": notional,
                     "dte": dte,
                     "exp": exp,
-                    "strike": float(_safe(c, "strike_price", "strike", default=0)),
+                    "strike": strike,
                     "moneyness": moneyness,
                 }
 
@@ -229,11 +251,9 @@ async def run_unusual():
         strike = best["strike"]
         ctype = best["ctype"].upper()  # CALL or PUT
 
-        # pick emoji
-        type_emoji = "🟢" if ctype == "CALL" else "🔻"
         flow_emoji = "🕵️"
         money_emoji = "💰"
-        clock_emoji = "⏱️"
+        clock_emoji = "🕒"
         divider = "────────────"
 
         move_pct = (
@@ -241,28 +261,32 @@ async def run_unusual():
             if prev_close > 0 else 0.0
         )
 
-        # sweep classification
+        # simple sweep-type classification
         if best["bid"] == 0 or best["ask"] == 0:
-            sweep_type = "Mixed Flow"
-        elif best["mid"] == best["ask"]:
-            sweep_type = "Aggressive ASK Buy"
-        elif best["mid"] == best["bid"]:
-            sweep_type = "Aggressive BID Hit"
+            sweep_type = "Mixed flow"
+        elif abs(best["mid"] - best["ask"]) < 1e-4:
+            sweep_type = "Aggressive ASK buy"
+        elif abs(best["mid"] - best["bid"]) < 1e-4:
+            sweep_type = "Aggressive BID hit"
         else:
-            sweep_type = "Directional Sweep"
+            sweep_type = "Directional sweep"
 
-        itm_otm = "ITM" if (ctype == "CALL" and last_price > strike) or (ctype == "PUT" and last_price < strike) else "OTM"
+        itm_otm = (
+            "ITM"
+            if (ctype == "CALL" and last_price > strike)
+            or (ctype == "PUT" and last_price < strike)
+            else "OTM"
+        )
 
-        # Timestamp
         now_et = datetime.now(eastern)
-        timestamp = now_et.strftime("%I:%M %p EST · %b %d")
+        timestamp = now_et.strftime("%I:%M %p EST · %b %d").lstrip("0")
 
         extra = (
             f"{flow_emoji} UNUSUAL — {sym}\n"
             f"{clock_emoji} {timestamp}\n"
             f"{money_emoji} ${last_price:.2f}\n"
             f"{divider}\n"
-            f"{flow_emoji} Unusual {ctype} Sweep: {sym} {best['exp']} {strike:.2f} {ctype[0]}\n"
+            f"{flow_emoji} Unusual {ctype} sweep: {sym} {best['exp']} {strike:.2f} {ctype[0]}\n"
             f"📌 Flow Type: {sweep_type}\n"
             f"⏱ DTE: {best['dte']} · {itm_otm} · Moneyness {best['moneyness']:.1f}%\n"
             f"📦 Volume: {best['vol']:,} contracts · Avg: ${best['mid']:.2f}\n"
