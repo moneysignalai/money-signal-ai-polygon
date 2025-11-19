@@ -1,6 +1,9 @@
 import os
-from datetime import date, timedelta
+import time
+from datetime import date, timedelta, datetime
 from typing import List
+
+import pytz
 
 try:
     from massive import RESTClient
@@ -20,8 +23,22 @@ from bots.shared import (
 
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
-MIN_VOLUME_RVOL = float(os.getenv("MIN_VOLUME_RVOL", "4.0"))
-MIN_VOLUME_PRICE = float(os.getenv("MIN_VOLUME_PRICE", "2.0"))
+eastern = pytz.timezone("US/Eastern")
+
+MIN_MONSTER_BAR_SHARES = int(os.getenv("MIN_MONSTER_BAR_SHARES", "8000000"))
+MIN_MONSTER_PRICE = float(os.getenv("MIN_MONSTER_PRICE", "2.0"))
+MIN_VOLUME_RVOL = float(os.getenv("MIN_VOLUME_RVOL", "2.5"))
+
+# run this bot at most every 8 minutes
+_MONSTER_REFRESH_SEC = int(os.getenv("MONSTER_REFRESH_SEC", "480"))
+_last_run_ts = 0.0
+
+
+def _in_rth_window() -> bool:
+    """Regular trading hours 9:30–16:00 EST."""
+    now_et = datetime.now(eastern)
+    minutes = now_et.hour * 60 + now_et.minute
+    return 9 * 60 + 30 <= minutes <= 16 * 60
 
 
 def _get_ticker_universe() -> List[str]:
@@ -33,17 +50,31 @@ def _get_ticker_universe() -> List[str]:
 
 async def run_volume():
     """
-    High relative-volume scanner:
-      • RVOL >= max(MIN_VOLUME_RVOL, MIN_RVOL_GLOBAL)
-      • Volume >= MIN_VOLUME_GLOBAL
-      • Price >= MIN_VOLUME_PRICE
+    Volume Monster:
+      • Any 1-min bar with volume >= MIN_MONSTER_BAR_SHARES
+      • Underlying price >= MIN_MONSTER_PRICE
+      • Day RVOL >= max(MIN_VOLUME_RVOL, MIN_RVOL_GLOBAL)
+      • Day volume >= MIN_VOLUME_GLOBAL
+      • Only during 9:30–16:00 EST
+      • Bot-level throttle: at most once every MONSTER_REFRESH_SEC
     """
+    global _last_run_ts
+
     if not POLYGON_KEY:
         print("[volume] POLYGON_KEY not set; skipping scan.")
         return
     if not _client:
         print("[volume] Client not initialized; skipping scan.")
         return
+    if not _in_rth_window():
+        print("[volume] Outside 9:30–16:00 window; skipping scan.")
+        return
+
+    now_ts = time.time()
+    if now_ts - _last_run_ts < _MONSTER_REFRESH_SEC:
+        print("[volume] Throttled by MONSTER_REFRESH_SEC; skipping this cycle.")
+        return
+    _last_run_ts = now_ts
 
     universe = _get_ticker_universe()
     today = date.today()
@@ -53,6 +84,7 @@ async def run_volume():
         if is_etf_blacklisted(sym):
             continue
 
+        # daily bars for RVOL / move
         try:
             days = list(
                 _client.list_aggs(
@@ -73,13 +105,11 @@ async def run_volume():
 
         today_bar = days[-1]
         prev = days[-2]
-
-        last_price = float(today_bar.close)
-        if last_price < MIN_VOLUME_PRICE:
-            continue
-
         prev_close = float(prev.close)
-        move_pct = (last_price - prev_close) / prev_close * 100.0 if prev_close > 0 else 0.0
+        last_price = float(today_bar.close)
+
+        if last_price < MIN_MONSTER_PRICE:
+            continue
 
         hist = days[:-1]
         if hist:
@@ -96,24 +126,58 @@ async def run_volume():
         if rvol < max(MIN_VOLUME_RVOL, MIN_RVOL_GLOBAL):
             continue
 
-        vol_today = float(today_bar.volume)
-        if vol_today < MIN_VOLUME_GLOBAL:
+        day_vol = float(today_bar.volume)
+        if day_vol < MIN_VOLUME_GLOBAL:
             continue
 
-        dv = last_price * vol_today
+        # minute bars for monster bar detection
+        try:
+            mins = list(
+                _client.list_aggs(
+                    ticker=sym,
+                    multiplier=1,
+                    timespan="minute",
+                    from_=today_s,
+                    to=today_s,
+                    limit=10_000,
+                )
+            )
+        except Exception as e:
+            print(f"[volume] minute fetch failed for {sym}: {e}")
+            continue
+
+        if not mins:
+            continue
+
+        # look for any 1-min bar with massive shares
+        monster_bar = None
+        for b in mins:
+            if b.volume >= MIN_MONSTER_BAR_SHARES:
+                monster_bar = b
+        # if multiple qualify, we'll just use the last one
+
+        if not monster_bar:
+            continue
+
+        monster_vol = float(monster_bar.volume)
+        monster_price = float(monster_bar.close)
+
+        move_pct = (last_price - prev_close) / prev_close * 100.0 if prev_close > 0 else 0.0
+        dv = last_price * day_vol
         grade = grade_equity_setup(abs(move_pct), rvol, dv)
 
         if move_pct > 0:
-            bias = "Long accumulation (high volume up day)"
+            bias = "Aggressive buying (monster 1-min volume)"
         elif move_pct < 0:
-            bias = "Heavy distribution (high volume down day)"
+            bias = "Aggressive selling (monster 1-min volume)"
         else:
-            bias = "High volume, flat price action"
+            bias = "Huge tape activity with flat price"
 
         extra = (
-            f"📊 High relative volume: {rvol:.1f}x\n"
-            f"📈 Prev Close: ${prev_close:.2f} → Close: ${last_price:.2f} ({move_pct:.1f}%)\n"
-            f"📦 Volume: {int(vol_today):,} (≈ ${dv:,.0f} notional)\n"
+            f"📊 Monster 1-min bar: {int(monster_vol):,} shares\n"
+            f"💹 Bar Close: ${monster_price:.2f}\n"
+            f"📈 Prev Close: ${prev_close:.2f} → Day Close: ${last_price:.2f} ({move_pct:.1f}%)\n"
+            f"📦 Day Volume: {int(day_vol):,} (≈ ${dv:,.0f} notional)\n"
             f"🎯 Setup Grade: {grade}\n"
             f"📌 Bias: {bias}\n"
             f"🔗 Chart: {chart_link(sym)}"
