@@ -38,6 +38,11 @@ REQUIRE_EARNINGS_NEWS = os.getenv("REQUIRE_EARNINGS_NEWS", "true").lower() == "t
 _alerted_date: date | None = None
 _alerted_symbols: set[str] = set()
 
+# --- News capability flags ---
+
+_news_capability_checked = False
+_news_supported = False
+
 
 def _reset_if_new_day() -> None:
     """
@@ -90,24 +95,61 @@ def _get_ticker_universe() -> List[str]:
 
 # --- Optional earnings-news check ---
 
+def _ensure_news_capability_checked():
+    """
+    Detect once whether the current RESTClient supports list_news.
+    If not, we disable the news requirement to avoid noisy errors.
+    """
+    global _news_capability_checked, _news_supported, REQUIRE_EARNINGS_NEWS
+
+    if _news_capability_checked:
+        return
+
+    _news_capability_checked = True
+
+    if not _client:
+        _news_supported = False
+        # If we don't even have a client, there's no point in requiring news
+        if REQUIRE_EARNINGS_NEWS:
+            print("[earnings] No client available; disabling REQUIRE_EARNINGS_NEWS.")
+            REQUIRE_EARNINGS_NEWS = False
+        return
+
+    if hasattr(_client, "list_news"):
+        _news_supported = True
+    else:
+        _news_supported = False
+        if REQUIRE_EARNINGS_NEWS:
+            print(
+                "[earnings] Client has no list_news(). "
+                "Disabling REQUIRE_EARNINGS_NEWS to avoid errors."
+            )
+            REQUIRE_EARNINGS_NEWS = False
+
+
 def _has_recent_earnings_news(sym: str, today: date) -> bool:
     """
     Optionally require a recent 'earnings-style' news headline
     to reduce false positives.
 
-    You can turn this off with REQUIRE_EARNINGS_NEWS=false.
+    If the client does NOT support list_news (older polygon client),
+    we simply return True and skip the filter to avoid attribute errors.
     """
+    _ensure_news_capability_checked()
+
+    # If we've turned off the requirement (either via env or capability), treat as pass.
     if not REQUIRE_EARNINGS_NEWS:
         return True
 
-    if not _client:
-        return False
+    if not _client or not _news_supported:
+        # This should not happen after _ensure_news_capability_checked, but guard anyway.
+        return True
 
     try:
         from_dt = today - timedelta(days=EARNINGS_NEWS_LOOKBACK_DAYS)
         from_iso = datetime(from_dt.year, from_dt.month, from_dt.day, tzinfo=pytz.UTC).isoformat()
-        # Polygon: list_news supports published_utc.gte in query params,
-        # but some client versions require "published_utc.gte" in kwargs.
+
+        # Newer polygon clients: list_news
         news_items = list(
             _client.list_news(
                 ticker=sym,
@@ -117,12 +159,15 @@ def _has_recent_earnings_news(sym: str, today: date) -> bool:
         )
     except Exception as e:
         print(f"[earnings] news fetch failed for {sym}: {e}")
-        return False
+        # On failure, don't block the signal — just allow it through.
+        return True
 
     if not news_items:
+        # If we strictly require news, this will block; if you want more signals,
+        # you can set REQUIRE_EARNINGS_NEWS=false in ENV.
         return False
 
-    keywords = ("earnings", "results", "guidance", "quarter", "Q1", "Q2", "Q3", "Q4")
+    keywords = ("earnings", "results", "guidance", "quarter", "q1", "q2", "q3", "q4")
     for n in news_items:
         title = (getattr(n, "title", "") or "").lower()
         if any(k in title for k in keywords):
@@ -142,7 +187,7 @@ async def run_earnings():
       • Day RVOL >= max(MIN_EARNINGS_RVOL, MIN_RVOL_GLOBAL)
       • Day volume >= MIN_VOLUME_GLOBAL
       • Dollar volume >= MIN_EARNINGS_DOLLAR_VOL
-      • Optional: at least one recent 'earnings' news item
+      • Optional: at least one recent 'earnings' news item, if supported
       • Only runs between 7:00 AM and 10:00 PM EST
       • Per-symbol per-day de-dupe: each ticker alerts at most once per day
     """
@@ -157,6 +202,7 @@ async def run_earnings():
         return
 
     _reset_if_new_day()
+    _ensure_news_capability_checked()
 
     universe = _get_ticker_universe()
     today = date.today()
@@ -238,7 +284,7 @@ async def run_earnings():
             else 0.0
         )
 
-        # Optional: require an earnings-style news item
+        # Optional: require an earnings-style news item (only if supported)
         if not _has_recent_earnings_news(sym, today):
             continue
 
@@ -260,7 +306,5 @@ async def run_earnings():
             f"🔗 Chart: {chart_link(sym)}"
         )
 
-        # Mark before sending so even if the process crashes mid-send,
-        # we are still conservative about duplicates on restart.
         _mark_alerted(sym)
         send_alert("earnings", sym, last_price, rvol, extra=extra)
