@@ -1,4 +1,4 @@
-<p align="center">
+my<p align="center">
   <img src="docs/moneysignal-logo.png" alt="MoneySignalAI Logo" width="420">
 </p>
 
@@ -105,4 +105,228 @@ bots/shared.py
  ├─ dynamic most-active universe builder
  ├─ equity setup grading (A+, A, B, C)
  └─ small helpers: chart_link(), is_etf_blacklisted(), etc.
+
+⚙️ Local Installation
+
+1️⃣ Clone the repo
+
+git clone https://github.com/YOURNAME/money-signal-ai.git
+cd money-signal-ai
+
+2️⃣ Create a virtualenv (optional but recommended)
+
+python -m venv .venv
+source .venv/bin/activate      # macOS / Linux
+# or
+.\.venv\Scripts\activate       # Windows
+
+3️⃣ Install requirements
+
+pip install -r requirements.txt
+
+4️⃣ Environment variables
+
+Create a .env file or set these directly in your environment / Render dashboard.
+
+🔑 Core
+
+POLYGON_KEY=your_polygon_api_key
+
+TELEGRAM_TOKEN_ALERTS=your_telegram_bot_token
+TELEGRAM_CHAT_ALL=your_main_alert_chat_id
+
+TELEGRAM_TOKEN_STATUS=optional_status_bot_token
+TELEGRAM_CHAT_STATUS=optional_status_chat_id
+
+🌍 Global filters (for all bots)
+
+MIN_RVOL_GLOBAL=2.5         # RVOL floor
+MIN_VOLUME_GLOBAL=800000    # minimum daily volume in shares
+
+🎯 Optional per-bot tuning (override defaults)
+
+These are optional; the code includes safe defaults. Only set them if you want to be more aggressive / conservative.
+
+# WHALES
+WHALES_MIN_NOTIONAL=2000000
+WHALES_MIN_PRICE=10
+WHALES_MAX_PRICE=500
+
+# DARK POOL RADAR
+DARK_LOOKBACK_MIN=20
+DARK_MIN_TOTAL_NOTIONAL=20000000
+DARK_MIN_SINGLE_NOTIONAL=10000000
+DARK_MIN_PRINT_COUNT=3
+
+# TREND RIDER
+TREND_BREAKOUT_LOOKBACK=20
+TREND_BREAKOUT_MIN_PCT=2.0
+TREND_MIN_RVOL=3.0
+
+# PANIC FLUSH
+PANIC_MIN_DROP_PCT=12
+PANIC_MIN_RVOL=4.0
+PANIC_NEAR_LOW_PCT=2.0
+
+# SWING PULLBACK
+PULLBACK_MAX_DIST_EMA=1.0
+PULLBACK_MIN_RVOL=2.0
+
+# IV CRUSH
+IVCRUSH_MAX_DTE=14
+IVCRUSH_MIN_IV=0.6
+IVCRUSH_MIN_IV_DROP_PCT=30
+IVCRUSH_MIN_IMPLIED_MOVE_PCT=8
+IVCRUSH_MAX_MOVE_REL_IV=0.6
+
+🚀 Running Locally
+
+Run the FastAPI + background scanner
+
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+This will:
+	•	Start a small API (for Render health checks).
+	•	Spin up a background task that:
+	•	Every ~60 seconds:
+	•	Builds the dynamic universe.
+	•	Runs all 15 bots concurrently.
+	•	Sends alerts to Telegram.
+
+Visit:
+
+http://localhost:8000/
+
+to confirm the service is up.
+
+🌥 Deploying on Render
+	1.	Push your repo to GitHub.
+	2.	Go to Render → New → Web Service.
+	3.	Connect to your GitHub repo.
+	4.	Choose:
+	•	Runtime: Python
+	•	Start Command:
+
+gunicorn -k uvicorn.workers.UvicornWorker main:app --timeout 600
+
+5.	In Environment → Environment Variables, add all POLYGON_KEY, TELEGRAM_*, MIN_*, etc.
+	6.	Deploy.
+
+Render will:
+	•	Health-check /
+	•	Keep the process alive
+	•	Let the async scanner run 24/5.
+
+
+🧪 Sample Alert Formats
+
+These are examples of how Telegram messages look.
+In your own alerts the tickers, numbers, and times will be live.
+
+🐋 Whale Flow
+🐋 WHALE FLOW — META
+🕒 10:35 AM EST · Nov 21
+💰 Underlying: $317.22 · RVOL 3.9x
+────────────
+🟢 META 11/24 330C
+📦 Volume: 4,812 · Avg: $6.15
+💰 Notional: ≈ $2,961,000
+🔗 Chart: https://www.tradingview.com/chart/?symbol=META
+
+🌑 Dark Pool Radar
+🌑 DARK POOL RADAR — AMD
+🕒 7:42 PM EST · Nov 21
+💰 $117.88 · RVOL 2.8x
+────────────
+📡 Dark pool cluster (last 20 min)
+📦 Prints: 12
+💰 Total Dark Notional: ≈ $47,550,000
+🏦 Largest Single Print: ≈ $12,800,000
+🔗 Chart: https://www.tradingview.com/chart/?symbol=AMD
+
+🔥 Cheap 0DTE / 3DTE
+🔥 CHEAP — BBAI
+🕒 12:14 PM EST · Nov 21
+💰 Last: $5.98
+────────────
+🔥 Cheap CALL: O:BBAI251121P00006000
+⏱ DTE: 3 · Strike: 6.00
+📦 Volume: 2,666 · Avg: $0.35
+💰 Notional: ≈ $94,525
+🔗 Chart: https://www.tradingview.com/chart/?symbol=BBAI
+
+
+🛠 Developer Notes
+	•	All bots are structured as async coroutines (async def run_xxx()).
+	•	bots/shared.py centralizes:
+	•	Global ENV
+	•	Telegram sending
+	•	Universe building
+	•	Equity grading
+	•	New bots are easy to add:
+	1.	Create bots/new_strategy.py with async def run_new_strategy().
+	2.	Import and add it to the asyncio.gather() list in main.py.
+	3.	Use send_alert("new_strategy", ticker, price, rvol, extra=msg).
+
+
+❓ FAQ
+
+❓ Why am I not getting any alerts?
+
+Check:
+	1.	Are your Telegram tokens and chat IDs correct?
+	2.	Do logs show:
+SCANNING: Premarket, Volume, Gaps, ORB, ...
+
+3.	Are your global filters too strict?
+	•	Try temporarily:
+MIN_RVOL_GLOBAL=2.0
+MIN_VOLUME_GLOBAL=500000
+
+❓ Why am I getting too many alerts?
+	•	Raise thresholds:
+MIN_RVOL_GLOBAL=3.0
+MIN_VOLUME_GLOBAL=1500000
+WHALES_MIN_NOTIONAL=3000000
+DARK_MIN_TOTAL_NOTIONAL=40000000
+
+	•	Or narrow the universe to only specific tickers via:
+TICKER_UNIVERSE=AAPL,MSFT,TSLA,NVDA,META,AMZN
+
+❓ Does this place trades for me?
+No.
+This is an information and alert system only. You (or your own trading system) decide whether to trade.
+
+🧭 Roadmap
+	•	🧬 Greeks Extreme Bot (gamma, vanna, charm pressure extremes)
+	•	⚖️ Options vs Equity Divergence Bot (flow doesn’t match price)
+	•	🧲 Liquidity Vacuum Detector (thin-book sweeps)
+	•	📅 Pre-Earnings IV Ramp scanner
+	•	🧂 Mean Reversion Bot for intraday overextensions
+	•	🌐 Multi-exchange support (if Polygon adds more feeds)
+
+
+⚠️ Disclaimer
+
+This project is for educational and informational purposes only.
+Nothing in this repository is financial advice.
+Markets are risky. Do your own research. Use at your own risk.
+
+
+🤝 Contributing
+
+PRs, issues, and ideas are welcome.
+	1.	Fork the repo
+	2.	Create a feature branch
+	3.	Add logs + comments
+	4.	Submit a PR describing:
+	•	What strategy you added/changed
+	•	Example alert
+	•	Any new ENV vars
+
+<p align="center">
+  Built for traders who don’t have time to babysit every chart. ⚡<br>
+  <b>Let the bots watch the market. You just watch the alerts.</b>
+</p>
+```
 
