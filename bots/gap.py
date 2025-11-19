@@ -24,11 +24,13 @@ _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
 eastern = pytz.timezone("US/Eastern")
 
-# % gap threshold
+# Gap thresholds (% of prior close)
 MIN_GAP_PCT = float(os.getenv("MIN_GAP_PCT", "4.0"))      # min |gap|
 MAX_GAP_PCT = float(os.getenv("MAX_GAP_PCT", "35.0"))     # max |gap|
 MIN_GAP_PRICE = float(os.getenv("MIN_GAP_PRICE", "2.0"))  # min last price
 MIN_GAP_RVOL = float(os.getenv("MIN_GAP_RVOL", "2.5"))    # min RVOL
+
+_last_gap_run_date: date | None = None  # ensure only one run per trading day
 
 
 def _in_gap_window() -> bool:
@@ -47,14 +49,18 @@ def _get_ticker_universe() -> List[str]:
 
 async def run_gap():
     """
-    Gap Radar:
+    Overnight Gap Radar (up or down):
+
       • |Gap| between MIN_GAP_PCT and MAX_GAP_PCT vs prior close
-      • Works for both gap-up and gap-down
+      • Both gap-up and gap-down permitted
       • Last price >= MIN_GAP_PRICE
       • RVOL >= max(MIN_GAP_RVOL, MIN_RVOL_GLOBAL)
       • Volume >= MIN_VOLUME_GLOBAL
       • Only during 9:30–10:30 AM EST
+      • Only runs once per calendar day per container
     """
+    global _last_gap_run_date
+
     if not POLYGON_KEY:
         print("[gap] POLYGON_KEY not set; skipping scan.")
         return
@@ -65,8 +71,13 @@ async def run_gap():
         print("[gap] Outside 9:30–10:30 window; skipping scan.")
         return
 
-    universe = _get_ticker_universe()
     today = date.today()
+    if _last_gap_run_date == today:
+        print("[gap] Already ran today; skipping extra scans.")
+        return
+    _last_gap_run_date = today
+
+    universe = _get_ticker_universe()
     today_s = today.isoformat()
 
     for sym in universe:
@@ -111,7 +122,7 @@ async def run_gap():
         if not (MIN_GAP_PCT <= gap_mag <= MAX_GAP_PCT):
             continue
 
-        # RVOL
+        # RVOL check (day level)
         hist = days[:-1]
         if hist:
             recent = hist[-20:] if len(hist) > 20 else hist
@@ -147,15 +158,15 @@ async def run_gap():
             bias = (
                 "Long gap-and-go momentum"
                 if total_move_pct > 0
-                else "Caution: gap-up with weak follow-through"
+                else "Gap-up with weak follow-through (fade risk)"
             )
         else:
             direction = "Gap-Down"
             emoji = "⚠️"
             bias = (
-                "Short / fade gap-down breakdown"
+                "Short / continuation gap-down"
                 if total_move_pct < 0
-                else "Caution: gap-down being bought"
+                else "Gap-down being bought (possible reversal)"
             )
 
         extra = (
