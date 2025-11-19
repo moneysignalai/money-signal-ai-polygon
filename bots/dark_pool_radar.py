@@ -25,15 +25,17 @@ eastern = pytz.timezone("US/Eastern")
 
 # ------------------- CONFIG -------------------
 
-# These will need to match your provider’s dark-pool / off-exchange codes.
+# Exchange codes to be treated as dark/ATS — dev can tune if needed
 DARK_EXCHANGES = {
-    8, 9, 80, 81, 82  # EXAMPLE CODES — dev should verify and adjust
+    8, 9, 80, 81, 82  # placeholders; adapt to your real feed
 }
 
 DARK_LOOKBACK_MIN = int(os.getenv("DARK_LOOKBACK_MIN", "20"))  # last X minutes
-MIN_DARK_TOTAL_NOTIONAL = float(os.getenv("DARK_MIN_TOTAL_NOTIONAL", "10000000"))  # $10M
-MIN_DARK_SINGLE_NOTIONAL = float(os.getenv("DARK_MIN_SINGLE_NOTIONAL", "5000000"))  # $5M
-MIN_DARK_DOLLAR_VOL = float(os.getenv("DARK_MIN_DOLLAR_VOL", "20000000"))  # $20M underlying
+MIN_DARK_TOTAL_NOTIONAL = float(os.getenv("DARK_MIN_TOTAL_NOTIONAL", "20000000"))  # $20M+
+MIN_DARK_SINGLE_NOTIONAL = float(os.getenv("DARK_MIN_SINGLE_NOTIONAL", "10000000"))  # $10M+
+MIN_DARK_PRINT_COUNT = int(os.getenv("DARK_MIN_PRINT_COUNT", "3"))
+MIN_DARK_DOLLAR_VOL = float(os.getenv("DARK_MIN_DOLLAR_VOL", "50000000"))  # $50M+
+MIN_DARK_RVOL = float(os.getenv("DARK_MIN_RVOL", "2.0"))
 
 _alert_date: date | None = None
 _alerted: set[str] = set()
@@ -57,17 +59,25 @@ def _mark(sym: str):
     _alerted.add(sym)
 
 
-def _in_rth() -> bool:
+def _in_dark_window() -> bool:
+    """
+    Dark/ATS prints exist in premarket + RTH + after-hours, not literal 24/7.
+    We'll monitor 4:00–20:00 ET Mon–Fri.
+    """
     now = datetime.now(eastern)
+    if now.weekday() >= 5:
+        print("[dark_pool] Weekend; skipping.")
+        return False
+
     mins = now.hour * 60 + now.minute
-    return 9 * 60 + 30 <= mins <= 16 * 60
+    return 4 * 60 <= mins <= 20 * 60  # 4:00–20:00 ET
 
 
 def _universe() -> List[str]:
     env = os.getenv("TICKER_UNIVERSE")
     if env:
         return [x.strip().upper() for x in env.split(",") if x.strip()]
-    return get_dynamic_top_volume_universe(max_tickers=150, volume_coverage=0.95)
+    return get_dynamic_top_volume_universe(max_tickers=120, volume_coverage=0.95)
 
 
 def _safe(o: Any, name: str, default=None):
@@ -76,23 +86,28 @@ def _safe(o: Any, name: str, default=None):
 
 async def run_dark_pool_radar():
     """
-    Dark Pool Radar Bot:
+    Dark Pool Radar Bot — "oh wow" clusters.
 
-      • Scans recent trades for off-exchange (dark/ATS) prints.
-      • Triggers when:
-          - Total dark notional in last DARK_LOOKBACK_MIN >= MIN_DARK_TOTAL_NOTIONAL, OR
-          - Largest single dark print >= MIN_DARK_SINGLE_NOTIONAL
-          - Underlying RVOL & dollar volume filters pass.
+      • Time: 4:00–20:00 ET (premarket + RTH + after-hours).
+      • Underlying:
+          - RVOL ≥ max(MIN_DARK_RVOL, MIN_RVOL_GLOBAL)
+          - Volume ≥ MIN_VOLUME_GLOBAL
+          - Dollar volume ≥ MIN_DARK_DOLLAR_VOL
+      • Dark prints (last DARK_LOOKBACK_MIN minutes):
+          - Total dark notional ≥ MIN_DARK_TOTAL_NOTIONAL  OR
+          - Largest single dark print ≥ MIN_DARK_SINGLE_NOTIONAL
+          - At least MIN_DARK_PRINT_COUNT prints
     """
     if not POLYGON_KEY or not _client:
         print("[dark_pool] Missing client/API key.")
         return
-    if not _in_rth():
-        print("[dark_pool] Outside RTH; skipping.")
+    if not _in_dark_window():
+        print("[dark_pool] Outside dark window; skipping.")
         return
 
     _reset_if_new_day()
     universe = _universe()
+
     now_et = datetime.now(eastern)
     end_ts = now_et
     start_ts = now_et - timedelta(minutes=DARK_LOOKBACK_MIN)
@@ -106,8 +121,7 @@ async def run_dark_pool_radar():
         if _already(sym):
             continue
 
-        # --- Daily context for RVOL, price, dollar volume ---
-
+        # --- Daily context ---
         try:
             days = list(
                 _client.list_aggs(
@@ -140,7 +154,7 @@ async def run_dark_pool_radar():
         day_vol = float(d0.volume)
         rvol = day_vol / avg_vol if avg_vol > 0 else 1.0
 
-        if rvol < max(1.5, MIN_RVOL_GLOBAL):
+        if rvol < max(MIN_DARK_RVOL, MIN_RVOL_GLOBAL):
             continue
         if day_vol < MIN_VOLUME_GLOBAL:
             continue
@@ -154,15 +168,12 @@ async def run_dark_pool_radar():
             if prev_close > 0 else 0.0
         )
 
-        # --- Dark/off-exchange trades over last DARK_LOOKBACK_MIN minutes ---
-
+        # --- Dark trades over last DARK_LOOKBACK_MIN minutes ---
         total_dark_notional = 0.0
         largest_dark_print = 0.0
         trade_count = 0
 
         try:
-            # NOTE: dev may need to adapt this to your exact Polygon client version.
-            # We assume list_trades(ticker=..., timestamp_gte=..., timestamp_lte=...) exists.
             trades = _client.list_trades(
                 ticker=sym,
                 timestamp_gte=int(start_ts.timestamp() * 1_000_000_000),
@@ -189,14 +200,13 @@ async def run_dark_pool_radar():
             if notional > largest_dark_print:
                 largest_dark_print = notional
 
-        if trade_count == 0:
+        if trade_count < MIN_DARK_PRINT_COUNT:
             continue
 
         if (
             total_dark_notional < MIN_DARK_TOTAL_NOTIONAL
             and largest_dark_print < MIN_DARK_SINGLE_NOTIONAL
         ):
-            # no real cluster / whale here
             continue
 
         now_str = now_et.strftime("%I:%M %p EST · %b %d").lstrip("0")
