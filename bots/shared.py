@@ -13,13 +13,12 @@ eastern = pytz.timezone("US/Eastern")
 
 
 def now_est() -> str:
-    # Example: "06:58 PM EST · Nov 18"
+    # Example: "07:08 PM EST · Nov 18"
     return datetime.now(eastern).strftime("%I:%M %p EST · %b %d")
 
 
 # ---------- Global filters (tweak via ENV if needed) ----------
 
-# Base global filters for multiple bots
 MIN_RVOL_GLOBAL = float(os.getenv("MIN_RVOL_GLOBAL", "2.0"))
 MIN_VOLUME_GLOBAL = int(os.getenv("MIN_VOLUME_GLOBAL", "500000"))
 RSI_OVERSOLD = 35
@@ -29,17 +28,11 @@ RSI_OVERBOUGHT = 65
 
 POLYGON_KEY = os.getenv("POLYGON_KEY", "")
 
-# Main chat where all alerts go
 TELEGRAM_CHAT_ALL = os.getenv("TELEGRAM_CHAT_ALL", "")
-
-# Single "all alerts" bot
 TELEGRAM_TOKEN_ALERTS = os.getenv("TELEGRAM_TOKEN_ALERTS", "")
-
-# Optional status/health bot (can be same as TELEGRAM_TOKEN_ALERTS)
 TELEGRAM_TOKEN_STATUS = os.getenv("TELEGRAM_TOKEN_STATUS", "")
 
-
-# ---------- Telegram helpers ----------
+# ---------- Emoji map per bot ----------
 
 _EMOJI_MAP = {
     "premarket": "🌅",
@@ -55,13 +48,8 @@ _EMOJI_MAP = {
 
 
 def _pick_alert_token(bot_name: str) -> str:
-    """
-    Right now we just use TELEGRAM_TOKEN_ALERTS for all bots.
-    Kept as a function in case you later want to route different bots.
-    """
     if TELEGRAM_TOKEN_ALERTS:
         return TELEGRAM_TOKEN_ALERTS
-    # Fallback to status bot if alerts bot isn't set
     if TELEGRAM_TOKEN_STATUS:
         return TELEGRAM_TOKEN_STATUS
     return ""
@@ -79,10 +67,11 @@ def send_alert(
 
     Layout:
 
-    🌅 [06:58 PM EST · Nov 18]  PREMARKET — `AAPL`
-    💰 Last: $189.23 · 📊 RVOL 3.1x
-
-    (bot-specific details...)
+    🧨 SQUEEZE — `OLMA`
+    🕒 07:08 PM EST · Nov 18
+    💰 $20.14 · 📊 RVOL 87.9x
+    ────────────
+    ...strategy-specific block...
     """
     if not TELEGRAM_CHAT_ALL:
         print("ALERT SKIPPED: TELEGRAM_CHAT_ALL not set")
@@ -90,26 +79,28 @@ def send_alert(
 
     token = _pick_alert_token(bot_name)
     if not token:
-        print(f"ALERT SKIPPED: no Telegram token configured (TELEGRAM_TOKEN_ALERTS)")
+        print("ALERT SKIPPED: no Telegram token configured (TELEGRAM_TOKEN_ALERTS)")
         return
 
     timestamp = now_est()
     title = bot_name.upper().replace("_", " ")
     emoji = _EMOJI_MAP.get(bot_name.lower(), "📈")
 
-    # Header
-    header = f"{emoji} *[{timestamp}]*  *{title}* — `{symbol}`"
+    # Line 1: strategy + symbol (short so it doesn't wrap)
+    header_line = f"{emoji} *{title}* — `{symbol}`"
 
-    # Core line: price (+ RVOL if provided)
-    line1 = f"💰 Last: ${last_price:.2f}"
+    # Line 2: time
+    time_line = f"🕒 {timestamp}"
+
+    # Line 3: price + optional RVOL
+    price_line = f"💰 ${last_price:.2f}"
     if rvol > 0:
-        line1 += f" · 📊 RVOL {rvol:.1f}x"
+        price_line += f" · 📊 RVOL {rvol:.1f}x"
 
-    msg = f"{header}\n{line1}"
+    msg = f"{header_line}\n{time_line}\n{price_line}\n────────────"
 
-    # Strategy-specific block
     if extra:
-        msg += f"\n\n{extra}"
+        msg += f"\n{extra}"
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
@@ -124,7 +115,6 @@ def send_alert(
 
 
 def send_status_message(text: str) -> None:
-    """Optional status helper if you want to send custom messages."""
     if not TELEGRAM_CHAT_ALL:
         return
     token = TELEGRAM_TOKEN_STATUS or TELEGRAM_TOKEN_ALERTS
@@ -143,7 +133,6 @@ def send_status_message(text: str) -> None:
 
 
 def start_polygon_websocket():
-    # Placeholder – you can wire real websockets later if you want.
     print("Polygon/WebSocket placeholder — using REST scanners only for now.")
 
 
@@ -162,16 +151,7 @@ def get_dynamic_top_volume_universe(
     volume_coverage: float = 0.90,
 ) -> List[str]:
     """
-    Returns a list of tickers that:
-      * Are sorted by today's total volume (descending)
-      * Stop when we either:
-          - Reach `max_tickers`, OR
-          - Cumulative volume >= `volume_coverage` of total market volume.
-
-    Uses Polygon snapshot endpoint:
-      /v2/snapshot/locale/us/markets/stocks/tickers
-
-    Result is cached for DYNAMIC_UNIVERSE_REFRESH_SEC seconds.
+    Build a dynamic universe of liquid names that covers ~90% of total volume.
     """
     now_ts = time.time()
     if (
