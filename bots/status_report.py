@@ -1,7 +1,11 @@
-# bots/status_report.py — system heartbeat + daily status for MoneySignalAI
+# bots/status_report.py — system heartbeat + daily status + error digests
+
+from __future__ import annotations
 
 import pytz
 from datetime import datetime, date
+from typing import List, Tuple, Optional
+
 from bots.shared import send_status
 
 eastern = pytz.timezone("US/Eastern")
@@ -10,6 +14,12 @@ eastern = pytz.timezone("US/Eastern")
 _PROCESS_RESTART_SENT = False
 _LAST_STARTUP_DAY: date | None = None
 _LAST_HEARTBEAT_KEY: str | None = None  # e.g. "2024-11-19-10" for 10:00
+
+# Error buffer: holds recent bot errors until the next status_report tick
+_ERROR_BUFFER: List[Tuple[datetime, str, str]] = []
+
+
+# ---------------- INTERNAL HELPERS ----------------
 
 
 def _should_send_restart(now_et: datetime) -> bool:
@@ -57,10 +67,6 @@ def _should_send_heartbeat(now_et: datetime) -> bool:
     if not (10 <= now_et.hour <= 20):
         return False
 
-    # Every 2 hours
-    if now_et.hour % 2 != 0:
-        return False
-
     key = f"{now_et.date()}-{now_et.hour}"
     if _LAST_HEARTBEAT_KEY == key:
         return False
@@ -76,6 +82,53 @@ def _fmt_now(now_et: datetime) -> str:
     return now_et.strftime("%I:%M %p · %b %d").lstrip("0") + " EST"
 
 
+# ---------------- ERROR CAPTURE API ----------------
+
+
+def record_bot_error(bot_name: str, error: Exception | str) -> None:
+    """
+    Called from main.py (and optionally bots) whenever a bot throws.
+    We store the bot name + error message + timestamp in an in-memory buffer.
+
+    The next time run_status_report() runs, it will pick these up and send a
+    single Telegram digest summarizing the recent errors.
+    """
+    global _ERROR_BUFFER
+    now_et = datetime.now(eastern)
+
+    if isinstance(error, Exception):
+        msg = f"{type(error).__name__}: {error}"
+    else:
+        msg = str(error)
+
+    _ERROR_BUFFER.append((now_et, bot_name, msg))
+
+    # Keep only last 50 errors to avoid unbounded growth
+    if len(_ERROR_BUFFER) > 50:
+        _ERROR_BUFFER = _ERROR_BUFFER[-50:]
+
+
+def _consume_recent_errors(max_items: int = 5) -> List[str]:
+    """
+    Return up to max_items recent errors as formatted lines, then clear the buffer.
+    """
+    global _ERROR_BUFFER
+    if not _ERROR_BUFFER:
+        return []
+
+    recent = _ERROR_BUFFER[-max_items:]
+    _ERROR_BUFFER = []
+
+    lines: List[str] = []
+    for ts, bot, msg in recent:
+        t = ts.strftime("%H:%M:%S")
+        lines.append(f"{t} — {bot}: {msg}")
+    return lines
+
+
+# ---------------- MAIN ENTRYPOINT ----------------
+
+
 async def run_status_report():
     """
     Entry point called from main.py once per scan cycle (about every 60 seconds).
@@ -83,6 +136,7 @@ async def run_status_report():
     Decides *whether* to send:
       - a restart notice (once per process),
       - a daily 08:55 AM system status blast,
+      - an error digest if any bots have thrown recently,
       - or a heartbeat every 2 hours,
 
     and posts via bots.shared.send_status(), which uses TELEGRAM_TOKEN_STATUS /
@@ -105,18 +159,16 @@ async def run_status_report():
     # 2) Daily pre-market system status at 08:55 AM EST
     if _should_send_daily_startup(now_et):
         msg = (
-            "*MoneySignalAI — SYSTEM STATUS*\n"
+            "*MoneySignalAI — SYSTEM STATUS*\n\n"
             f"{_fmt_now(now_et)}\n\n"
-            "All core scanners are running and connected to Polygon.\n"
-            "Telegram alert pipeline is live and responding.\n\n"
-            "*Active strategies (15-in-1 suite):*\n"
-            "• Premarket Runner\n"
-            "• Gap & Go (up & down)\n"
-            "• ORB (Opening Range Breakout)\n"
+            "Multi-bot scanner is *armed* for today. Core modules:\n"
+            "• Premarket Gap + Volume\n"
+            "• Regular Session Gaps\n"
+            "• Opening Range Breakouts (ORB)\n"
             "• Volume Monster\n"
             "• Cheap 0–5 DTE Options\n"
             "• Unusual Options Sweeps\n"
-            "• Whale Flow ($2M+ orders)\n"
+            "• Whale Flow\n"
             "• Short Squeeze Pro\n"
             "• Earnings Move + Fundamentals\n"
             "• Momentum Reversal\n"
@@ -143,12 +195,25 @@ async def run_status_report():
         print("[status_report] Sent daily startup status.")
         return
 
-    # 3) Heartbeat (simple health ping so you know the loop is alive)
+    # 3) Error digest: if any bots have thrown since the last tick, surface them ASAP
+    error_lines = _consume_recent_errors(max_items=5)
+    if error_lines:
+        msg = (
+            "⚠️ *MoneySignalAI — Recent Bot Errors*\n\n"
+            f"{_fmt_now(now_et)}\n\n"
+            "The following errors were recorded:\n"
+            + "\n".join(f"• {line}" for line in error_lines)
+        )
+        send_status(msg)
+        print(f"[status_report] Sent error digest with {len(error_lines)} item(s).")
+        return
+
+    # 4) Heartbeat (simple health ping so you know the loop is alive)
     if _should_send_heartbeat(now_et):
         hb = now_et.strftime("%I:%M %p EST").lstrip("0")
         send_status(f"✅ System running normally — {hb}")
         print("[status_report] Heartbeat sent.")
         return
 
-    # 4) Nothing scheduled right now
+    # 5) Nothing scheduled right now
     print("[status_report] No status to send at this minute.")
