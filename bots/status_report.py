@@ -1,217 +1,272 @@
-# bots/status_report.py — system heartbeat + daily status + error digests
+# bots/status_report.py
+#
+# Central status / heartbeat + error digest bot.
+#
+# Responsibilities:
+#   • Collect errors from all bots via record_bot_error(...)
+#   • Collect shared/universe info via record_shared_error(...) and record_universe_health(...)
+#   • On each run_status_report() call:
+#       - If there are NEW errors since last digest → send an error summary to the status Telegram.
+#       - Else, every ~10 minutes → send a lightweight heartbeat with latest universe stats
+#         and recent error counts.
 
 from __future__ import annotations
 
-import pytz
-from datetime import datetime, date
-from typing import List, Tuple
+import os
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional
 
-from bots.shared import send_status
+import pytz
+import requests
+import threading
+
+# --------------- CONFIG / ENV ---------------
 
 eastern = pytz.timezone("US/Eastern")
 
-# State flags so we don't spam Telegram
-_PROCESS_RESTART_SENT = False
-_LAST_STARTUP_DAY: date | None = None
-_LAST_HEARTBEAT_KEY: str | None = None  # e.g. "2025-11-20-10" for 10:00
+TELEGRAM_TOKEN_STATUS = os.getenv("TELEGRAM_TOKEN_STATUS")
+TELEGRAM_CHAT_ALL = os.getenv("TELEGRAM_CHAT_ALL")
 
-# Error buffer: holds recent bot errors until the next status_report tick
-_ERROR_BUFFER: List[Tuple[datetime, str, str]] = []
+# --------------- INTERNAL STATE ---------------
+
+# Error events: list of dicts {time, source, message}
+_error_events: List[Dict] = []
+
+# Last time we sent an error digest (to avoid spamming the same ones)
+_last_error_digest_sent_at: Optional[datetime] = None
+
+# Latest dynamic-universe health snapshot
+_universe_health: Optional[Dict] = None  # {"time": dt, "size": int, "coverage": float}
+
+# Last heartbeat we sent (no-error status message)
+_last_heartbeat_sent_at: Optional[datetime] = None
+
+# Simple lock so multiple bots recording at once don't corrupt state
+_LOCK = threading.Lock()
 
 
-# ---------------- INTERNAL HELPERS ----------------
+# --------------- TIME HELPERS ---------------
+
+def now_est() -> datetime:
+    """Current time in US/Eastern."""
+    return datetime.now(eastern)
 
 
-def _should_send_restart(now_et: datetime) -> bool:
+# --------------- TELEGRAM LOW-LEVEL ---------------
+
+def _send_status_telegram(text: str) -> None:
     """
-    Only once per process boot. As soon as the scanner loop starts,
-    we send a single 'bot restarted' message.
+    Send a status / heartbeat message to the dedicated status bot.
+
+    Uses:
+      • TELEGRAM_TOKEN_STATUS
+      • TELEGRAM_CHAT_ALL
     """
-    global _PROCESS_RESTART_SENT
-    if _PROCESS_RESTART_SENT:
-        return False
-    _PROCESS_RESTART_SENT = True
-    return True
+    token = TELEGRAM_TOKEN_STATUS
+    chat_id = TELEGRAM_CHAT_ALL
+
+    if not token or not chat_id:
+        # Don't crash the app just because env isn't wired.
+        print(f"[status_report] missing TELEGRAM_TOKEN_STATUS or TELEGRAM_CHAT_ALL; "
+              f"status message not sent. Text was:\n{text}")
+        return
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        resp = requests.post(
+            url,
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                # NO parse_mode to avoid 'can't parse entities' 400 errors.
+            },
+            timeout=8,
+        )
+        if resp.status_code != 200:
+            print(f"[status_report] telegram send failed {resp.status_code}: {resp.text}")
+    except Exception as e:
+        print(f"[status_report] telegram send exception: {e}")
 
 
-def _should_send_daily_startup(now_et: datetime) -> bool:
+# --------------- PUBLIC RECORDING API ---------------
+
+def record_bot_error(source: str, exc: Exception | str) -> None:
     """
-    Send the big 'system armed' status once per calendar day at 08:55 AM EST.
-    This runs *inside* the 60-second scan loop.
+    Called by main.py when a bot raises, e.g.:
+
+        record_bot_error("unusual", e)
+
+    or by other places that want to centralize error reporting.
     """
-    global _LAST_STARTUP_DAY
+    msg = str(exc)
+    event = {
+        "time": now_est(),
+        "source": source,
+        "message": msg,
+    }
+    with _LOCK:
+        _error_events.append(event)
+        # Keep buffer reasonably small
+        if len(_error_events) > 300:
+            _error_events[:] = _error_events[-200:]
 
-    if not (now_et.hour == 8 and now_et.minute == 55):
-        return False
 
-    today = now_et.date()
-    if _LAST_STARTUP_DAY == today:
-        return False
-
-    _LAST_STARTUP_DAY = today
-    return True
-
-
-def _should_send_heartbeat(now_et: datetime) -> bool:
+def record_shared_error(tag: str, message: str) -> None:
     """
-    Lightweight heartbeat: every 2 hours on the hour between 10:00 and 20:00 EST.
-    Example: 10:00, 12:00, 14:00, 16:00, 18:00, 20:00.
+    Convenience wrapper for shared.py, so you can log:
+
+        record_shared_error("universe", "[shared] error fetching dynamic universe: ...")
+
+    It will show up as source = "shared:universe".
     """
-    global _LAST_HEARTBEAT_KEY
-
-    # Only on the top of the hour
-    if now_et.minute != 0:
-        return False
-
-    # Only during the active trading / after-hours window
-    if not (10 <= now_et.hour <= 20):
-        return False
-
-    key = f"{now_et.date()}-{now_et.hour}"
-    if _LAST_HEARTBEAT_KEY == key:
-        return False
-
-    _LAST_HEARTBEAT_KEY = key
-    return True
+    source = f"shared:{tag}"
+    record_bot_error(source, message)
 
 
-def _fmt_now(now_et: datetime) -> str:
-    """Nice human-readable EST timestamp for messages."""
-    return now_et.strftime("%I:%M %p · %b %d").lstrip("0") + " EST"
-
-
-# ---------------- ERROR CAPTURE API ----------------
-
-
-def record_bot_error(bot_name: str, error: Exception | str) -> None:
+def record_universe_health(size: int, coverage: float) -> None:
     """
-    Called from main.py whenever a bot throws.
+    Called by shared.get_dynamic_top_volume_universe(...) on successful universe builds.
 
-    We store the bot name + error message + timestamp in an in-memory buffer.
-    The next time run_status_report() runs, it will pick these up and send a
-    single Telegram digest summarizing the recent errors.
+    Example usage in shared.py:
+
+        from bots.status_report import record_universe_health
+        ...
+        record_universe_health(len(tickers), coverage)
+
+    This lets the status bot include universe stats in periodic heartbeats.
     """
-    global _ERROR_BUFFER
-    now_et = datetime.now(eastern)
+    snap = {
+        "time": now_est(),
+        "size": int(size),
+        "coverage": float(coverage),
+    }
+    with _LOCK:
+        global _universe_health
+        _universe_health = snap
 
-    if isinstance(error, Exception):
-        msg = f"{type(error).__name__}: {error}"
+
+# --------------- FORMAT HELPERS ---------------
+
+def _format_est_timestamp(dt: datetime) -> str:
+    return dt.strftime("%I:%M %p EST · %b %d").lstrip("0")
+
+
+def _build_error_digest(now: datetime) -> Optional[str]:
+    """
+    Build a human-readable digest of NEW errors since last digest.
+    Returns None if there is nothing new to send.
+    """
+    global _last_error_digest_sent_at
+
+    with _LOCK:
+        if not _error_events:
+            return None
+
+        # Only include errors strictly after the last digest
+        if _last_error_digest_sent_at is None:
+            new_events = _error_events[-15:]  # on first run, show last handful
+        else:
+            new_events = [e for e in _error_events if e["time"] > _last_error_digest_sent_at]
+
+        if not new_events:
+            return None
+
+        # Mark that we've digested up to now
+        _last_error_digest_sent_at = now
+
+    # Format digest outside the lock
+    head_time = _format_est_timestamp(now)
+    lines = [f"⚠️ MoneySignalAI — Recent Bot Errors", "", head_time, "", "The following errors were recorded:"]
+
+    for e in new_events[-15:]:  # cap at 15 lines per message
+        t_s = e["time"].strftime("%H:%M:%S")
+        src = e["source"]
+        msg = e["message"]
+        # keep each line compact
+        if len(msg) > 180:
+            msg = msg[:177] + "..."
+        lines.append(f"• {t_s} — {src}: {msg}")
+
+    return "\n".join(lines)
+
+
+def _build_heartbeat(now: datetime) -> Optional[str]:
+    """
+    Build a light heartbeat / health snapshot if:
+      • At least ~10 minutes passed since last heartbeat
+      • Or we've never sent one yet.
+
+    Includes:
+      • Current time
+      • Latest universe size / coverage (if known)
+      • Count of errors in the last hour
+    """
+    global _last_heartbeat_sent_at
+
+    with _LOCK:
+        # Rate limit heartbeats to ~10 minutes
+        if _last_heartbeat_sent_at is not None:
+            if now - _last_heartbeat_sent_at < timedelta(minutes=10):
+                return None
+
+        # Snapshot universe + error stats
+        universe = _universe_health
+        one_hour_ago = now - timedelta(hours=1)
+        recent_errors = [e for e in _error_events if e["time"] >= one_hour_ago]
+        total_errors_1h = len(recent_errors)
+
+        # No data at all? Then don't spam.
+        if universe is None and total_errors_1h == 0:
+            return None
+
+        _last_heartbeat_sent_at = now
+
+    # Format outside the lock
+    head_time = _format_est_timestamp(now)
+    lines = [f"✅ MoneySignalAI — Heartbeat", "", head_time, ""]
+
+    if universe is not None:
+        cov_pct = universe["coverage"] * 100.0
+        size = universe["size"]
+        uni_time = universe["time"].strftime("%H:%M:%S")
+        lines.append(f"📊 Universe: {size} tickers · coverage ≈ {cov_pct:.1f}% (as of {uni_time} EST)")
     else:
-        msg = str(error)
+        lines.append("📊 Universe: no recent universe snapshot recorded.")
 
-    _ERROR_BUFFER.append((now_et, bot_name, msg))
+    if total_errors_1h := total_errors_1h:
+        lines.append(f"⚠️ Errors last 60m: {total_errors_1h}")
+    else:
+        lines.append("✅ Errors last 60m: none recorded.")
 
-    # Keep only last 50 errors to avoid unbounded growth
-    if len(_ERROR_BUFFER) > 50:
-        _ERROR_BUFFER = _ERROR_BUFFER[-50:]
+    return "\n".join(lines)
 
 
-def _consume_recent_errors(max_items: int = 5) -> List[str]:
+# --------------- MAIN ENTRYPOINT ---------------
+
+async def run_status_report() -> None:
     """
-    Return up to max_items recent errors as formatted lines, then clear the buffer.
+    Called from main.py once per scan cycle.
+
+    Priority:
+      1) If there are new errors since the last digest → send error digest.
+      2) Else, if enough time has passed → send heartbeat with universe stats.
+      3) Else, do nothing (log that there was nothing to send).
     """
-    global _ERROR_BUFFER
-    if not _ERROR_BUFFER:
-        return []
+    now = now_est()
 
-    recent = _ERROR_BUFFER[-max_items:]
-    _ERROR_BUFFER = []
-
-    lines: List[str] = []
-    for ts, bot, msg in recent:
-        t = ts.strftime("%H:%M:%S")
-        lines.append(f"{t} — {bot}: {msg}")
-    return lines
-
-
-# ---------------- MAIN ENTRYPOINT ----------------
-
-
-async def run_status_report():
-    """
-    Entry point called from main.py once per scan cycle (about every 60 seconds).
-
-    Decides *whether* to send:
-      - a restart notice (once per process),
-      - a daily 08:55 AM system status blast,
-      - an error digest if any bots have thrown recently,
-      - or a heartbeat every 2 hours,
-
-    and posts via bots.shared.send_status(), which uses TELEGRAM_TOKEN_STATUS /
-    TELEGRAM_CHAT_STATUS if set (otherwise falls back to the main alert bot).
-    """
-    now_et = datetime.now(eastern)
-
-    # 1) Restart notice (only once per boot)
-    if _should_send_restart(now_et):
-        msg = (
-            "⚡ *MoneySignalAI has restarted*\n\n"
-            f"{_fmt_now(now_et)}\n\n"
-            "The multi-bot scanner just booted (deploy / restart).\n"
-            "All core modules are loading and will begin scanning on the next cycle."
-        )
-        send_status(msg)
-        print("[status_report] Sent restart notice.")
+    # 1) Try to send an error digest if there are new errors
+    error_text = _build_error_digest(now)
+    if error_text:
+        _send_status_telegram(error_text)
+        print("[status_report] sent error digest.")
         return
 
-    # 2) Daily pre-market system status at 08:55 AM EST
-    if _should_send_daily_startup(now_et):
-        msg = (
-            "*MoneySignalAI — SYSTEM STATUS*\n\n"
-            f"{_fmt_now(now_et)}\n\n"
-            "Multi-bot scanner is *armed* for today. Core modules:\n"
-            "• Premarket Gap + Volume\n"
-            "• Regular Session Gaps\n"
-            "• Opening Range Breakouts (ORB)\n"
-            "• Volume Monster\n"
-            "• Cheap 0–5 DTE Options\n"
-            "• Unusual Options Sweeps\n"
-            "• Whale Flow\n"
-            "• Short Squeeze Pro\n"
-            "• Earnings Move + Fundamentals\n"
-            "• Momentum Reversal\n"
-            "• Swing Pullback\n"
-            "• Panic Flush\n"
-            "• Trend Rider (Daily Breakouts)\n"
-            "• IV Crush (Post-Earnings)\n"
-            "• Dark Pool Radar\n\n"
-            "*Typical hunt windows (EST):*\n"
-            "• 04:00–09:30 — Premarket, Dark Pool Radar\n"
-            "• 09:30–10:30 — Gap & Go, ORB, Volume spikes\n"
-            "• 09:30–16:00 — Cheap, Unusual, Whales, Squeeze, Momentum, Panic, Swing\n"
-            "• 15:30–20:15 — Trend Rider, Dark Pool Radar, late Earnings/IV moves\n\n"
-            "Everything is armed and watching the tape for:\n"
-            "• Explosive volume\n"
-            "• Big options flow\n"
-            "• Key earnings movers\n"
-            "• Dark pool clusters\n"
-            "• High-probability reversals & breakouts\n\n"
-            "You focus on execution.\n"
-            "*Let the bots watch the market. ⚡*"
-        )
-        send_status(msg)
-        print("[status_report] Sent daily startup status.")
+    # 2) Otherwise, maybe send a heartbeat
+    heartbeat_text = _build_heartbeat(now)
+    if heartbeat_text:
+        _send_status_telegram(heartbeat_text)
+        print("[status_report] sent heartbeat.")
         return
 
-    # 3) Error digest: if any bots have thrown since the last tick, surface them ASAP
-    error_lines = _consume_recent_errors(max_items=5)
-    if error_lines:
-        msg = (
-            "⚠️ *MoneySignalAI — Recent Bot Errors*\n\n"
-            f"{_fmt_now(now_et)}\n\n"
-            "The following errors were recorded:\n"
-            + "\n".join(f"• {line}" for line in error_lines)
-        )
-        send_status(msg)
-        print(f"[status_report] Sent error digest with {len(error_lines)} item(s).")
-        return
-
-    # 4) Heartbeat (simple health ping so you know the loop is alive)
-    if _should_send_heartbeat(now_et):
-        hb = now_et.strftime("%I:%M %p EST").lstrip("0")
-        send_status(f"✅ System running normally — {hb}")
-        print("[status_report] Heartbeat sent.")
-        return
-
-    # 5) Nothing scheduled right now
+    # 3) Nothing to send this minute
     print("[status_report] No status to send at this minute.")
