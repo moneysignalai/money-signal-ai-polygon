@@ -25,18 +25,15 @@ eastern = pytz.timezone("US/Eastern")
 
 # ---------------- CONFIG (tunable via ENV) ----------------
 
-# Minimum notional for a whale order (price * size * 100)
 MIN_WHALE_NOTIONAL = float(os.getenv("WHALES_MIN_NOTIONAL", "500000"))  # default $500k+
-
-# Minimum size in contracts
-MIN_WHALE_SIZE = int(os.getenv("WHALES_MIN_SIZE", "50"))  # default 50 contracts
-
-# Maximum DTE to keep focus on nearer-term flow
-MAX_WHALE_DTE = int(os.getenv("WHALES_MAX_DTE", "90"))  # default up to ~3 months
+MIN_WHALE_SIZE = int(os.getenv("WHALES_MIN_SIZE", "50"))
+MAX_WHALE_DTE = int(os.getenv("WHALES_MAX_DTE", "90"))
 
 alert_date: date | None = None
 alerted_contracts: set[str] = set()
 
+
+# ---------------- STATE MGMT ----------------
 
 def _reset_day() -> None:
     global alert_date, alerted_contracts
@@ -54,6 +51,58 @@ def _mark(contract: str) -> None:
     alerted_contracts.add(contract)
 
 
+# ---------------- UNIVERSE RESOLUTION ----------------
+
+def _resolve_whale_universe():
+    """
+    Universe priority:
+      1) WHALES_TICKER_UNIVERSE env
+      2) Dynamic top-volume universe (shared)
+      3) TICKER_UNIVERSE env (global)
+      4) Hard-coded top 100 liquid tickers (final fallback)
+    """
+    # 1) Specific override for whales
+    env = os.getenv("WHALES_TICKER_UNIVERSE")
+    if env:
+        return [t.strip().upper() for t in env.split(",") if t.strip()]
+
+    # 2) Primary: dynamic universe
+    uni = get_dynamic_top_volume_universe(max_tickers=150, volume_coverage=0.92)
+
+    # 3) If dynamic universe broke → global environment
+    if not uni:
+        env2 = os.getenv("TICKER_UNIVERSE")
+        if env2:
+            uni = [t.strip().upper() for t in env2.split(",") if t.strip()]
+        else:
+            # 4) Last resort: top 100
+            uni = [
+                "SPY","QQQ","IWM","DIA","VTI",
+                "XLK","XLF","XLE","XLY","XLI",
+                "AAPL","MSFT","NVDA","TSLA","META",
+                "GOOGL","AMZN","NFLX","AVGO","ADBE",
+                "SMCI","AMD","INTC","MU","ORCL",
+                "CRM","SHOP","PANW","ARM","CSCO",
+                "PLTR","SOFI","SNOW","UBER","LYFT",
+                "ABNB","COIN","HOOD","RIVN","LCID",
+                "NIO","F","GM","T","VZ",
+                "BAC","JPM","WFC","C","GS",
+                "XOM","CVX","OXY","SLB","COP",
+                "PFE","MRK","LLY","UNH","ABBV",
+                "TSM","BABA","JD","NKE","MCD",
+                "SBUX","WMT","COST","HD","LOW",
+                "DIS","PARA","WBD","TGT","SQ",
+                "PYPL","ROKU","ETSY","NOW","INTU",
+                "TXN","QCOM","LRCX","AMAT","LIN",
+                "CAT","DE","BA","LULU","GME",
+                "AMC","MARA","RIOT","CLSK","BITF",
+                "CIFR","HUT","BTBT","TSLY","SMH",
+            ]
+    return uni
+
+
+# ---------------- OPTION SYMBOL PARSING ----------------
+
 def _parse_option_symbol(sym: str):
     if not sym.startswith("O:"):
         return None, None, None, None
@@ -65,7 +114,7 @@ def _parse_option_symbol(sym: str):
 
         exp_raw = rest[:6]      # YYMMDD
         cp = rest[6]            # C/P
-        strike_raw = rest[7:]   # 000450000
+        strike_raw = rest[7:]
 
         yy = int("20" + exp_raw[0:2])
         mm = int(exp_raw[2:4])
@@ -86,13 +135,12 @@ def _days_to_expiry(expiry) -> int | None:
     return (expiry - today).days
 
 
+# ---------------- MAIN BOT ----------------
+
 async def run_whales():
-    """
-    Look for very large, single-option whale orders.
-    """
     _reset_day()
 
-    universe = get_dynamic_top_volume_universe(max_tickers=200, volume_coverage=0.95)
+    universe = _resolve_whale_universe()
     if not universe:
         print("[whales] empty universe; skipping.")
         return
@@ -150,7 +198,6 @@ async def run_whales():
 
             cp = "CALL" if cp_raw.upper() == "C" else "PUT"
 
-            # Nicely formatted EST timestamp
             time_str = now_est().strftime("%I:%M %p EST · %b %d").lstrip("0")
 
             extra = (
