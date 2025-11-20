@@ -18,6 +18,7 @@ from bots.shared import (
     grade_equity_setup,
     is_etf_blacklisted,
     chart_link,
+    now_est,  # NEW: for pretty timestamp line
 )
 
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
@@ -296,11 +297,16 @@ async def run_earnings():
         else:
             bias = "Post-earnings fade / short setup"
 
+        # 🔔 NEW ALERT FORMAT (your requested style)
         extra = (
-            f"📣 Earnings move: {move_pct:.1f}% today\n"
-            f"📈 Prev Close: ${prev_close:.2f} → Open: ${open_today:.2f} → Close: ${last_price:.2f}\n"
+            f"📣 EARNINGS — {sym}\n"
+            f"🕒 {now_est()}\n"
+            f"────────────\n"
+            f"✅ Earnings Today\n"
+            f"📌 Report Time: Today (price reaction scan)\n"
+            f"💵 Move: {move_pct:.1f}% vs prior close\n"
             f"📊 Gap: {gap_pct:.1f}% · Intraday: {intraday_pct:.1f}% from open\n"
-            f"📦 Volume: {int(vol_today):,}\n"
+            f"📦 Volume: {int(vol_today):,} · RVOL {rvol:.1f}x\n"
             f"🎯 Setup Grade: {grade}\n"
             f"📌 Bias: {bias}\n"
             f"🔗 Chart: {chart_link(sym)}"
