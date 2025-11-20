@@ -160,19 +160,28 @@ async def run_unusual():
         if env:
             universe = [x.strip().upper() for x in env.split(",") if x.strip()]
         else:
-            # 2) Hard-coded top 50 popular, liquid, options-heavy names
+            # 2) Hard-coded top 100 popular, liquid, options-heavy names
             universe = [
-                "SPY", "QQQ", "IWM", "DIA",
-                "AAPL", "MSFT", "NVDA", "TSLA", "AMD",
-                "META", "GOOGL", "AMZN", "NFLX", "AVGO",
-                "SMCI", "MU", "INTC", "ORCL", "CRM",
-                "SHOP", "PANW", "ARM", "PLTR", "SOFI",
-                "COIN", "HOOD", "RIVN", "LCID", "NIO",
-                "F", "GM", "T", "VZ", "BAC",
-                "JPM", "WFC", "C", "XOM", "CVX",
-                "OXY", "SLB", "PFE", "MRK", "LLY",
-                "UNH", "TSM", "BABA", "JD", "SQ",
-                "UBER",
+                "SPY","QQQ","IWM","DIA","VTI",
+                "XLK","XLF","XLE","XLY","XLI",
+                "AAPL","MSFT","NVDA","TSLA","META",
+                "GOOGL","AMZN","NFLX","AVGO","ADBE",
+                "SMCI","AMD","INTC","MU","ORCL",
+                "CRM","SHOP","PANW","ARM","CSCO",
+                "PLTR","SOFI","SNOW","UBER","LYFT",
+                "ABNB","COIN","HOOD","RIVN","LCID",
+                "NIO","F","GM","T","VZ",
+                "BAC","JPM","WFC","C","GS",
+                "XOM","CVX","OXY","SLB","COP",
+                "PFE","MRK","LLY","UNH","ABBV",
+                "TSM","BABA","JD","NKE","MCD",
+                "SBUX","WMT","COST","HD","LOW",
+                "DIS","PARA","WBD","TGT","SQ",
+                "PYPL","ROKU","ETSY","NOW","INTU",
+                "TXN","QCOM","LRCX","AMAT","LIN",
+                "CAT","DE","BA","LULU","GME",
+                "AMC","MARA","RIOT","CLSK","BITF",
+                "CIFR","HUT","BTBT","TSLY","SMH",
             ]
 
     if not universe:
