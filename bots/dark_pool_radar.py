@@ -30,12 +30,12 @@ DARK_EXCHANGES = {
     8, 9, 80, 81, 82  # placeholders; adapt to your real feed
 }
 
-DARK_LOOKBACK_MIN = int(os.getenv("DARK_LOOKBACK_MIN", "20"))  # last X minutes
-MIN_DARK_TOTAL_NOTIONAL = float(os.getenv("DARK_MIN_TOTAL_NOTIONAL", "20000000"))  # $20M+
-MIN_DARK_SINGLE_NOTIONAL = float(os.getenv("DARK_MIN_SINGLE_NOTIONAL", "10000000"))  # $10M+
+DARK_LOOKBACK_MIN = int(os.getenv("DARK_LOOKBACK_MIN", "30"))  # last X minutes
+MIN_DARK_TOTAL_NOTIONAL = float(os.getenv("DARK_MIN_TOTAL_NOTIONAL", "10000000"))  # $10M+
+MIN_DARK_SINGLE_NOTIONAL = float(os.getenv("DARK_MIN_SINGLE_NOTIONAL", "5000000"))  # $5M+
 MIN_DARK_PRINT_COUNT = int(os.getenv("DARK_MIN_PRINT_COUNT", "3"))
-MIN_DARK_DOLLAR_VOL = float(os.getenv("DARK_MIN_DOLLAR_VOL", "50000000"))  # $50M+
-MIN_DARK_RVOL = float(os.getenv("DARK_MIN_RVOL", "2.0"))
+MIN_DARK_DOLLAR_VOL = float(os.getenv("DARK_MIN_DOLLAR_VOL", "25000000"))  # $25M+
+MIN_DARK_RVOL = float(os.getenv("DARK_MIN_RVOL", "1.5"))
 
 _alert_date: date | None = None
 _alerted: set[str] = set()
