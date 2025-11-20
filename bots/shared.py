@@ -203,7 +203,8 @@ def get_dynamic_top_volume_universe(
     if not picked:
         picked = _UNIVERSE_CACHE["tickers"]
 
-    _UNIVERSE_CACHE = {"ts": now, "tickers": picked}
+    _UNIVERSE_CACHE["ts"] = now
+    _UNIVERSE_CACHE["tickers"] = picked
     return picked
 
 
@@ -247,7 +248,7 @@ def get_option_chain_cached(ticker: str) -> Optional[Dict[str, Any]]:
     return data
 
 
-def get_last_option_trade_cached(full_option_symbol: str) -> Optional[Dict[str, Any]]:
+def get_last_option_trades_cached(full_option_symbol: str) -> Optional[Dict[str, Any]]:
     """Get the last trade for a single option symbol with a short cache.
 
     Behaviour:
@@ -284,6 +285,28 @@ def get_last_option_trade_cached(full_option_symbol: str) -> Optional[Dict[str, 
 
     _OPTION_CACHE[key] = {"ts": now, "data": data}
     return data
+
+
+def get_last_option_trade_cached(full_option_symbol: str) -> Optional[Dict[str, Any]]:
+    """
+    Backwards-compat alias for older bots that imported the singular name.
+    Delegates to get_last_option_trades_cached().
+    """
+    return get_last_option_trades_cached(full_option_symbol)
+
+
+def getLastOptionTradesCached(full_option_symbol: str) -> Optional[Dict[str, Any]]:
+    """
+    Backwards-compat alias for older camelCase import style.
+    """
+    return get_last_option_trades_cached(full_option_symbol)
+
+
+def getlastoptiontradescached(full_option_symbol: str) -> Optional[Dict[str, Any]]:
+    """
+    Backwards-compat alias for fully lowercase import style (defensive).
+    """
+    return get_last_option_trades_cached(full_option_symbol)
 
 
 # ---------------- GRADING / SETUP QUALITY ----------------
