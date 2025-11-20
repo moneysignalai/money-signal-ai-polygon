@@ -15,150 +15,251 @@ from bots.shared import (
     MIN_VOLUME_GLOBAL,
     send_alert,
     get_dynamic_top_volume_universe,
-    grade_equity_setup,
     is_etf_blacklisted,
+    grade_equity_setup,
     chart_link,
     now_est,
 )
 
-_client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 eastern = pytz.timezone("US/Eastern")
+_client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
-MIN_GAP_PRICE = float(os.getenv("MIN_GAP_PRICE", "2.0"))
-MIN_GAP_PCT = float(os.getenv("MIN_GAP_PCT", "4.0"))      # min |gap|
-MAX_GAP_PCT = float(os.getenv("MAX_GAP_PCT", "35.0"))     # cap crazy microcaps
-MIN_GAP_RVOL = float(os.getenv("MIN_GAP_RVOL", "2.0"))
+# -------- CONFIG --------
+
+MIN_GAP_PRICE = float(os.getenv("MIN_GAP_PRICE", "3.0"))
+MIN_GAP_PCT = float(os.getenv("MIN_GAP_PCT", "3.0"))
+MIN_GAP_RVOL = float(os.getenv("MIN_GAP_RVOL", "1.5"))
 MIN_GAP_DOLLAR_VOL = float(os.getenv("MIN_GAP_DOLLAR_VOL", "5000000"))  # $5M+
 
-# Only 9:30–10:30
+# Only scan gaps until ~11:00 ET
+GAP_SCAN_END_MIN = 11 * 60
+
+# Per-day dedupe
+_alert_date: date | None = None
+_alerted_syms: set[str] = set()
+
+
+def _reset_if_new_day() -> None:
+    global _alert_date, _alerted_syms
+    today = date.today()
+    if _alert_date != today:
+        _alert_date = today
+        _alerted_syms = set()
+
+
+def _already_alerted(sym: str) -> bool:
+    return sym in _alerted_syms
+
+
+def _mark(sym: str) -> None:
+    _alerted_syms.add(sym)
+
+
 def _in_gap_window() -> bool:
-    now_et = datetime.now(eastern)
-    minutes = now_et.hour * 60 + now_et.minute
-    return 9 * 60 + 30 <= minutes <= 10 * 60 + 30
+    now = datetime.now(eastern)
+    mins = now.hour * 60 + now.minute
+    # 09:30 – 11:00 ET
+    return 9 * 60 + 30 <= mins <= GAP_SCAN_END_MIN
 
 
-def _get_ticker_universe() -> List[str]:
-    env = os.getenv("TICKER_UNIVERSE")
+def _get_universe() -> List[str]:
+    env = os.getenv("GAP_TICKER_UNIVERSE")
     if env:
-        return [t.strip().upper() for t in env.split(",") if t.strip()]
-    return get_dynamic_top_volume_universe(max_tickers=100, volume_coverage=0.90)
+        return [s.strip().upper() for s in env.split(",") if s.strip()]
+    return get_dynamic_top_volume_universe(max_tickers=150, volume_coverage=0.90)
+
+
+def _fetch_daily_window(sym: str, trading_day: date):
+    """
+    Fetch the last two daily candles (yesterday, today) for gap calculations.
+    Returns (prev_day, today_day) or (None, None) on failure.
+    """
+    if not _client:
+        return None, None
+
+    try:
+        start = (trading_day - timedelta(days=5)).isoformat()
+        end = trading_day.isoformat()
+        daily = list(
+            _client.list_aggs(
+                sym,
+                1,
+                "day",
+                start,
+                end,
+                limit=10,
+                sort="asc",
+            )
+        )
+    except Exception as e:
+        print(f"[gap] daily agg error for {sym}: {e}")
+        return None, None
+
+    if len(daily) < 2:
+        return None, None
+
+    return daily[-2], daily[-1]
+
+
+def _compute_gap_stats(sym: str, trading_day: date):
+    """
+    Compute gap stats for symbol:
+      - prev_close
+      - open_today
+      - last_price
+      - day_low, day_high
+      - vol_today
+      - gap_pct
+      - intraday_pct (from open)
+      - total_move_pct (from prev close)
+      - rvol
+      - dollar_vol
+    """
+    prev_day, today_day = _fetch_daily_window(sym, trading_day)
+    if not prev_day or not today_day:
+        return None
+
+    prev_close = float(getattr(prev_day, "close", getattr(prev_day, "c", 0)))
+    open_today = float(getattr(today_day, "open", getattr(today_day, "o", 0)))
+    day_high = float(getattr(today_day, "high", getattr(today_day, "h", 0)))
+    day_low = float(getattr(today_day, "low", getattr(today_day, "l", 0)))
+    last_price = float(getattr(today_day, "close", getattr(today_day, "c", 0)))
+    vol_today = float(getattr(today_day, "volume", getattr(today_day, "v", 0)))
+
+    if prev_close <= 0 or open_today <= 0:
+        return None
+
+    gap_pct = (open_today - prev_close) / prev_close * 100.0
+    intraday_pct = (last_price - open_today) / open_today * 100.0
+    total_move_pct = (last_price - prev_close) / prev_close * 100.0
+
+    # Compute RVOL vs last 20 days (excluding today)
+    try:
+        start = (trading_day - timedelta(days=40)).isoformat()
+        end = trading_day.isoformat()
+        daily = list(
+            _client.list_aggs(
+                sym,
+                1,
+                "day",
+                start,
+                end,
+                limit=50,
+                sort="asc",
+            )
+        )
+    except Exception as e:
+        print(f"[gap] daily history error for {sym}: {e}")
+        return None
+
+    hist = daily[:-1] if len(daily) > 1 else daily
+    recent = hist[-20:] if len(hist) > 20 else hist
+    if recent:
+        avg_vol = sum(float(getattr(d, "volume", getattr(d, "v", 0))) for d in recent) / len(recent)
+    else:
+        avg_vol = vol_today
+
+    rvol = vol_today / avg_vol if avg_vol > 0 else 1.0
+    dollar_vol = last_price * vol_today
+
+    return {
+        "prev_close": prev_close,
+        "open_today": open_today,
+        "last_price": last_price,
+        "day_low": day_low,
+        "day_high": day_high,
+        "vol_today": vol_today,
+        "gap_pct": gap_pct,
+        "intraday_pct": intraday_pct,
+        "total_move_pct": total_move_pct,
+        "rvol": rvol,
+        "dollar_vol": dollar_vol,
+    }
 
 
 async def run_gap():
     """
-    Overnight Gap Radar (up or down):
+    Regular session gap scanner.
 
-      • |Gap| between MIN_GAP_PCT and MAX_GAP_PCT vs prior close
-      • Both gap-up and gap-down permitted
-      • Last price >= MIN_GAP_PRICE
-      • RVOL >= max(MIN_GAP_RVOL, MIN_RVOL_GLOBAL)
-      • Volume >= MIN_VOLUME_GLOBAL
-      • Only during 9:30–10:30 AM EST
-      • Only runs once per calendar day per container
+    Looks for:
+      • Gappers around the open
+      • Sufficient RVOL + dollar volume
+      • Single alert per symbol per day
     """
-    if not POLYGON_KEY or not _client:
-        print("[gap] no API key/client; skipping.")
-        return
+    _reset_if_new_day()
+
     if not _in_gap_window():
-        print("[gap] outside 9:30–10:30; skipping.")
+        print("[gap] outside gap scan window; skipping.")
         return
 
-    universe = _get_ticker_universe()
-    today = date.today()
-    today_s = today.isoformat()
+    if not POLYGON_KEY or not _client:
+        print("[gap] missing POLYGON_KEY or client; skipping.")
+        return
+
+    universe = _get_universe()
+    if not universe:
+        print("[gap] empty universe; skipping.")
+        return
+
+    trading_day = date.today()
 
     for sym in universe:
         if is_etf_blacklisted(sym):
             continue
-
-        try:
-            days = list(
-                _client.list_aggs(
-                    ticker=sym,
-                    multiplier=1,
-                    timespan="day",
-                    from_=(today - timedelta(days=40)).isoformat(),
-                    to=today_s,
-                    limit=50,
-                )
-            )
-        except Exception as e:
-            print(f"[gap] daily fetch failed for {sym}: {e}")
+        if _already_alerted(sym):
             continue
 
-        if len(days) < 2:
+        stats = _compute_gap_stats(sym, trading_day)
+        if not stats:
             continue
 
-        today_bar = days[-1]
-        prev = days[-2]
-
-        prev_close = float(prev.close)
-        if prev_close <= 0:
-            continue
-
-        open_today = float(today_bar.open)
-        last_price = float(today_bar.close)
-        day_high = float(today_bar.high)
-        day_low = float(today_bar.low)
-        vol_today = float(today_bar.volume)
+        prev_close = stats["prev_close"]
+        open_today = stats["open_today"]
+        last_price = stats["last_price"]
+        day_low = stats["day_low"]
+        day_high = stats["day_high"]
+        vol_today = stats["vol_today"]
+        gap_pct = stats["gap_pct"]
+        intraday_pct = stats["intraday_pct"]
+        total_move_pct = stats["total_move_pct"]
+        rvol = stats["rvol"]
+        dollar_vol = stats["dollar_vol"]
 
         if last_price < MIN_GAP_PRICE:
             continue
 
-        # basic gap stats
-        gap_pct = (open_today - prev_close) / prev_close * 100.0
-        if abs(gap_pct) < MIN_GAP_PCT or abs(gap_pct) > MAX_GAP_PCT:
+        if abs(gap_pct) < MIN_GAP_PCT:
             continue
 
-        intraday_pct = (
-            (last_price - open_today) / open_today * 100.0
-            if open_today > 0
-            else 0.0
-        )
-        total_move_pct = (last_price - prev_close) / prev_close * 100.0
-
-        # RVOL
-        hist = days[:-1]
-        if hist:
-            recent = hist[-20:] if len(hist) > 20 else hist
-            avg_vol = float(sum(d.volume for d in recent)) / len(recent)
-        else:
-            avg_vol = vol_today
-
-        if avg_vol > 0:
-            rvol = vol_today / avg_vol
-        else:
-            rvol = 1.0
-
+        # RVOL gate: use max of bot-specific and global
         if rvol < max(MIN_GAP_RVOL, MIN_RVOL_GLOBAL):
             continue
+
         if vol_today < MIN_VOLUME_GLOBAL:
             continue
 
-        dollar_vol = last_price * vol_today
         if dollar_vol < MIN_GAP_DOLLAR_VOL:
             continue
 
-        grade = grade_equity_setup(abs(total_move_pct), rvol, dollar_vol)
+        direction = "Gap Up" if gap_pct > 0 else "Gap Down"
+        emoji = "🚀" if gap_pct > 0 else "🩸"
 
+        grade = grade_equity_setup(total_move_pct, rvol, dollar_vol)
+        bias = ""
         if gap_pct > 0:
-            emoji = "🚀"
-            direction = "Gap-up"
             if intraday_pct > 0:
-                bias = "Gap-and-go long setup"
+                bias = "Gap-and-go strength intraday"
+            elif intraday_pct < 0:
+                bias = "Gap fading intraday"
             else:
-                bias = "Gap-up being faded (possible short)"
+                bias = "Holding the gap so far"
         else:
-            emoji = "⚠️"
-            direction = "Gap-down"
             if intraday_pct < 0:
-                bias = "Gap-down continuation short"
+                bias = "Gap-down continuation lower"
+            elif intraday_pct > 0:
+                bias = "Gap-down bounce attempt"
             else:
-                bias = (
-                    "Gap-down being bought (possible reversal)"
-                    if total_move_pct < 0
-                    else "Gap-down being bought (possible reversal)"
-                )
+                bias = "Holding the downside gap so far"
 
         body = (
             f"{emoji} {direction}: {gap_pct:.1f}% vs prior close\n"
@@ -171,12 +272,15 @@ async def run_gap():
             f"🔗 Chart: {chart_link(sym)}"
         )
 
+        time_str = now_est().strftime("%I:%M %p EST · %b %d").lstrip("0")
+
         extra = (
             f"📣 GAP — {sym}\n"
-            f"🕒 {now_est()}\n"
+            f"🕒 {time_str}\n"
             f"💰 ${last_price:.2f} · 📊 RVOL {rvol:.1f}x\n"
             "────────────\n"
             f"{body}"
         )
 
+        _mark(sym)
         send_alert("gap", sym, last_price, rvol, extra=extra)
