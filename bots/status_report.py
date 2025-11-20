@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytz
 from datetime import datetime, date
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 
 from bots.shared import send_status
 
@@ -13,7 +13,7 @@ eastern = pytz.timezone("US/Eastern")
 # State flags so we don't spam Telegram
 _PROCESS_RESTART_SENT = False
 _LAST_STARTUP_DAY: date | None = None
-_LAST_HEARTBEAT_KEY: str | None = None  # e.g. "2024-11-19-10" for 10:00
+_LAST_HEARTBEAT_KEY: str | None = None  # e.g. "2025-11-20-10" for 10:00
 
 # Error buffer: holds recent bot errors until the next status_report tick
 _ERROR_BUFFER: List[Tuple[datetime, str, str]] = []
@@ -76,9 +76,7 @@ def _should_send_heartbeat(now_et: datetime) -> bool:
 
 
 def _fmt_now(now_et: datetime) -> str:
-    """
-    Nice human-readable EST timestamp for messages.
-    """
+    """Nice human-readable EST timestamp for messages."""
     return now_et.strftime("%I:%M %p · %b %d").lstrip("0") + " EST"
 
 
@@ -87,9 +85,9 @@ def _fmt_now(now_et: datetime) -> str:
 
 def record_bot_error(bot_name: str, error: Exception | str) -> None:
     """
-    Called from main.py (and optionally bots) whenever a bot throws.
-    We store the bot name + error message + timestamp in an in-memory buffer.
+    Called from main.py whenever a bot throws.
 
+    We store the bot name + error message + timestamp in an in-memory buffer.
     The next time run_status_report() runs, it will pick these up and send a
     single Telegram digest summarizing the recent errors.
     """
@@ -149,7 +147,7 @@ async def run_status_report():
         msg = (
             "⚡ *MoneySignalAI has restarted*\n\n"
             f"{_fmt_now(now_et)}\n\n"
-            "The multi-bot scanner just booted (Render deploy / restart).\n"
+            "The multi-bot scanner just booted (deploy / restart).\n"
             "All core modules are loading and will begin scanning on the next cycle."
         )
         send_status(msg)
