@@ -14,18 +14,15 @@
 #   • DTE between 0 and CHEAP_MAX_DTE (inclusive, default 5 days)
 #   • CALL + PUT
 #
-# Universe:
-#   • ENV TICKER_UNIVERSE override
-#   • Otherwise dynamic top-volume universe from shared.get_dynamic_top_volume_universe()
-#
-# Output:
-#   • A-style alert formatting (consistent with other bots)
+# Alerts:
+#   • One alert per contract per day.
+#   • Premium Telegram format (emoji, timestamp, price, RVOL, divider, body, chart).
 
 from __future__ import annotations
 
 import os
-from datetime import date, timedelta
-from typing import List, Tuple, Optional
+from datetime import date, datetime
+from typing import List, Optional, Tuple
 
 import pytz
 
@@ -52,19 +49,22 @@ _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
 # Underlying filters
 MIN_UNDERLYING_PRICE = float(os.getenv("CHEAP_MIN_UNDERLYING_PRICE", "3.0"))
-MAX_UNDERLYING_PRICE = float(os.getenv("CHEAP_MAX_UNDERLYING_PRICE", "200.0"))
-MIN_UNDERLYING_DOLLAR_VOL = float(os.getenv("CHEAP_MIN_UNDERLYING_DOLLAR_VOL", "20000000"))  # $20M+
+MAX_UNDERLYING_PRICE = float(os.getenv("CHEAP_MAX_UNDERLYING_PRICE", "120.0"))
+MIN_UNDERLYING_DOLLAR_VOL = float(os.getenv("CHEAP_MIN_UNDERLYING_DOLLAR_VOL", "5000000"))  # $5M+
 
-# Option filters
-CHEAP_MAX_DTE = int(os.getenv("CHEAP_MAX_DTE", "5"))  # 0–5 days to expiry
+# DTE window for options
+CHEAP_MAX_DTE = int(os.getenv("CHEAP_MAX_DTE", "5"))  # 0–5 DTE by default
 
-# Mode B price/flow thresholds
-MAX_BASE_OPTION_PRICE = float(os.getenv("CHEAP_MAX_BASE_PRICE", "1.00"))
-MAX_EXT_OPTION_PRICE = float(os.getenv("CHEAP_MAX_EXT_PRICE", "2.00"))
+# Price bands (Mode B)
+MAX_BASE_OPTION_PRICE = float(os.getenv("CHEAP_MAX_BASE_OPTION_PRICE", "1.00"))   # ≤ $1.00 = always eligible
+MAX_EXT_OPTION_PRICE = float(os.getenv("CHEAP_MAX_EXT_OPTION_PRICE", "2.00"))     # (1.00, 2.00] = only big volume/notional
 
-MIN_BASE_VOLUME = float(os.getenv("CHEAP_MIN_BASE_VOLUME", "50"))       # contracts
-MIN_BASE_NOTIONAL = float(os.getenv("CHEAP_MIN_BASE_NOTIONAL", "5000"))  # dollars
+# Volume + notional thresholds
+# Base zone (≤ $1.00)
+MIN_BASE_VOLUME = float(os.getenv("CHEAP_MIN_BASE_VOLUME", "50"))           # contracts
+MIN_BASE_NOTIONAL = float(os.getenv("CHEAP_MIN_BASE_NOTIONAL", "5000"))     # dollars
 
+# Extended zone (1.00–2.00]
 MIN_EXT_VOLUME = float(os.getenv("CHEAP_MIN_EXT_VOLUME", "200"))
 MIN_EXT_NOTIONAL = float(os.getenv("CHEAP_MIN_EXT_NOTIONAL", "20000"))
 
@@ -92,19 +92,18 @@ def _mark_alerted_contract(contract: str) -> None:
     _alerted_contracts.add(contract)
 
 
-def _in_regular_hours() -> bool:
+def _in_trading_window() -> bool:
     now = now_est()
     mins = now.hour * 60 + now.minute
-    # Allow from 09:30–16:00 ET
+    # 09:30–16:00 ET
     return 9 * 60 + 30 <= mins <= 16 * 60
 
 
 def _get_universe() -> List[str]:
-    env = os.getenv("TICKER_UNIVERSE")
+    env = os.getenv("CHEAP_TICKER_UNIVERSE")
     if env:
         return [t.strip().upper() for t in env.split(",") if t.strip()]
-    # Reasonable default: top-volume names, capture ~95% of volume, up to 200 tickers
-    return get_dynamic_top_volume_universe(max_tickers=200, volume_coverage=0.95)
+    return get_dynamic_top_volume_universe(max_tickers=100, volume_coverage=0.90)
 
 
 # ---------------- HELPERS ----------------
@@ -112,54 +111,51 @@ def _get_universe() -> List[str]:
 
 def _extract_underlying_price_and_volume(snapshot) -> Tuple[Optional[float], float, float]:
     """
-    Given Polygon's snapshot object for a single ticker, extract:
-      - last trade price
+    From Polygon snapshot, extract:
+      - last underlying price
       - day volume
-      - approximate RVOL (using day.v vs day.av if available)
-
-    Works with both dict and client-typed response objects.
+      - estimated RVOL-like ratio (day_v / prev_day_v) — used only for display
     """
-    if snapshot is None:
-        return None, 0.0, 1.0
+    under_px = None
+    day_vol = 0.0
+    rvol = 1.0
 
-    # Handle dict response
-    if isinstance(snapshot, dict):
-        day = snapshot.get("day") or {}
-        last = snapshot.get("lastTrade") or {}
-        price = last.get("p") or last.get("price")
-        vol = day.get("v") or day.get("volume") or 0
-        avg_vol = day.get("av") or day.get("avg_volume") or vol
+    # Last trade price
+    last_trade = getattr(snapshot, "lastTrade", None)
+    if isinstance(last_trade, dict):
+        under_px = last_trade.get("p") or last_trade.get("price")
+    elif hasattr(last_trade, "p"):
+        under_px = last_trade.p
+
+    # Day volume and "RVOL-ish"
+    day_info = getattr(snapshot, "day", None)
+    if isinstance(day_info, dict):
+        day_vol = float(day_info.get("v") or day_info.get("volume") or 0)
+        prev_vol = float(day_info.get("prevDayVolume") or day_info.get("prev_day_volume") or day_vol)
+    elif day_info is not None:
+        v = getattr(day_info, "v", 0) or getattr(day_info, "volume", 0)
+        day_vol = float(v or 0)
+        prev_vol = float(getattr(day_info, "prevDayVolume", day_vol))
     else:
-        day = getattr(snapshot, "day", None)
-        last = getattr(snapshot, "last_trade", None)
-        price = getattr(last, "p", None) or getattr(last, "price", None)
-        vol = getattr(day, "v", 0) if day is not None else 0
-        avg_vol = getattr(day, "av", vol) if day is not None else vol
+        day_vol = 0.0
+        prev_vol = 0.0
 
     try:
-        px = float(price)
+        px = float(under_px) if under_px is not None else None
     except Exception:
         px = None
 
-    try:
-        vol_f = float(vol or 0.0)
-    except Exception:
-        vol_f = 0.0
+    if prev_vol > 0:
+        rvol = day_vol / prev_vol
+    else:
+        rvol = 1.0
 
-    try:
-        avg_v = float(avg_vol or 0.0)
-    except Exception:
-        avg_v = vol_f
-
-    rvol = vol_f / avg_v if avg_v > 0 else 1.0
-
-    return px, vol_f, rvol
+    return px, day_vol, rvol
 
 
 def _option_passes_price_and_flow_filters(price: float, volume: float, notional: float) -> bool:
     """
-    Mode B logic:
-
+    Mode B filters:
       - If price ≤ MAX_BASE_OPTION_PRICE:
           volume ≥ MIN_BASE_VOLUME and notional ≥ MIN_BASE_NOTIONAL
       - If MAX_BASE_OPTION_PRICE < price ≤ MAX_EXT_OPTION_PRICE:
@@ -195,7 +191,7 @@ def _describe_moneyness(under_px: float, strike: Optional[float], cp_label: str)
 
     if cp_label == "CALL":
         diff = (strike - under_px) / under_px * 100.0
-    else:
+    else:  # PUT
         diff = (under_px - strike) / under_px * 100.0
 
     if abs(diff) < 2.0:
@@ -215,14 +211,15 @@ async def run_cheap() -> None:
       - Strong underlying filters (price band + dollar volume).
       - Both CALLs and PUTs.
     """
-    if not POLYGON_KEY or not _client:
-        print("[cheap] Missing Polygon API key/client; skipping.")
-        return
-    if not _in_regular_hours():
-        print("[cheap] Outside RTH; skipping.")
+    _reset_if_new_day()
+
+    if not _in_trading_window():
+        print("[cheap] outside RTH window; skipping.")
         return
 
-    _reset_if_new_day()
+    if not POLYGON_KEY or not _client:
+        print("[cheap] no POLYGON_KEY or client; skipping.")
+        return
 
     universe = _get_universe()
     if not universe:
@@ -237,8 +234,7 @@ async def run_cheap() -> None:
 
         # Snapshot for underlying price & volume
         try:
-            # FIX: proper call signature for Polygon RESTClient
-            snapshot = _client.get_snapshot_ticker(ticker=sym)
+            snapshot = _client.get_snapshot_ticker(sym)
         except Exception as e:
             print(f"[cheap] snapshot error for {sym}: {e}")
             continue
@@ -279,22 +275,19 @@ async def run_cheap() -> None:
             if not expiry:
                 continue
 
-            try:
-                exp_date = (
-                    expiry
-                    if isinstance(expiry, date)
-                    else date.fromisoformat(str(expiry)[:10])
-                )
-            except Exception:
+            dte = _parse_dte(str(expiry))
+            if dte is None or dte < 0 or dte > CHEAP_MAX_DTE:
                 continue
 
-            dte = (exp_date - today).days
-            if dte < 0 or dte > CHEAP_MAX_DTE:
+            # Contract type — explicit CALL / PUT handling
+            raw_type = str(getattr(opt, "contract_type", "")).upper()
+            if raw_type in ("CALL", "C"):
+                cp_label = "CALL"
+            elif raw_type in ("PUT", "P"):
+                cp_label = "PUT"
+            else:
+                # Unknown type, skip rather than mislabel
                 continue
-
-            # CALL / PUT
-            cp_type = getattr(opt, "contract_type", "").upper()
-            cp_label = "CALL" if cp_type == "CALL" else "PUT"
 
             # Strike
             strike = getattr(opt, "strike_price", None)
@@ -333,7 +326,7 @@ async def run_cheap() -> None:
             try:
                 volume = float(volume or 0.0)
             except Exception:
-                continue
+                volume = 0.0
 
             if volume <= 0:
                 continue
@@ -353,10 +346,11 @@ async def run_cheap() -> None:
 
             body = (
                 f"🎯 Contract: {contract} ({cp_label})\n"
-                f"📈 Underlying: {sym} @ ${under_px:.2f}\n"
-                f"💵 Option Price: ${opt_price:.2f} · Volume: {int(volume):,} · Notional ≈ ${notional:,.0f}\n"
-                f"⏱ DTE: {dte_text} · Strike: {strike_text} · {moneyness}\n"
-                f"📊 Underlying Vol: {int(day_vol):,} shares (≈ ${dollar_vol:,.0f})\n"
+                f"🗓️ DTE: {dte_text} · Strike: ${strike_text}\n"
+                f"📍 Moneyness: {moneyness}\n"
+                f"💵 Option Price: ${opt_price:.2f}\n"
+                f"📦 Volume: {int(volume):,} · Notional: ≈ ${notional:,.0f}\n"
+                f"💰 Underlying: ${under_px:.2f} (≈ ${dollar_vol:,.0f} day notional)\n"
                 f"🔗 Chart: {chart_link(sym)}"
             )
 
@@ -373,3 +367,11 @@ async def run_cheap() -> None:
             _mark_alerted_contract(contract)
             # We don't have a perfect RVOL here; we pass approx_rvol for display.
             send_alert("cheap", sym, under_px, approx_rvol, extra=extra)
+
+
+def _parse_dte(expiration_date: str) -> Optional[int]:
+    try:
+        dt = datetime.strptime(expiration_date[:10], "%Y-%m-%d").date()
+        return (dt - date.today()).days
+    except Exception:
+        return None
