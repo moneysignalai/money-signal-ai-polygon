@@ -148,14 +148,8 @@ def report_status_error(bot: str, message: str) -> None:
 
 # Basic ETF blacklist; can be extended via ENV if you want
 _DEFAULT_ETF_BLACKLIST = {
-    "SPY",
-    "QQQ",
-    "IWM",
     "UVXY",
     "SVXY",
-    "SQQQ",
-    "TQQQ",
-    "SPXU",
     "XLK",
     "XLF",
     "XLE",
@@ -203,6 +197,9 @@ def get_dynamic_top_volume_universe(
 ) -> List[str]:
     """Fetch a dynamic ticker universe based on top dollar-volume.
 
+    Uses Polygon's v2 snapshot endpoint:
+        /v2/snapshot/locale/us/markets/stocks/tickers
+
     Cached for a few minutes to avoid hammering Polygon.
     """
     if not POLYGON_KEY:
@@ -214,36 +211,43 @@ def get_dynamic_top_volume_universe(
     if ts and now - ts < 180:
         return list(_UNIVERSE_CACHE.get("tickers", []))
 
-    url = "https://api.polygon.io/v3/snapshot/stocks"
-    params = {"apiKey": POLYGON_KEY, "limit": 1000}
+    # ✅ Correct Polygon endpoint
+    url = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
+    params = {
+        "apiKey": POLYGON_KEY,
+        "limit": 1000,  # grab a big chunk, then sort by dollar volume
+    }
 
     try:
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(url, params=params, timeout=15)
         r.raise_for_status()
         data = r.json()
     except Exception as e:
         msg = f"[shared] error fetching dynamic universe: {e}"
         print(msg)
         report_status_error("shared:universe", msg)
-        return _UNIVERSE_CACHE["tickers"]
+        # fall back to last good universe if we have one
+        return _UNIVERSE_CACHE.get("tickers", [])
 
     results = data.get("tickers") or []
     if not results:
         msg = "[shared] no tickers in dynamic universe response."
         print(msg)
         report_status_error("shared:universe", msg)
-        return _UNIVERSE_CACHE["tickers"]
+        return _UNIVERSE_CACHE.get("tickers", [])
 
     def _vol(rec: Dict[str, Any]) -> float:
         try:
-            return float(rec.get("todaysVolume") or 0.0)
+            return float(rec.get("todaysVolume") or rec.get("day", {}).get("v") or 0.0)
         except Exception:
             return 0.0
 
     def _dollar_vol(rec: Dict[str, Any]) -> float:
         try:
-            c = float(rec.get("day", {}).get("c") or 0.0)
-            v = float(rec.get("day", {}).get("v") or 0.0)
+            c = float(rec.get("lastTrade", {}).get("p")
+                      or rec.get("day", {}).get("c")
+                      or 0.0)
+            v = float(rec.get("day", {}).get("v") or rec.get("todaysVolume") or 0.0)
             return c * v
         except Exception:
             return 0.0
@@ -264,10 +268,13 @@ def get_dynamic_top_volume_universe(
             )
         )
 
-    records.sort(key=lambda r: r.dollar_volume, reverse=True)
     if not records:
-        print("[shared] dynamic universe produced no valid records.")
-        return []
+        msg = "[shared] dynamic universe produced no valid records."
+        print(msg)
+        report_status_error("shared:universe", msg)
+        return _UNIVERSE_CACHE.get("tickers", [])
+
+    records.sort(key=lambda r: r.dollar_volume, reverse=True)
 
     total_dv = sum(r.dollar_volume for r in records)
     running = 0.0
