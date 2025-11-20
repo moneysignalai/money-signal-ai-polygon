@@ -8,7 +8,7 @@ import pytz
 from bots.shared import (
     get_dynamic_top_volume_universe,
     get_option_chain_cached,
-    get_last_option_trades_cached,
+    get_last_option_trades_cached,  # uses shared cached last-trade helper
     send_alert,
     chart_link,
     now_est,
@@ -21,7 +21,8 @@ eastern = pytz.timezone("US/Eastern")
 #   UNUSUAL_MIN_NOTIONAL, UNUSUAL_MIN_SIZE, UNUSUAL_MAX_DTE
 
 # Minimum notional (price * size * 100) per sweep
-MIN_NOTIONAL = float(os.getenv("UNUSUAL_MIN_NOTIONAL", "50000"))   # default $50k+
+# 🔥 Raise floor to $100k by default
+MIN_NOTIONAL = float(os.getenv("UNUSUAL_MIN_NOTIONAL", "100000"))  # default $100k+
 
 # Minimum number of contracts in the last trade
 MIN_TRADE_SIZE = int(os.getenv("UNUSUAL_MIN_SIZE", "10"))          # default 10+ contracts
@@ -70,8 +71,14 @@ def _parse_option_symbol(sym: str):
 
     try:
         base = sym[2:]
-        under = base[: base.find("2")]
-        rest = base[len(under):]
+
+        # Find first digit – start of YYMMDD
+        idx = 0
+        while idx < len(base) and not base[idx].isdigit():
+            idx += 1
+
+        under = base[:idx]
+        rest = base[idx:]
 
         exp_raw = rest[:6]      # YYMMDD
         cp = rest[6]            # C/P
@@ -140,6 +147,53 @@ def _moneyness_label(under_px: float | None, strike: float | None, cp: str | Non
     return label, dist_pct
 
 
+def _extract_price_and_size(last_trade: dict):
+    """
+    Make this robust to different Polygon shapes.
+
+    Expected possibilities:
+      • {"results": {...}}               # dict
+      • {"results": [{...}, ...]}        # list
+      • {"last": {...}}                  # some endpoints
+    """
+    if not last_trade:
+        return None, None
+
+    trade = None
+
+    if "results" in last_trade:
+        res = last_trade["results"]
+        if isinstance(res, list) and res:
+            trade = res[0]
+        elif isinstance(res, dict):
+            trade = res
+    elif "last" in last_trade:
+        trade = last_trade["last"]
+
+    if trade is None:
+        trade = last_trade
+
+    price = (
+        trade.get("p")
+        or trade.get("price")
+        or trade.get("P")
+    )
+    size = (
+        trade.get("s")
+        or trade.get("size")
+        or trade.get("q")
+        or trade.get("volume")
+    )
+
+    try:
+        price = float(price)
+        size = int(size)
+    except Exception:
+        return None, None
+
+    return price, size
+
+
 # --------------- Core scan ----------------
 
 
@@ -172,20 +226,9 @@ async def run_unusual():
             if not last_trade:
                 continue
 
-            try:
-                last = last_trade.get("results", [{}])[0]
-            except Exception:
-                continue
-
-            price = last.get("p")
-            size = last.get("s")
+            # 🔧 Robust extraction of price & size
+            price, size = _extract_price_and_size(last_trade)
             if price is None or size is None:
-                continue
-
-            try:
-                price = float(price)
-                size = int(size)
-            except Exception:
                 continue
 
             if size < MIN_TRADE_SIZE:
@@ -203,7 +246,14 @@ async def run_unusual():
             if dte is None or dte < 0 or dte > MAX_DTE:
                 continue
 
-            cp = "CALL" if cp_raw.upper() == "C" else "PUT"
+            # Explicit CALL + PUT handling
+            cp_raw_up = cp_raw.upper()
+            if cp_raw_up == "C":
+                cp = "CALL"
+            elif cp_raw_up == "P":
+                cp = "PUT"
+            else:
+                continue  # unknown type, skip
 
             under_px = _underlying_price_from_opt(opt)
             m_label, m_dist = _moneyness_label(under_px, strike, cp)
