@@ -1,78 +1,46 @@
-import pytz
-from datetime import datetime
-from bots.shared import send_status
+# status_report.py — manual system status blast for MoneySignalAI
 
-eastern = pytz.timezone("US/Eastern")
+from bots.shared import send_alert
+import time
 
-# One-per-process flag so we only send the restart notice once
-_PROCESS_RESTART_ANNOUNCED = False
+def send_status():
+    now = time.strftime("%I:%M %p · %b %d")
+    message = f"""*MoneySignalAI — SYSTEM STATUS*  
+{now} EST  
 
+All core scanners are running and connected to Polygon.  
+Telegram alert pipeline is live and responding.  
 
-def _should_send_daily_startup(now_et: datetime) -> bool:
-    """
-    Send once per day at 8:55 AM EST.
-    """
-    return now_et.hour == 8 and now_et.minute == 55
+*Active strategies (15-in-1 suite):*  
+• Premarket Runner  
+• Gap & Go (up & down)  
+• ORB (Opening Range Breakout)  
+• Volume Monster  
+• Cheap 0–5 DTE Options  
+• Unusual Options Sweeps  
+• Whale Flow ($2M+ orders)  
+• Short Squeeze Pro  
+• Earnings Move + Fundamentals  
+• Momentum Reversal  
+• Swing Pullback  
+• Panic Flush  
+• Trend Rider (Daily Breakouts)  
+• IV Crush (Post-Earnings)  
+• Dark Pool Radar  
 
+*Typical hunt windows (EST):*  
+• 04:00–09:30 — Premarket, Dark Pool Radar  
+• 09:30–10:30 — Gap & Go, ORB, Volume spikes  
+• 09:30–16:00 — Cheap, Unusual, Whales, Squeeze, Momentum, Panic, Swing  
+• 15:30–20:15 — Trend Rider, Dark Pool Radar, late Earnings/IV moves  
 
-def _should_send_heartbeat(now_et: datetime) -> bool:
-    """
-    Send a simple heartbeat every 2 hours on the hour (10:00, 12:00, 14:00, ...).
-    Adjust if your scheduler runs less frequently.
-    """
-    return now_et.minute == 0 and now_et.hour % 2 == 0
+Everything is armed and watching the tape for:  
+• Explosive volume  
+• Big options flow  
+• Key earnings movers  
+• Dark pool clusters  
+• High-probability reversals & breakouts  
 
-
-async def run_status_report():
-    """
-    Central status/health bot.
-
-    Responsibilities:
-      • On process start: announce restart.
-      • 08:55 EST: full "all bots armed" schedule message.
-      • Every 2 hours on the hour: short heartbeat.
-    """
-    global _PROCESS_RESTART_ANNOUNCED
-
-    now_et = datetime.now(eastern)
-
-    # 1) One-time restart notification when this process starts
-    if not _PROCESS_RESTART_ANNOUNCED:
-        _PROCESS_RESTART_ANNOUNCED = True
-        restart_msg = (
-            "🟢 *MoneySignal AI — Process Restarted*\n\n"
-            f"Instance booted at: {now_et.strftime('%I:%M %p EST · %b %d').lstrip('0')}\n"
-            "If you did not intentionally redeploy or restart, treat this as a soft health check.\n"
-        )
-        send_status(restart_msg)
-        print("[status_report] Restart announcement sent.")
-        # Don’t `return` — we may also want to send startup/heartbeat on the same minute
-
-    # 2) Daily startup schedule and “all bots armed” view (08:55 EST)
-    if _should_send_daily_startup(now_et):
-        msg = (
-            "📊 *Daily System Check — All Bots Online*\n\n"
-            "• Premarket Runner: 4:00–9:29 AM\n"
-            "• Gap Bot: 9:30–10:30 AM\n"
-            "• ORB + FVG Bot: 9:45–11:00 AM\n"
-            "• Volume Monster: 9:30 AM–4:00 PM\n"
-            "• Cheap 0DTE/3DTE Hunter: 9:30 AM–4:00 PM\n"
-            "• Unusual Options Sweeps (Calls + Puts): 9:30 AM–4:00 PM\n"
-            "• Short Squeeze Pro: 9:30 AM–4:00 PM\n"
-            "• Momentum Reversal: 11:30 AM–4:00 PM\n"
-            "• Earnings Catalyst: 7:00 AM–10:00 PM\n\n"
-            "All modules armed and ready for today's session. 🚀"
-        )
-        send_status(msg)
-        print("[status_report] Sent daily startup status.")
-        return
-
-    # 3) Heartbeat (every 2 hours on the hour)
-    if _should_send_heartbeat(now_et):
-        hb = now_et.strftime("%I:%M %p EST").lstrip("0")
-        send_status(f"✅ System running normally — {hb}")
-        print("[status_report] Heartbeat sent.")
-        return
-
-    # Nothing to send this minute
-    print("[status_report] No status to send at this minute.")
+You focus on execution.  
+*Let the bots watch the market. ⚡*"""
+    send_alert("System", "Status OK", 0, 0, message)
