@@ -1,16 +1,9 @@
-"""
-bots/shared.py — MoneySignalAI core utilities
-
-Shared helpers used by all bots:
-
-- Time / timezone helpers
-- Telegram alert helpers
-- Polygon universe helper with short cache
-- Option-chain + last-trade helpers with cache
-- Common grading / filters
-"""
-
-from __future__ import annotations
+# bots/shared.py — MoneySignalAI core utilities
+#
+# - Telegram alert helpers
+# - Polygon universe helper with 3-min cache
+# - Option-chain + last-trade helpers with cache
+# - Common grading / filters
 
 import os
 import time
@@ -26,39 +19,31 @@ eastern = pytz.timezone("US/Eastern")
 
 
 def now_est() -> datetime:
-    """Return current time in US/Eastern."""
+    """Return current datetime in US/Eastern timezone."""
     return datetime.now(eastern)
-
-
-def _fmt_est(ts: Optional[datetime] = None) -> str:
-    if ts is None:
-        ts = now_est()
-    # If your Python version chokes on %-I, change to %I (it just adds a leading 0)
-    return ts.strftime("%-I:%M %p EST · %b %d")
 
 
 # --- API keys / global thresholds ---
 
 POLYGON_KEY: Optional[str] = os.getenv("POLYGON_KEY") or os.getenv("POLYGON_API_KEY")
 
-# Global sanity thresholds some bots can reference
 MIN_RVOL_GLOBAL: float = float(os.getenv("MIN_RVOL_GLOBAL", "2.0"))
-MIN_VOLUME_GLOBAL: float = float(os.getenv("MIN_VOLUME_GLOBAL", "500000"))
+MIN_VOLUME_GLOBAL: float = float(os.getenv("MIN_VOLUME_GLOBAL", "500000"))  # shares
 
-TELEGRAM_TOKEN_ALERTS: Optional[str] = os.getenv("TELEGRAM_TOKEN_ALERTS")
-TELEGRAM_CHAT_ALL: Optional[str] = os.getenv("TELEGRAM_CHAT_ALL")
+# Telegram routing
+TELEGRAM_TOKEN_ALERTS = os.getenv("TELEGRAM_TOKEN_ALERTS")
+TELEGRAM_CHAT_ALL = os.getenv("TELEGRAM_CHAT_ALL")
 
-TELEGRAM_TOKEN_STATUS: Optional[str] = os.getenv("TELEGRAM_TOKEN_STATUS")
-TELEGRAM_CHAT_STATUS: Optional[str] = os.getenv("TELEGRAM_CHAT_STATUS")
-
+TELEGRAM_TOKEN_STATUS = os.getenv("TELEGRAM_TOKEN_STATUS")
+TELEGRAM_CHAT_STATUS = os.getenv("TELEGRAM_CHAT_STATUS")  # kept for compatibility, not required
 
 # ---------------- TELEGRAM HELPERS ----------------
 
 
 def _send_telegram_raw(token: Optional[str], chat_id: Optional[str], text: str) -> None:
-    """Low-level Telegram sender with basic error handling."""
+    """Low-level Telegram sender. Logs failures but never raises."""
     if not token or not chat_id:
-        print("[telegram] missing token/chat_id, skipping message:", text[:120])
+        print(f"[telegram] missing token/chat_id, message not sent: {text[:160]!r}")
         return
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -77,8 +62,7 @@ def _send_telegram_raw(token: Optional[str], chat_id: Optional[str], text: str) 
 
 
 def send_alert(bot: str, ticker: str, price: float, rvol: float, extra: str = "") -> None:
-    """
-    High-level alert sender used by all bots.
+    """High-level alert sender used by all bots.
 
     Most bots pass a fully formatted `extra` message (with emojis, dividers, etc.).
     In that case we send it as-is. If `extra` is empty, we fall back to a simple
@@ -95,13 +79,24 @@ def send_alert(bot: str, ticker: str, price: float, rvol: float, extra: str = ""
     _send_telegram_raw(TELEGRAM_TOKEN_ALERTS, TELEGRAM_CHAT_ALL, msg)
 
 
-def send_status(text: str) -> None:
-    """Send a plain text status message to the status channel (if configured)."""
-    _send_telegram_raw(TELEGRAM_TOKEN_STATUS, TELEGRAM_CHAT_STATUS, text)
+def send_status(message: str) -> None:
+    """Status / heartbeat messages.
+
+    Prefer the dedicated status bot token if configured; otherwise fall back
+    to the main alerts token. Always send to TELEGRAM_CHAT_ALL so there is
+    a single central status/alert feed.
+    """
+    token = TELEGRAM_TOKEN_STATUS or TELEGRAM_TOKEN_ALERTS
+    chat = TELEGRAM_CHAT_ALL
+    if not token or not chat:
+        print(f"[status] (no telegram config) {message}")
+        return
+    _send_telegram_raw(token, chat, message)
 
 
 # ---------------- ETF BLACKLIST ----------------
 
+# Basic ETF blacklist; can be extended via ENV if you want
 _DEFAULT_ETF_BLACKLIST = {
     "SPY",
     "QQQ",
@@ -113,12 +108,7 @@ _DEFAULT_ETF_BLACKLIST = {
     "XLV",
 }
 
-_env_etf = {
-    s.strip().upper()
-    for s in os.getenv("ETF_BLACKLIST", "").split(",")
-    if s.strip()
-}
-
+_env_etf = {s.strip().upper() for s in os.getenv("ETF_BLACKLIST", "").split(",") if s.strip()}
 ETF_BLACKLIST = _DEFAULT_ETF_BLACKLIST.union(_env_etf)
 
 
@@ -126,11 +116,16 @@ def is_etf_blacklisted(ticker: str) -> bool:
     return ticker.upper() in ETF_BLACKLIST
 
 
-# ---------------- VIEW / CHART LINKS ----------------
+# ---------------- CHART LINKS ----------------
 
 
 def chart_link(symbol: str) -> str:
-    """TradingView chart link helper used everywhere."""
+    """
+    Build a TradingView link for the given underlying symbol.
+
+    Example:
+      https://www.tradingview.com/chart/?symbol=AAPL
+    """
     sym = symbol.upper()
     return f"https://www.tradingview.com/chart/?symbol={sym}"
 
@@ -147,23 +142,22 @@ def get_dynamic_top_volume_universe(
     max_tickers: int = 100,
     volume_coverage: float = 0.90,
 ) -> List[str]:
-    """
-    Approximate "top N names that capture ~X% of market volume".
+    """Approximate 'top N names that capture ~X% of market volume'.
 
-    - Uses Polygon v2 snapshot tickers endpoint.
-    - Caches the full list for 3 minutes to reduce API load.
-    - Falls back to the last good cache if the request fails.
+    Implementation:
+      • Uses Polygon's "previous close" / snapshot endpoints as a proxy for
+        current volume leaders.
+      • Keeps a 3-minute in-memory cache to avoid hammering the API.
+      • Fallback: if Polygon fails or returns nothing, returns a static
+        baseline universe from the last cache.
     """
-    global _UNIVERSE_CACHE
-
-    # Quick cache hit path
     now = time.time()
     if now - _UNIVERSE_CACHE["ts"] < 180 and _UNIVERSE_CACHE["tickers"]:
-        return _UNIVERSE_CACHE["tickers"][:max_tickers]
+        return _UNIVERSE_CACHE["tickers"]
 
     if not POLYGON_KEY:
-        print("[shared] POLYGON_KEY not set; using cached fallback universe.")
-        return _UNIVERSE_CACHE["tickers"][:max_tickers]
+        print("[shared] POLYGON_KEY missing; using cached/static universe.")
+        return _UNIVERSE_CACHE["tickers"]
 
     url = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
     params = {"apiKey": POLYGON_KEY, "limit": 1000}
@@ -173,23 +167,25 @@ def get_dynamic_top_volume_universe(
         r.raise_for_status()
         data = r.json()
     except Exception as e:
-        print(f"[shared] snapshot tickers fetch failed: {e}")
-        return _UNIVERSE_CACHE["tickers"][:max_tickers]
+        print(f"[shared] error fetching dynamic universe: {e}")
+        return _UNIVERSE_CACHE["tickers"]
 
     results = data.get("tickers") or []
     if not results:
-        print("[shared] snapshot tickers returned empty result set.")
-        return _UNIVERSE_CACHE["tickers"][:max_tickers]
+        print("[shared] no tickers in dynamic universe response.")
+        return _UNIVERSE_CACHE["tickers"]
 
-    # Sort by daily volume desc
     def _vol(rec: Dict[str, Any]) -> float:
         try:
-            return float(rec.get("v", 0.0))
+            day = rec.get("day") or {}
+            return float(day.get("v", 0.0))
         except Exception:
             return 0.0
 
+    # Sort by day volume descending
     sorted_by_vol = sorted(results, key=_vol, reverse=True)
 
+    # Compute cumulative coverage and pick max_tickers or volume_coverage threshold, whichever hits first
     total_vol = sum(_vol(r) for r in sorted_by_vol) or 1.0
     picked: List[str] = []
     running = 0.0
@@ -201,7 +197,6 @@ def get_dynamic_top_volume_universe(
         v = _vol(rec)
         running += v
         picked.append(t)
-
         if running / total_vol >= volume_coverage or len(picked) >= max_tickers:
             break
 
@@ -218,23 +213,25 @@ _OPTION_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
 def get_option_chain_cached(ticker: str) -> Optional[Dict[str, Any]]:
-    """
-    Get snapshot option chain for an underlying with a short cache.
+    """Get snapshot option chain for an underlying with a short cache.
 
-    - Uses Polygon v3 snapshot options endpoint.
-    - 120-second per-underlying cache.
-    - On failure, returns last good cached value if available.
+    Cache behaviour:
+      • 30-second TTL per underlying.
+      • Uses Polygon snapshot options endpoint.
     """
+    key = f"chain_{ticker.upper()}"
+    now = time.time()
+
+    # Cache hit
+    entry = _OPTION_CACHE.get(key)
+    if entry and now - entry.get("ts", 0) < 30:
+        return entry.get("data")
+
     if not POLYGON_KEY:
+        print("[shared] POLYGON_KEY not set; cannot fetch options.")
         return None
 
-    ticker = ticker.upper()
-    now = time.time()
-    cached = _OPTION_CACHE.get(ticker)
-    if cached and now - cached.get("ts", 0) < 120:
-        return cached.get("data")
-
-    url = f"https://api.polygon.io/v3/snapshot/options/{ticker}"
+    url = f"https://api.polygon.io/v3/snapshot/options/{ticker.upper()}"
     params = {"apiKey": POLYGON_KEY}
 
     try:
@@ -242,16 +239,16 @@ def get_option_chain_cached(ticker: str) -> Optional[Dict[str, Any]]:
         r.raise_for_status()
         data = r.json()
     except Exception as e:
-        print(f"[shared] option chain fetch failed for {ticker}: {e}")
-        return _OPTION_CACHE.get(ticker, {}).get("data")
+        print(f"[shared] error fetching option chain for {ticker}: {e}")
+        return None
 
-    _OPTION_CACHE[ticker] = {"ts": now, "data": data}
+    # Store in cache
+    _OPTION_CACHE[key] = {"ts": now, "data": data}
     return data
 
 
-def get_last_option_trades_cached(full_option_symbol: str) -> Any:
-    """
-    Get the last trade for a single option symbol with a short cache.
+def get_last_option_trade_cached(full_option_symbol: str) -> Optional[Dict[str, Any]]:
+    """Get the last trade for a single option symbol with a short cache.
 
     Behaviour:
       • 30-second in-memory cache per option.
@@ -269,50 +266,64 @@ def get_last_option_trades_cached(full_option_symbol: str) -> Any:
     if not POLYGON_KEY:
         return None
 
-    url = f"https://api.polygon.io/v3/trades/{full_option_symbol}/last"
+    url = f"https://api.polygon.io/v2/last/trade/{full_option_symbol}"
     params = {"apiKey": POLYGON_KEY}
 
     try:
         r = requests.get(url, params=params, timeout=10)
+        # Treat 404 (no data) as a normal, non-fatal condition
         if r.status_code == 404:
-            print(f"[shared] last trade 404 for {full_option_symbol}")
-            _OPTION_CACHE[key] = {"ts": now, "data": None}
+            print(f"[shared] no last option trade for {full_option_symbol} (404).")
             return None
 
         r.raise_for_status()
         data = r.json()
     except Exception as e:
-        print(f"[shared] last trade fetch failed for {full_option_symbol}: {e}")
+        print(f"[shared] error fetching last option trade for {full_option_symbol}: {e}")
         return None
 
     _OPTION_CACHE[key] = {"ts": now, "data": data}
     return data
 
 
-# ---------------- GRADER ----------------
+# ---------------- GRADING / SETUP QUALITY ----------------
 
 
-def grade_equity_setup(move_pct: float, rvol: float, dollar_vol: float) -> str:
-    """
-    Rough A+/A/B/C grading based on move, RVOL, and dollar volume.
+def grade_equity_setup(
+    move_pct: float,
+    rvol: float,
+    dollar_vol: float,
+) -> str:
+    """Very rough A+/A/B/C grade for an equity setup.
 
-    This is intentionally simple — we just want a quick qualitative label
-    for unusual / momentum setups in the alerts.
+    Inputs:
+      • move_pct: absolute % move from a reference (e.g. ORB break, gap, etc.)
+      • rvol: relative volume multiple vs typical
+      • dollar_vol: traded notional in USD
+
+    Heuristic:
+      - movement:   0–2pt → low, 2–4 modest, 4–8 strong, >8 explosive
+      - RVOL:       1–2 moderate, 2–4 high, >4 extreme
+      - $ volume:   5–25M light, 25–75M solid, 75–200M large, >200M huge
+
+    Returns:
+      "A+", "A", "B", or "C"
     """
     score = 0
 
     # Move contribution
-    if move_pct >= 3:
+    m = abs(move_pct)
+    if m >= 2:
         score += 1
-    if move_pct >= 5:
+    if m >= 4:
         score += 1
-    if move_pct >= 8:
+    if m >= 8:
         score += 1
 
     # RVOL contribution
     if rvol >= 2:
         score += 1
-    if rvol >= 3:
+    if rvol >= 4:
         score += 1
 
     # Dollar-volume contribution
