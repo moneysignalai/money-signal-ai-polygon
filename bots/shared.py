@@ -145,8 +145,7 @@ def get_dynamic_top_volume_universe(
     """Approximate 'top N names that capture ~X% of market volume'.
 
     Implementation:
-      • Uses Polygon's "previous close" / snapshot endpoints as a proxy for
-        current volume leaders.
+      • Uses Polygon's snapshot endpoint as a proxy for current volume leaders.
       • Keeps a 3-minute in-memory cache to avoid hammering the API.
       • Fallback: if Polygon fails or returns nothing, returns a static
         baseline universe from the last cache.
@@ -287,25 +286,20 @@ def get_last_option_trades_cached(full_option_symbol: str) -> Optional[Dict[str,
     return data
 
 
+# ---- Backwards-compatible aliases for old bot imports ----
+
 def get_last_option_trade_cached(full_option_symbol: str) -> Optional[Dict[str, Any]]:
-    """
-    Backwards-compat alias for older bots that imported the singular name.
-    Delegates to get_last_option_trades_cached().
-    """
+    """Alias for older singular name."""
     return get_last_option_trades_cached(full_option_symbol)
 
 
 def getLastOptionTradesCached(full_option_symbol: str) -> Optional[Dict[str, Any]]:
-    """
-    Backwards-compat alias for older camelCase import style.
-    """
+    """Alias for older CamelCase import style."""
     return get_last_option_trades_cached(full_option_symbol)
 
 
 def getlastoptiontradescached(full_option_symbol: str) -> Optional[Dict[str, Any]]:
-    """
-    Backwards-compat alias for fully lowercase import style (defensive).
-    """
+    """Alias for fully lowercase import style."""
     return get_last_option_trades_cached(full_option_symbol)
 
 
