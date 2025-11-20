@@ -3,6 +3,7 @@
 import os
 from datetime import date, timedelta, datetime
 from typing import List, Any
+
 import pytz
 
 try:
@@ -25,9 +26,9 @@ eastern = pytz.timezone("US/Eastern")
 
 # ------------------- CONFIG -------------------
 
-# Exchange codes to be treated as dark/ATS — dev can tune if needed
+# Exchange codes to be treated as dark/ATS — tune as needed
 DARK_EXCHANGES = {
-    8, 9, 80, 81, 82  # placeholders; adapt to your real feed
+    8, 9, 80, 81, 82  # placeholders; adapt to your feed
 }
 
 DARK_LOOKBACK_MIN = int(os.getenv("DARK_LOOKBACK_MIN", "30"))  # last X minutes
@@ -36,6 +37,8 @@ MIN_DARK_SINGLE_NOTIONAL = float(os.getenv("DARK_MIN_SINGLE_NOTIONAL", "5000000"
 MIN_DARK_PRINT_COUNT = int(os.getenv("DARK_MIN_PRINT_COUNT", "3"))
 MIN_DARK_DOLLAR_VOL = float(os.getenv("DARK_MIN_DOLLAR_VOL", "25000000"))  # $25M+
 MIN_DARK_RVOL = float(os.getenv("DARK_MIN_RVOL", "1.5"))
+
+# ------------------- STATE -------------------
 
 _alert_date: date | None = None
 _alerted: set[str] = set()
@@ -61,26 +64,10 @@ def _mark(sym: str):
 
 def _in_dark_window() -> bool:
     """
-    Dark/ATS prints (FINRA TRF) can hit:
-      • Premarket
-      • Regular hours
-      • After-hours
-    and can be reported with a short delay.
-
-    We monitor:
-      • Weekdays only
-      • 04:00–20:15 ET (premarket → RTH → after-hours + ~15 min for late prints).
+    Dark pool radar runs from 04:00 to 20:15 ET.
     """
     now = datetime.now(eastern)
-
-    # Skip weekends entirely
-    if now.weekday() >= 5:
-        print("[dark_pool] Weekend; skipping.")
-        return False
-
     mins = now.hour * 60 + now.minute
-
-    # 04:00 = 240, 20:15 = 1215
     return 4 * 60 <= mins <= 20 * 60 + 15  # 4:00–20:15 ET
 
 
@@ -95,19 +82,22 @@ def _safe(o: Any, name: str, default=None):
     return getattr(o, name, default)
 
 
+# ------------------- MAIN BOT -------------------
+
+
 async def run_dark_pool_radar():
     """
     Dark Pool Radar Bot — "oh wow" clusters.
 
-      • Time: 4:00–20:15 ET (premarket + RTH + after-hours + delay buffer).
-      • Underlying:
-          - RVOL ≥ max(MIN_DARK_RVOL, MIN_RVOL_GLOBAL)
-          - Volume ≥ MIN_VOLUME_GLOBAL
-          - Dollar volume ≥ MIN_DARK_DOLLAR_VOL
-      • Dark prints (last DARK_LOOKBACK_MIN minutes):
-          - Total dark notional ≥ MIN_DARK_TOTAL_NOTIONAL  OR
-          - Largest single dark print ≥ MIN_DARK_SINGLE_NOTIONAL
-          - At least MIN_DARK_PRINT_COUNT prints
+      • Time: 04:00–20:15 EST
+      • Universe: TICKER_UNIVERSE env OR dynamic top volume universe (120 names)
+      • Filters:
+          - Day $ volume ≥ MIN_DARK_DOLLAR_VOL
+          - RVOL ≥ max(MIN_RVOL_GLOBAL, MIN_DARK_RVOL)
+          - Dark prints (last DARK_LOOKBACK_MIN minutes):
+              - Total dark notional ≥ MIN_DARK_TOTAL_NOTIONAL  OR
+              - Largest single dark print ≥ MIN_DARK_SINGLE_NOTIONAL
+              - At least MIN_DARK_PRINT_COUNT prints
     """
     if not POLYGON_KEY or not _client:
         print("[dark_pool] Missing client/API key.")
@@ -148,36 +138,32 @@ async def run_dark_pool_radar():
             print(f"[dark_pool] daily fetch failed for {sym}: {e}")
             continue
 
-        if len(days) < 2:
+        if len(days) < 10:
             continue
 
-        d0 = days[-1]
-        d1 = days[-2]
+        today_bar = days[-1]
+        prev_bar = days[-2]
 
-        last_price = float(d0.close)
-        prev_close = float(d1.close)
-        if last_price <= 0:
-            continue
-
-        hist = days[:-1]
-        recent = hist[-20:] if len(hist) > 20 else hist
-        avg_vol = sum(d.volume for d in recent) / len(recent)
-        day_vol = float(d0.volume)
-        rvol = day_vol / avg_vol if avg_vol > 0 else 1.0
-
-        if rvol < max(MIN_DARK_RVOL, MIN_RVOL_GLOBAL):
-            continue
-        if day_vol < MIN_VOLUME_GLOBAL:
+        try:
+            last_price = float(today_bar.close)
+            prev_close = float(prev_bar.close)
+            day_vol = float(today_bar.volume or 0.0)
+        except Exception:
             continue
 
         dollar_vol = last_price * day_vol
-        if dollar_vol < MIN_DARK_DOLLAR_VOL:
+        if dollar_vol < max(MIN_DARK_DOLLAR_VOL, MIN_VOLUME_GLOBAL * last_price):
             continue
 
-        move_pct = (
-            (last_price - prev_close) / prev_close * 100.0
-            if prev_close > 0 else 0.0
-        )
+        vols = [float(d.volume or 0.0) for d in days[-11:-1]]
+        avg_vol = sum(vols) / max(len(vols), 1)
+        if avg_vol <= 0:
+            continue
+        rvol = day_vol / avg_vol
+        if rvol < max(MIN_RVOL_GLOBAL, MIN_DARK_RVOL):
+            continue
+
+        move_pct = (last_price / prev_close - 1.0) * 100.0 if prev_close > 0 else 0.0
 
         # --- Dark trades over last DARK_LOOKBACK_MIN minutes ---
         total_dark_notional = 0.0
@@ -220,10 +206,11 @@ async def run_dark_pool_radar():
         ):
             continue
 
+        # --- Alert ---
         now_str = now_et.strftime("%I:%M %p EST · %b %d").lstrip("0")
-        emoji = "🌑"
-        money_emoji = "💰"
+        emoji = "📡"
         radar_emoji = "📡"
+        money_emoji = "💰"
         divider = "────────────"
 
         extra = (
