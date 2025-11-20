@@ -2,6 +2,7 @@
 
 import os
 from datetime import datetime, date
+
 import pytz
 
 from bots.shared import (
@@ -10,20 +11,23 @@ from bots.shared import (
     get_last_option_trades_cached,
     send_alert,
     chart_link,
+    now_est,
 )
 
 eastern = pytz.timezone("US/Eastern")
 
-# ---------------- ENV CONFIG (LOOSER DEFAULTS) ----------------
-# You can override these on Render with:
+# ---------------- ENV CONFIG (tunable) ----------------
+# You can override these on Render:
 #   UNUSUAL_MIN_NOTIONAL, UNUSUAL_MIN_SIZE, UNUSUAL_MAX_DTE
 
-# Notional per sweep (price * size * 100)
+# Minimum notional (price * size * 100) per sweep
 MIN_NOTIONAL = float(os.getenv("UNUSUAL_MIN_NOTIONAL", "75000"))   # default $75k+
-# Minimum number of contracts
-MIN_TRADE_SIZE = int(os.getenv("UNUSUAL_MIN_SIZE", "20"))          # default >= 20
+
+# Minimum number of contracts in the last trade
+MIN_TRADE_SIZE = int(os.getenv("UNUSUAL_MIN_SIZE", "20"))          # default 20+ contracts
+
 # Maximum days to expiration
-MAX_DTE = int(os.getenv("UNUSUAL_MAX_DTE", "60"))                  # default 60 days
+MAX_DTE = int(os.getenv("UNUSUAL_MAX_DTE", "60"))                  # default 60 days out
 
 # --------------- Per-day dedupe (per contract) ----------------
 _alert_date: date | None = None
@@ -31,6 +35,7 @@ _alerted_contracts: set[str] = set()
 
 
 def _reset_day() -> None:
+    """Reset daily state if we rolled to a new calendar day."""
     global _alert_date, _alerted_contracts
     today = date.today()
     if today != _alert_date:
@@ -39,11 +44,13 @@ def _reset_day() -> None:
 
 
 def _already(contract: str) -> bool:
+    """Check if this contract was already alerted today."""
     _reset_day()
     return contract in _alerted_contracts
 
 
 def _mark(contract: str) -> None:
+    """Mark a contract as alerted for the current day."""
     _reset_day()
     _alerted_contracts.add(contract)
 
@@ -55,13 +62,16 @@ def _in_rth() -> bool:
       09:30–16:00 ET, Mon–Fri.
     """
     now = datetime.now(eastern)
-    if now.weekday() >= 5:
+    if now.weekday() >= 5:  # 5=Saturday, 6=Sunday
         return False
-    return (now.hour > 9 or (now.hour == 9 and now.minute >= 30)) and now.hour < 16
+
+    mins = now.hour * 60 + now.minute
+    return (9 * 60 + 30) <= mins < (16 * 60)
 
 
 # ---------------- DTE HELPER ----------------
 def _calc_dte(expiration: str | None, today: date) -> int | None:
+    """Compute days-to-expiration from YYYY-MM-DD."""
     if not expiration:
         return None
     try:
@@ -74,14 +84,14 @@ def _calc_dte(expiration: str | None, today: date) -> int | None:
 # ---------------- MAIN BOT ----------------
 async def run_unusual():
     """
-    Unusual Options Flow Bot:
+    Unusual Options Flow Bot (CALL + PUT):
 
       • Time: RTH only (09:30–16:00 ET, Mon–Fri).
       • Universe: dynamic top-volume tickers (or TICKER_UNIVERSE if set).
       • For each underlying:
           - Fetch option chain via get_option_chain_cached(sym).
           - For each contract:
-              • contract_type in {call, put}
+              • CALL or PUT
               • 0 <= DTE <= MAX_DTE
               • Last trade exists via get_last_option_trades_cached(contract)
               • size >= MIN_TRADE_SIZE
@@ -89,10 +99,13 @@ async def run_unusual():
           - Per-contract per-day: only 1 alert.
     """
     if not _in_rth():
+        print("[unusual] Outside RTH; skipping.")
         return
 
     today = date.today()
-    universe = get_dynamic_top_volume_universe()
+
+    # Slightly expanded universe so it sees more symbols
+    universe = get_dynamic_top_volume_universe(max_tickers=120, volume_coverage=0.95)
     if not universe:
         print("[unusual] Universe empty; skipping.")
         return
@@ -108,12 +121,19 @@ async def run_unusual():
 
         for opt in results:
             details = opt.get("details") or {}
-            contract = opt.get("ticker") or opt.get("option_symbol")
+
+            # Resolve contract symbol (Polygon can use different keys)
+            contract = (
+                opt.get("ticker")
+                or opt.get("option_symbol")
+                or details.get("symbol")
+                or details.get("ticker")
+            )
             if not contract:
                 continue
             contract = str(contract)
 
-            # Per-contract daily dedupe
+            # Per-contract dedupe
             if _already(contract):
                 continue
 
@@ -128,12 +148,15 @@ async def run_unusual():
             if dte is None or dte < 0 or dte > MAX_DTE:
                 continue
 
-            # Last trade
+            # Last trade from cached helper
             trade = get_last_option_trades_cached(contract)
             if not trade:
                 continue
 
             last = trade.get("results") or {}
+
+            # Polygon last-trade fields for options:
+            #   p = price, s = size
             price = last.get("p")
             size = last.get("s", 0)
 
@@ -152,14 +175,12 @@ async def run_unusual():
             if notional < MIN_NOTIONAL:
                 continue
 
-            # Format time nicely
-            now = datetime.now(eastern)
-            now_str = now.strftime("%I:%M %p EST · %b %d").lstrip("0")
+            # Build premium-style alert
+            time_str = now_est()
 
-            # Build premium alert
             msg = (
                 f"🕵️ UNUSUAL — {sym}\n"
-                f"🕒 {now_str}\n"
+                f"🕒 {time_str}\n"
                 f"💰 Trade Price: ${price:.2f}\n"
                 "────────────\n"
                 f"🕵️ Unusual {cp} Sweep\n"
