@@ -1,3 +1,5 @@
+# bots/orb.py — Opening Range Breakout (15m ORB, 5m FVG retest)
+
 import os
 from datetime import date, timedelta, datetime
 from typing import List, Optional, Tuple, Any
@@ -31,7 +33,7 @@ MIN_ORB_RVOL = float(os.getenv("MIN_ORB_RVOL", "2.5"))
 MIN_ORB_DOLLAR_VOL = float(os.getenv("MIN_ORB_DOLLAR_VOL", "8000000"))  # $8M+
 
 # ORB timing (EST)
-# 9:30–9:45 → build 15-min range (3× 5m bars)
+# 9:30–9:45 → build 15-min range (first 3×5m bars)
 # 9:45–11:00 → look for breakout + FVG-style retest
 ORB_BUILD_START_MIN = 9 * 60 + 30
 ORB_BUILD_END_MIN = 9 * 60 + 45
@@ -123,28 +125,69 @@ def _compute_rvol(days) -> Tuple[float, float, float, float]:
     return rvol, day_vol, last_price, prev_close
 
 
-def _fetch_5m_bars(sym: str, today: date):
-    """Fetch today's 5-minute bars from 9:30 to now."""
-    start = datetime(today.year, today.month, today.day, 9, 30, tzinfo=eastern)
-    end = datetime.now(eastern)
+def _bar_timestamp_et(bar: Any) -> Optional[datetime]:
+    """
+    Convert Polygon agg bar timestamp (ms) to a timezone-aware datetime in EST.
+    Polygon v2 aggs typically expose 'timestamp' or 't' in milliseconds since epoch.
+    """
+    ts = getattr(bar, "timestamp", None)
+    if ts is None:
+        ts = getattr(bar, "t", None)
+    if ts is None:
+        return None
     try:
-        bars = list(
+        dt_utc = datetime.fromtimestamp(ts / 1000.0, tz=pytz.UTC)
+        return dt_utc.astimezone(eastern)
+    except Exception:
+        return None
+
+
+def _fetch_5m_bars(sym: str, today: date) -> List[Any]:
+    """
+    Fetch today's 5-minute bars and filter to 09:30–current time in EST.
+
+    IMPORTANT:
+      Polygon intraday 'from_' / 'to' must be either a DATE (YYYY-MM-DD)
+      or a Unix timestamp. We avoid ISO datetimes and request the whole day
+      via YYYY-MM-DD, then filter by local time.
+    """
+    day_str = today.isoformat()
+
+    try:
+        all_bars = list(
             _client.list_aggs(
                 ticker=sym,
                 multiplier=5,
                 timespan="minute",
-                from_=start.isoformat(),
-                to=end.isoformat(),
+                from_=day_str,  # YYYY-MM-DD (Polygon-compatible)
+                to=day_str,
                 limit=500,
             )
         )
     except Exception as e:
         print(f"[orb] 5m fetch failed for {sym}: {e}")
         return []
-    return bars
+
+    if not all_bars:
+        return []
+
+    now_et = datetime.now(eastern)
+    now_mins = now_et.hour * 60 + now_et.minute
+
+    filtered: List[Any] = []
+    for b in all_bars:
+        dt_et = _bar_timestamp_et(b)
+        if not dt_et:
+            continue
+        mins = dt_et.hour * 60 + dt_et.minute
+        # Keep bars from 09:30 up to current time
+        if ORB_BUILD_START_MIN <= mins <= now_mins:
+            filtered.append(b)
+
+    return filtered
 
 
-def _build_orb_range(bars) -> Optional[Tuple[float, float]]:
+def _build_orb_range(bars: List[Any]) -> Optional[Tuple[float, float]]:
     """Compute ORB high/low from first 3×5m bars (9:30–9:45)."""
     if len(bars) < 3:
         return None
@@ -155,14 +198,18 @@ def _build_orb_range(bars) -> Optional[Tuple[float, float]]:
 
 
 def _find_breakout_and_retest(
-    bars, orb_low: float, orb_high: float
+    bars: List[Any], orb_low: float, orb_high: float
 ) -> Optional[Tuple[str, Any, Any]]:
     """
     Return (direction, breakout_bar, retest_bar) or None.
 
     direction: "up" for breakout above orb_high, "down" for breakdown below orb_low.
+
+    Logic:
+      • Find the first clean breakout/breakdown bar after the ORB (index >=3).
+      • Then look for a later bar that "retests" the ORB edge while respecting the breakout.
     """
-    breakout_idx = None
+    breakout_idx: Optional[int] = None
     direction: Optional[str] = None
 
     # Skip first 3 bars (used for ORB build)
@@ -218,6 +265,7 @@ async def run_orb():
           - Day RVOL >= max(MIN_ORB_RVOL, MIN_RVOL_GLOBAL)
           - Day volume >= MIN_VOLUME_GLOBAL
           - Day dollar volume >= MIN_ORB_DOLLAR_VOL
+      • One alert per symbol per day.
     """
     if not POLYGON_KEY or not _client:
         print("[orb] POLYGON_KEY not set or client not initialized; skipping.")
@@ -229,6 +277,7 @@ async def run_orb():
     _reset_if_new_day()
     universe = _get_universe()
     today = date.today()
+    today_s = today.isoformat()
 
     for sym in universe:
         if is_etf_blacklisted(sym):
