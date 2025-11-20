@@ -100,10 +100,53 @@ def _in_trading_window() -> bool:
 
 
 def _get_universe() -> List[str]:
+    """
+    Universe resolution priority:
+
+      1) CHEAP_TICKER_UNIVERSE env (comma-separated list)
+      2) Dynamic top-volume universe from Polygon
+      3) TICKER_UNIVERSE env (global override)
+      4) Hard-coded top 100 popular, liquid, options-heavy names
+    """
+    # 1) CHEAP_TICKER_UNIVERSE explicit override for this bot
     env = os.getenv("CHEAP_TICKER_UNIVERSE")
     if env:
         return [t.strip().upper() for t in env.split(",") if t.strip()]
-    return get_dynamic_top_volume_universe(max_tickers=100, volume_coverage=0.90)
+
+    # 2) Primary: dynamic universe from shared helper
+    universe = get_dynamic_top_volume_universe(max_tickers=100, volume_coverage=0.90)
+
+    # 3) If dynamic universe failed / empty, try global TICKER_UNIVERSE
+    if not universe:
+        env2 = os.getenv("TICKER_UNIVERSE")
+        if env2:
+            universe = [t.strip().upper() for t in env2.split(",") if t.strip()]
+        else:
+            # 4) Final fallback: hard-coded top 100
+            universe = [
+                "SPY", "QQQ", "IWM", "DIA", "VTI",
+                "XLK", "XLF", "XLE", "XLY", "XLI",
+                "AAPL", "MSFT", "NVDA", "TSLA", "META",
+                "GOOGL", "AMZN", "NFLX", "AVGO", "ADBE",
+                "SMCI", "AMD", "INTC", "MU", "ORCL",
+                "CRM", "SHOP", "PANW", "ARM", "CSCO",
+                "PLTR", "SOFI", "SNOW", "UBER", "LYFT",
+                "ABNB", "COIN", "HOOD", "RIVN", "LCID",
+                "NIO", "F", "GM", "T", "VZ",
+                "BAC", "JPM", "WFC", "C", "GS",
+                "XOM", "CVX", "OXY", "SLB", "COP",
+                "PFE", "MRK", "LLY", "UNH", "ABBV",
+                "TSM", "BABA", "JD", "NKE", "MCD",
+                "SBUX", "WMT", "COST", "HD", "LOW",
+                "DIS", "PARA", "WBD", "TGT", "SQ",
+                "PYPL", "ROKU", "ETSY", "NOW", "INTU",
+                "TXN", "QCOM", "LRCX", "AMAT", "LIN",
+                "CAT", "DE", "BA", "LULU", "GME",
+                "AMC", "MARA", "RIOT", "CLSK", "BITF",
+                "CIFR", "HUT", "BTBT", "TSLY", "SMH",
+            ]
+
+    return universe
 
 
 # ---------------- HELPERS ----------------
