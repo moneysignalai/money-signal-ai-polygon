@@ -7,8 +7,7 @@
 #   • Collect shared/universe info via record_shared_error(...) and record_universe_health(...)
 #   • On each run_status_report() call:
 #       - If there are NEW errors since last digest → send an error summary to the status Telegram.
-#       - Else, every ~10 minutes → send a lightweight heartbeat with latest universe stats
-#         and recent error counts.
+#       - Else, send a periodic heartbeat (startup + every ~10 minutes).
 
 from __future__ import annotations
 
@@ -40,6 +39,9 @@ _universe_health: Optional[Dict] = None  # {"time": dt, "size": int, "coverage":
 
 # Last heartbeat we sent (no-error status message)
 _last_heartbeat_sent_at: Optional[datetime] = None
+
+# Whether we've sent at least one heartbeat since startup
+_startup_heartbeat_sent: bool = False
 
 # Simple lock so multiple bots recording at once don't corrupt state
 _LOCK = threading.Lock()
@@ -192,36 +194,18 @@ def _build_error_digest(now: datetime) -> Optional[str]:
 
 def _build_heartbeat(now: datetime) -> Optional[str]:
     """
-    Build a light heartbeat / health snapshot if:
-      • At least ~10 minutes passed since last heartbeat
-      • Or we've never sent one yet.
+    Build a light heartbeat / health snapshot.
 
-    Includes:
-      • Current time
-      • Latest universe size / coverage (if known)
-      • Count of errors in the last hour
+    Behavior:
+      • Always allowed to build (no universe/errors required)
+      • main() will control the frequency (startup + every ~10 minutes).
     """
-    global _last_heartbeat_sent_at
-
     with _LOCK:
-        # Rate limit heartbeats to ~10 minutes
-        if _last_heartbeat_sent_at is not None:
-            if now - _last_heartbeat_sent_at < timedelta(minutes=10):
-                return None
-
-        # Snapshot universe + error stats
         universe = _universe_health
         one_hour_ago = now - timedelta(hours=1)
         recent_errors = [e for e in _error_events if e["time"] >= one_hour_ago]
         total_errors_1h = len(recent_errors)
 
-        # No data at all? Then don't spam.
-        if universe is None and total_errors_1h == 0:
-            return None
-
-        _last_heartbeat_sent_at = now
-
-    # Format outside the lock
     head_time = _format_est_timestamp(now)
     lines = [f"✅ MoneySignalAI — Heartbeat", "", head_time, ""]
 
@@ -233,7 +217,7 @@ def _build_heartbeat(now: datetime) -> Optional[str]:
     else:
         lines.append("📊 Universe: no recent universe snapshot recorded.")
 
-    if total_errors_1h := total_errors_1h:
+    if total_errors_1h:
         lines.append(f"⚠️ Errors last 60m: {total_errors_1h}")
     else:
         lines.append("✅ Errors last 60m: none recorded.")
@@ -249,10 +233,13 @@ async def run_status_report() -> None:
 
     Priority:
       1) If there are new errors since the last digest → send error digest.
-      2) Else, if enough time has passed → send heartbeat with universe stats.
+      2) Else:
+          - If no heartbeat ever sent → send startup heartbeat immediately.
+          - Else if ≥10 minutes since last heartbeat → send heartbeat.
       3) Else, do nothing (log that there was nothing to send).
     """
     now = now_est()
+    global _last_heartbeat_sent_at, _startup_heartbeat_sent
 
     # 1) Try to send an error digest if there are new errors
     error_text = _build_error_digest(now)
@@ -261,12 +248,31 @@ async def run_status_report() -> None:
         print("[status_report] sent error digest.")
         return
 
-    # 2) Otherwise, maybe send a heartbeat
-    heartbeat_text = _build_heartbeat(now)
-    if heartbeat_text:
-        _send_status_telegram(heartbeat_text)
-        print("[status_report] sent heartbeat.")
-        return
+    # 2a) On first run after startup, always send a heartbeat
+    if not _startup_heartbeat_sent:
+        hb = _build_heartbeat(now)
+        if hb:
+            _send_status_telegram(hb)
+            _startup_heartbeat_sent = True
+            _last_heartbeat_sent_at = now
+            print("[status_report] sent startup heartbeat.")
+            return
+
+    # 2b) Periodic heartbeat every ~10 minutes
+    with _LOCK:
+        if _last_heartbeat_sent_at is None:
+            elapsed_ok = True
+        else:
+            elapsed_ok = (now - _last_heartbeat_sent_at) >= timedelta(minutes=10)
+
+    if elapsed_ok:
+        hb = _build_heartbeat(now)
+        if hb:
+            _send_status_telegram(hb)
+            with _LOCK:
+                _last_heartbeat_sent_at = now
+            print("[status_report] sent periodic heartbeat.")
+            return
 
     # 3) Nothing to send this minute
     print("[status_report] No status to send at this minute.")
