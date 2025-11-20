@@ -1,8 +1,8 @@
-# bots/shared.py — MoneySignalAI shared helpers
+# bots/shared.py — MoneySignalAI shared helpers (with 3-minute universe cache)
 
 import os
 import math
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List
 
 import requests
@@ -114,16 +114,24 @@ def is_etf_blacklisted(ticker: str) -> bool:
     return ticker.upper() in ETF_BLACKLIST
 
 
+# ---- Universe cache (in-memory, per process) ----
+
+_UNIVERSE_CACHE: List[str] | None = None
+_UNIVERSE_TS: datetime | None = None
+_UNIVERSE_TTL_SECONDS = int(os.getenv("UNIVERSE_CACHE_TTL", "180"))  # 3 minutes default
+
+
 def get_dynamic_top_volume_universe(
     max_tickers: int = 150,
     volume_coverage: float = 0.95,
 ) -> List[str]:
     """
-    Dynamic universe builder.
+    Dynamic universe builder (with 3-minute cache).
 
     Priority:
       1) If TICKER_UNIVERSE is set in ENV, use that list directly.
-      2) Otherwise, call Polygon's snapshot endpoint:
+      2) Else, if cached universe is younger than UNIVERSE_CACHE_TTL seconds, reuse it.
+      3) Else, call Polygon's snapshot endpoint:
          /v2/snapshot/locale/us/markets/stocks/tickers
          and sort by daily volume descending.
 
@@ -131,16 +139,29 @@ def get_dynamic_top_volume_universe(
       • hit `max_tickers`, OR
       • reach `volume_coverage` of total reported volume.
     """
-    # 1) Manual override
+    global _UNIVERSE_CACHE, _UNIVERSE_TS
+
+    # 1) Manual override wins
     manual = os.getenv("TICKER_UNIVERSE")
     if manual:
         tickers = [x.strip().upper() for x in manual.split(",") if x.strip()]
         print(f"[shared] using TICKER_UNIVERSE override ({len(tickers)} tickers).")
         return tickers
 
-    # 2) Dynamic from Polygon
+    # 2) Cache check
+    now = datetime.utcnow()
+    if _UNIVERSE_CACHE is not None and _UNIVERSE_TS is not None:
+        age = (now - _UNIVERSE_TS).total_seconds()
+        if age <= _UNIVERSE_TTL_SECONDS:
+            # cached universe is still fresh
+            print(f"[shared] using cached universe ({len(_UNIVERSE_CACHE)} tickers, age {int(age)}s).")
+            return _UNIVERSE_CACHE
+
+    # 3) Fetch from Polygon
     if not POLYGON_KEY:
         print("[shared] POLYGON_KEY missing; universe fallback empty.")
+        _UNIVERSE_CACHE = []
+        _UNIVERSE_TS = now
         return []
 
     url = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
@@ -152,6 +173,10 @@ def get_dynamic_top_volume_universe(
         data = resp.json()
     except Exception as e:
         print(f"[shared] universe fetch failed: {e}")
+        # on failure, keep old cache if it exists
+        if _UNIVERSE_CACHE is not None:
+            print("[shared] falling back to previous cached universe.")
+            return _UNIVERSE_CACHE
         return []
 
     tickers_data = data.get("tickers", []) or []
@@ -169,6 +194,8 @@ def get_dynamic_top_volume_universe(
 
     if not volumes:
         print("[shared] universe: no tickers found in snapshot.")
+        _UNIVERSE_CACHE = []
+        _UNIVERSE_TS = now
         return []
 
     # Sort by volume descending
@@ -187,9 +214,14 @@ def get_dynamic_top_volume_universe(
         if total_volume > 0 and (running / total_volume) >= volume_coverage:
             break
 
-    print(f"[shared] universe built: {len(chosen)} tickers, "
-          f"{running:,} / {total_volume:,} volume ({(running / total_volume * 100) if total_volume else 0:.1f}%).")
+    coverage_pct = (running / total_volume * 100) if total_volume else 0.0
+    print(
+        f"[shared] universe built from Polygon: {len(chosen)} tickers, "
+        f"{running:,} / {total_volume:,} volume ({coverage_pct:.1f}%)."
+    )
 
+    _UNIVERSE_CACHE = chosen
+    _UNIVERSE_TS = now
     return chosen
 
 
