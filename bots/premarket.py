@@ -18,6 +18,7 @@ from bots.shared import (
     grade_equity_setup,
     is_etf_blacklisted,
     chart_link,
+    now_est,
 )
 
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
@@ -26,126 +27,176 @@ eastern = pytz.timezone("US/Eastern")
 # ---- Config / thresholds ----
 
 MIN_PREMARKET_PRICE = float(os.getenv("MIN_PREMARKET_PRICE", "2.0"))
-MIN_PREMARKET_MOVE_PCT = float(os.getenv("MIN_PREMARKET_MOVE_PCT", "8.0"))      # vs prior close
-MIN_PREMARKET_RVOL = float(os.getenv("MIN_PREMARKET_RVOL", "2.0"))              # RVOL floor
+MIN_PREMARKET_MOVE_PCT = float(os.getenv("MIN_PREMARKET_MOVE_PCT", "6.0"))  # vs prior close
 MIN_PREMARKET_DOLLAR_VOL = float(os.getenv("MIN_PREMARKET_DOLLAR_VOL", "3000000"))  # $3M+
+MIN_PREMARKET_RVOL = float(os.getenv("MIN_PREMARKET_RVOL", "2.0"))
 
-# ---- Per-day de-dupe ----
+# Premarket scan window 04:00–09:29 ET
+PREMARKET_START_MIN = 4 * 60
+PREMARKET_END_MIN = 9 * 60 + 29
 
-_premarket_alert_date: date | None = None
-_premarket_alerted_syms: set[str] = set()
+# Per-day de-dupe
+_alerted_date = None
+_alerted_syms = set()
 
 
-def _reset_if_new_day() -> None:
-    global _premarket_alert_date, _premarket_alerted_syms
+def _reset_if_new_day():
+    global _alerted_date, _alerted_syms
     today = date.today()
-    if _premarket_alert_date != today:
-        _premarket_alert_date = today
-        _premarket_alerted_syms = set()
+    if _alerted_date != today:
+        _alerted_date = today
+        _alerted_syms = set()
 
 
-def _already_alerted(sym: str) -> bool:
+def _already(sym: str) -> bool:
     _reset_if_new_day()
-    return sym in _premarket_alerted_syms
+    return sym in _alerted_syms
 
 
-def _mark_alerted(sym: str) -> None:
+def _mark_alerted(sym: str):
     _reset_if_new_day()
-    _premarket_alerted_syms.add(sym)
+    _alerted_syms.add(sym)
 
-
-# ---- Time & universe helpers ----
 
 def _in_premarket_window() -> bool:
-    """
-    Premarket session: 4:00–9:29 AM EST.
-    """
-    now_et = datetime.now(eastern)
-    minutes = now_et.hour * 60 + now_et.minute
-    return 4 * 60 <= minutes < 9 * 60 + 30
+    """Only run 04:00–09:29 ET (premarket)."""
+    now = datetime.now(eastern)
+    mins = now.hour * 60 + now.minute
+    return PREMARKET_START_MIN <= mins <= PREMARKET_END_MIN
 
 
-def _get_ticker_universe() -> List[str]:
+def _get_universe() -> List[str]:
     env = os.getenv("TICKER_UNIVERSE")
     if env:
         return [t.strip().upper() for t in env.split(",") if t.strip()]
+    # dynamic: top ~100 tickers that cover ~90% of volume
     return get_dynamic_top_volume_universe(max_tickers=100, volume_coverage=0.90)
 
 
-def _filter_premarket_minutes(mins) -> List:
-    """
-    Keep only 1-min bars between 4:00 and 9:29 AM EST.
-    """
-    out = []
-    for b in mins:
-        # Polygon timestamps are usually in ms
-        ts = getattr(b, "timestamp", None)
-        if ts is None:
-            continue
-        dt_utc = datetime.utcfromtimestamp(ts / 1000.0).replace(tzinfo=pytz.UTC)
-        dt_et = dt_utc.astimezone(eastern)
-        minutes = dt_et.hour * 60 + dt_et.minute
-        if 4 * 60 <= minutes < 9 * 60 + 30:
-            out.append(b)
-    return out
+def _get_prev_and_today(sym: str):
+    today = date.today()
+    today_s = today.isoformat()
+    try:
+        days = list(
+            _client.list_aggs(
+                ticker=sym,
+                multiplier=1,
+                timespan="day",
+                from_=(today - timedelta(days=40)).isoformat(),
+                to=today_s,
+                limit=40,
+            )
+        )
+    except Exception as e:
+        print(f"[premarket] daily fetch failed for {sym}: {e}")
+        return None, None
+
+    if len(days) < 2:
+        return None, None
+
+    return days[-2], days[-1]
 
 
-def _premarket_stats(mins, prev_close: float) -> Tuple[float, float, float, float]:
+def _get_premarket_window_aggs(sym: str) -> Tuple[float, float, float, float]:
     """
-    Return (last_px, pre_high, pre_low, pre_move_pct) using the premarket bars.
+    Returns (pre_low, pre_high, pre_last, pre_volume) for 1m bars between 04:00–09:29.
     """
-    if not mins:
+    today = date.today()
+    start = datetime(today.year, today.month, today.day, 4, 0, tzinfo=eastern)
+    end = datetime(today.year, today.month, today.day, 9, 29, tzinfo=eastern)
+
+    try:
+        bars = list(
+            _client.list_aggs(
+                ticker=sym,
+                multiplier=1,
+                timespan="minute",
+                from_=start.isoformat(),
+                to=end.isoformat(),
+                limit=2000,
+            )
+        )
+    except Exception as e:
+        print(f"[premarket] minute fetch failed for {sym}: {e}")
         return 0.0, 0.0, 0.0, 0.0
 
-    pre_high = max(float(b.high) for b in mins)
-    pre_low = min(float(b.low) for b in mins)
-    last_px = float(mins[-1].close)
+    if not bars:
+        return 0.0, 0.0, 0.0, 0.0
 
-    if prev_close > 0:
-        move_pct = (last_px - prev_close) / prev_close * 100.0
-    else:
-        move_pct = 0.0
+    lows = [float(b.low) for b in bars]
+    highs = [float(b.high) for b in bars]
+    vols = [float(b.volume) for b in bars]
 
-    return last_px, pre_high, pre_low, move_pct
+    pre_low = min(lows)
+    pre_high = max(highs)
+    pre_last = float(bars[-1].close)
+    pre_vol = sum(vols)
 
+    return pre_low, pre_high, pre_last, pre_vol
 
-# ---- Main bot ----
 
 async def run_premarket():
     """
-    Premarket Runner:
+    Premarket Runner Bot:
 
-      • +MIN_PREMARKET_MOVE_PCT% or more vs yesterday close
-      • Price >= MIN_PREMARKET_PRICE
-      • Day RVOL >= max(MIN_PREMARKET_RVOL, MIN_RVOL_GLOBAL)
-      • Day volume >= MIN_VOLUME_GLOBAL
-      • Premarket dollar volume >= MIN_PREMARKET_DOLLAR_VOL
-      • Only between 4:00–9:29 AM EST
-      • Each symbol alerts at most once per day
+      • Runs only 04:00–09:29 ET.
+      • Universe: dynamic top-volume list (or TICKER_UNIVERSE if provided).
+      • Requirements:
+          - Price >= MIN_PREMARKET_PRICE
+          - |Move vs prior close| >= MIN_PREMARKET_MOVE_PCT
+          - Premarket dollar volume >= MIN_PREMARKET_DOLLAR_VOL
+          - Day RVOL (partial) >= max(MIN_PREMARKET_RVOL, MIN_RVOL_GLOBAL)
+          - Day volume so far >= MIN_VOLUME_GLOBAL
+      • Per symbol: only one alert per day.
     """
-    if not POLYGON_KEY:
-        print("[premarket] POLYGON_KEY not set; skipping scan.")
+    if not POLYGON_KEY or not _client:
+        print("[premarket] No POLYGON_KEY/client; skipping.")
         return
-    if not _client:
-        print("[premarket] Client not initialized; skipping scan.")
-        return
+
     if not _in_premarket_window():
-        print("[premarket] Outside 4:00–9:29 window; skipping scan.")
+        print("[premarket] Outside premarket window; skipping.")
         return
 
     _reset_if_new_day()
 
-    universe = _get_ticker_universe()
+    universe = _get_universe()
     today = date.today()
     today_s = today.isoformat()
 
     for sym in universe:
         if is_etf_blacklisted(sym):
             continue
-        if _already_alerted(sym):
+        if _already(sym):
             continue
 
-        # --- Daily bars for prev close + RVOL baseline ---
+        prev_bar, today_bar = _get_prev_and_today(sym)
+        if not prev_bar or not today_bar:
+            continue
+
+        prev_close = float(prev_bar.close)
+        if prev_close <= 0:
+            continue
+
+        # Day volume so far (partial, because it's still premarket)
+        todays_partial_vol = float(today_bar.volume)
+
+        # Premarket minute bars
+        pre_low, pre_high, last_px, pre_vol = _get_premarket_window_aggs(sym)
+        if last_px <= 0 or pre_vol <= 0:
+            continue
+
+        if last_px < MIN_PREMARKET_PRICE:
+            continue
+
+        move_pct = (last_px - prev_close) / prev_close * 100.0
+        if abs(move_pct) < MIN_PREMARKET_MOVE_PCT:
+            continue
+
+        pre_dollar_vol = last_px * pre_vol
+        if pre_dollar_vol < MIN_PREMARKET_DOLLAR_VOL:
+            continue
+
+        # Day RVOL (partial)
         try:
             days = list(
                 _client.list_aggs(
@@ -154,24 +205,16 @@ async def run_premarket():
                     timespan="day",
                     from_=(today - timedelta(days=40)).isoformat(),
                     to=today_s,
-                    limit=50,
+                    limit=40,
                 )
             )
         except Exception as e:
-            print(f"[premarket] daily fetch failed for {sym}: {e}")
+            print(f"[premarket] extra daily fetch failed for {sym}: {e}")
             continue
 
         if len(days) < 2:
             continue
 
-        today_bar = days[-1]
-        prev_bar = days[-2]
-
-        prev_close = float(prev_bar.close)
-        if prev_close <= 0:
-            continue
-
-        # RVOL based on partial day volume vs historical full days
         hist = days[:-1]
         if hist:
             recent = hist[-20:] if len(hist) > 20 else hist
@@ -179,7 +222,6 @@ async def run_premarket():
         else:
             avg_vol = float(today_bar.volume)
 
-        todays_partial_vol = float(today_bar.volume)
         if avg_vol > 0:
             rvol = todays_partial_vol / avg_vol
         else:
@@ -191,40 +233,11 @@ async def run_premarket():
         if todays_partial_vol < MIN_VOLUME_GLOBAL:
             continue
 
-        # --- Minute bars for true premarket move/volume ---
-        try:
-            mins_all = list(
-                _client.list_aggs(
-                    ticker=sym,
-                    multiplier=1,
-                    timespan="minute",
-                    from_=today_s,
-                    to=today_s,
-                    limit=10_000,
-                )
-            )
-        except Exception as e:
-            print(f"[premarket] minute fetch failed for {sym}: {e}")
-            continue
+        dollar_vol_day_partial = last_px * todays_partial_vol
 
-        premins = _filter_premarket_minutes(mins_all)
-        if not premins:
-            continue
-
-        last_px, pre_high, pre_low, move_pct = _premarket_stats(premins, prev_close)
-        if last_px < MIN_PREMARKET_PRICE:
-            continue
-
-        if abs(move_pct) < MIN_PREMARKET_MOVE_PCT:
-            continue
-
-        pre_vol = float(sum(b.volume for b in premins))
-        pre_dollar_vol = last_px * pre_vol
-        if pre_dollar_vol < MIN_PREMARKET_DOLLAR_VOL:
-            continue
-
-        dv = last_px * todays_partial_vol
-        grade = grade_equity_setup(abs(move_pct), rvol, dv)
+        # Grade & bias
+        gap_pct = move_pct
+        grade = grade_equity_setup(abs(gap_pct), rvol, dollar_vol_day_partial)
 
         direction = "up" if move_pct > 0 else "down"
         emoji = "🚀" if move_pct > 0 else "⚠️"
@@ -234,7 +247,12 @@ async def run_premarket():
             else "Watch for continuation / short setup on weakness"
         )
 
+        header_emoji = "📣"
         extra = (
+            f"{header_emoji} PREMARKET — {sym}\n"
+            f"🕒 {now_est()}\n"
+            f"💰 ${last_px:.2f} · 📊 RVOL {rvol:.1f}x\n"
+            "────────────\n"
             f"{emoji} Premarket move: {move_pct:.1f}% {direction} vs prior close\n"
             f"📈 Prev Close: ${prev_close:.2f} → Premarket Last: ${last_px:.2f}\n"
             f"📏 Premarket Range: ${pre_low:.2f} – ${pre_high:.2f}\n"
