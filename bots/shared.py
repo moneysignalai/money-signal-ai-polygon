@@ -1,9 +1,10 @@
-# bots/shared.py — MoneySignalAI shared helpers (with 3-minute universe cache)
+# bots/shared.py — MoneySignalAI (Universe cache + Option-chain cache)
 
 import os
 import math
+import time
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Dict, Any
 
 import requests
 import pytz
@@ -18,254 +19,216 @@ def now_est() -> str:
     return datetime.now(eastern).strftime("%I:%M %p EST · %b %d").lstrip("0")
 
 
-# Core ENV
+# ---------------- ENV ----------------
+
 POLYGON_KEY = os.getenv("POLYGON_KEY", "")
 
-# Global filters (can be overridden in Render ENV)
 MIN_RVOL_GLOBAL = float(os.getenv("MIN_RVOL_GLOBAL", "2.5"))
 MIN_VOLUME_GLOBAL = float(os.getenv("MIN_VOLUME_GLOBAL", "800000"))
 
-# Telegram
 TELEGRAM_TOKEN_ALERTS = os.getenv("TELEGRAM_TOKEN_ALERTS", "")
 TELEGRAM_CHAT_ALL = os.getenv("TELEGRAM_CHAT_ALL", "")
 
 TELEGRAM_TOKEN_STATUS = os.getenv("TELEGRAM_TOKEN_STATUS", "")
-TELEGRAM_CHAT_STATUS = os.getenv("TELEGRAM_CHAT_STATUS", "")  # optional, else falls back to CHAT_ALL
+TELEGRAM_CHAT_STATUS = os.getenv("TELEGRAM_CHAT_STATUS", "")
 
 TELEGRAM_API_BASE = "https://api.telegram.org"
 
 
-# ---------------- TELEGRAM HELPERS ----------------
+# ---------------- TELEGRAM ----------------
 
 def _send_telegram_raw(token: str, chat_id: str, text: str) -> None:
-    """Low-level Telegram send; prints to console if misconfigured."""
     if not token or not chat_id:
-        print("[telegram] missing token/chat_id — dumping message:")
-        print(text)
+        print("[telegram] Missing token/chat_id\n" + text)
         return
 
     url = f"{TELEGRAM_API_BASE}/bot{token}/sendMessage"
     payload = {
         "chat_id": chat_id,
         "text": text,
-        "parse_mode": "Markdown",
+        "parse_mode": "Markdown"
     }
+
     try:
-        resp = requests.post(url, data=payload, timeout=10)
-        if not resp.ok:
-            print(f"[telegram] send failed {resp.status_code}: {resp.text}")
+        r = requests.post(url, data=payload, timeout=10)
+        if not r.ok:
+            print(f"[telegram] send failed: {r.status_code} — {r.text}")
     except Exception as e:
         print(f"[telegram] exception: {e}")
 
 
-def send_alert(bot_name: str, ticker: str, price: float, rvol: float, extra: str = ""):
-    """
-    Main alert function used by all bots.
-
-    • If `extra` is provided, it's treated as the FULL message (we don't wrap it).
-    • If `extra` is empty, we send a simple generic header.
-    """
+def send_alert(bot: str, ticker: str, price: float, rvol: float, extra=""):
     if extra:
-        text = extra
+        msg = extra
     else:
-        header = f"🔔 {bot_name.upper()} — {ticker}\n"
-        meta = f"💰 ${price:.2f} · RVOL {rvol:.1f}x\n"
-        text = header + meta
+        msg = (
+            f"🔔 *{bot.upper()} — {ticker}*\n"
+            f"💰 ${price:.2f} · RVOL {rvol:.1f}x"
+        )
 
-    _send_telegram_raw(TELEGRAM_TOKEN_ALERTS, TELEGRAM_CHAT_ALL, text)
+    _send_telegram_raw(TELEGRAM_TOKEN_ALERTS, TELEGRAM_CHAT_ALL, msg)
 
 
-def send_status(message: str) -> None:
-    """Optional: send status/health pings via TELEGRAM_TOKEN_STATUS."""
+def send_status(message: str):
     token = TELEGRAM_TOKEN_STATUS or TELEGRAM_TOKEN_ALERTS
-    chat_id = TELEGRAM_CHAT_STATUS or TELEGRAM_CHAT_ALL
-
-    if not token or not chat_id:
-        print("[status] missing token/chat_id, printing message:")
-        print(message)
-        return
-
-    _send_telegram_raw(token, chat_id, message)
+    chat = TELEGRAM_CHAT_STATUS or TELEGRAM_CHAT_ALL
+    _send_telegram_raw(token, chat, message)
 
 
-# ---------------- UTILITIES / UNIVERSE ----------------
+# ---------------- UTILITIES ----------------
 
 def chart_link(ticker: str) -> str:
-    """TradingView chart link."""
     return f"https://www.tradingview.com/chart/?symbol={ticker.upper()}"
 
 
-# Simple ETF/index blacklist so some bots stay focused on single names
 ETF_BLACKLIST = {
-    "SPY",
-    "QQQ",
-    "IWM",
-    "DIA",
-    "VXX",
-    "UVXY",
-    "SPXL",
-    "SPXS",
-    "SQQQ",
-    "TQQQ",
+    "SPY", "QQQ", "IWM", "DIA",
+    "VXX", "UVXY", "SPXL", "SPXS",
+    "SQQQ", "TQQQ"
 }
-
 
 def is_etf_blacklisted(ticker: str) -> bool:
     return ticker.upper() in ETF_BLACKLIST
 
 
-# ---- Universe cache (in-memory, per process) ----
+# ---------------- UNIVERSE CACHE (3 min) ----------------
 
-_UNIVERSE_CACHE: List[str] | None = None
-_UNIVERSE_TS: datetime | None = None
-_UNIVERSE_TTL_SECONDS = int(os.getenv("UNIVERSE_CACHE_TTL", "180"))  # 3 minutes default
+_UNIVERSE_CACHE = None
+_UNIVERSE_TS = None
+_UNIVERSE_TTL = int(os.getenv("UNIVERSE_CACHE_TTL", "180"))
 
 
 def get_dynamic_top_volume_universe(
-    max_tickers: int = 150,
-    volume_coverage: float = 0.95,
+    max_tickers=150, volume_coverage=0.95
 ) -> List[str]:
-    """
-    Dynamic universe builder (with 3-minute cache).
-
-    Priority:
-      1) If TICKER_UNIVERSE is set in ENV, use that list directly.
-      2) Else, if cached universe is younger than UNIVERSE_CACHE_TTL seconds, reuse it.
-      3) Else, call Polygon's snapshot endpoint:
-         /v2/snapshot/locale/us/markets/stocks/tickers
-         and sort by daily volume descending.
-
-    We then pick tickers until we either:
-      • hit `max_tickers`, OR
-      • reach `volume_coverage` of total reported volume.
-    """
     global _UNIVERSE_CACHE, _UNIVERSE_TS
 
-    # 1) Manual override wins
+    # manual override
     manual = os.getenv("TICKER_UNIVERSE")
     if manual:
-        tickers = [x.strip().upper() for x in manual.split(",") if x.strip()]
-        print(f"[shared] using TICKER_UNIVERSE override ({len(tickers)} tickers).")
-        return tickers
+        return [x.strip().upper() for x in manual.split(",")]
 
-    # 2) Cache check
     now = datetime.utcnow()
-    if _UNIVERSE_CACHE is not None and _UNIVERSE_TS is not None:
+    if _UNIVERSE_CACHE and _UNIVERSE_TS:
         age = (now - _UNIVERSE_TS).total_seconds()
-        if age <= _UNIVERSE_TTL_SECONDS:
-            # cached universe is still fresh
-            print(f"[shared] using cached universe ({len(_UNIVERSE_CACHE)} tickers, age {int(age)}s).")
+        if age < _UNIVERSE_TTL:
             return _UNIVERSE_CACHE
-
-    # 3) Fetch from Polygon
-    if not POLYGON_KEY:
-        print("[shared] POLYGON_KEY missing; universe fallback empty.")
-        _UNIVERSE_CACHE = []
-        _UNIVERSE_TS = now
-        return []
 
     url = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
     params = {"apiKey": POLYGON_KEY}
 
     try:
-        resp = requests.get(url, params=params, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        tickers = r.json().get("tickers", [])
     except Exception as e:
-        print(f"[shared] universe fetch failed: {e}")
-        # on failure, keep old cache if it exists
-        if _UNIVERSE_CACHE is not None:
-            print("[shared] falling back to previous cached universe.")
-            return _UNIVERSE_CACHE
-        return []
+        print("[shared] universe fetch failed:", e)
+        return _UNIVERSE_CACHE or []
 
-    tickers_data = data.get("tickers", []) or []
-
-    volumes = []
-    for t in tickers_data:
+    volume_list = []
+    for t in tickers:
         ticker = t.get("ticker")
-        day = t.get("day", {}) or {}
-        vol = day.get("v", 0) or 0
-
+        v = t.get("day", {}).get("v", 0)
         if not ticker:
             continue
+        volume_list.append((ticker, v))
 
-        volumes.append((ticker, vol))
+    volume_list.sort(key=lambda x: x[1], reverse=True)
+    total_vol = sum(v for _, v in volume_list)
 
-    if not volumes:
-        print("[shared] universe: no tickers found in snapshot.")
-        _UNIVERSE_CACHE = []
-        _UNIVERSE_TS = now
-        return []
-
-    # Sort by volume descending
-    volumes.sort(key=lambda x: x[1], reverse=True)
-
-    total_volume = sum(v for _, v in volumes)
-    chosen: List[str] = []
+    picked = []
     running = 0
 
-    for ticker, vol in volumes:
-        chosen.append(ticker)
-        running += vol
-
-        if len(chosen) >= max_tickers:
+    for sym, v in volume_list:
+        picked.append(sym)
+        running += v
+        if len(picked) >= max_tickers:
             break
-        if total_volume > 0 and (running / total_volume) >= volume_coverage:
+        if total_vol > 0 and running / total_vol >= volume_coverage:
             break
 
-    coverage_pct = (running / total_volume * 100) if total_volume else 0.0
-    print(
-        f"[shared] universe built from Polygon: {len(chosen)} tickers, "
-        f"{running:,} / {total_volume:,} volume ({coverage_pct:.1f}%)."
-    )
-
-    _UNIVERSE_CACHE = chosen
+    _UNIVERSE_CACHE = picked
     _UNIVERSE_TS = now
-    return chosen
+
+    return picked
 
 
-# ---------------- GRADING / SCORING ----------------
+# ---------------- OPTION CHAIN CACHE (NEW) ----------------
+
+_OPTION_CACHE: Dict[str, Any] = {}
+_OPTION_CACHE_TTL = 120  # 2 minutes
+
+
+def get_option_chain_cached(ticker: str) -> Any:
+    """
+    Fetches full option chain for a symbol with caching to avoid
+    hitting Polygon 10+ times per minute.
+    """
+    now = time.time()
+
+    if ticker in _OPTION_CACHE:
+        entry = _OPTION_CACHE[ticker]
+        if now - entry["ts"] < _OPTION_CACHE_TTL:
+            return entry["data"]
+
+    url = f"https://api.polygon.io/v3/reference/options/contracts"
+    params = {"underlying_ticker": ticker, "limit": 1000, "apiKey": POLYGON_KEY}
+
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        print(f"[shared] option chain fetch failed for {ticker}: {e}")
+        return _OPTION_CACHE.get(ticker, {}).get("data", None)
+
+    _OPTION_CACHE[ticker] = {"ts": now, "data": data}
+    return data
+
+
+def get_last_option_trades_cached(full_option_symbol: str) -> Any:
+    """Gets last trade for an option with 30-sec cache."""
+    key = f"trade_{full_option_symbol}"
+
+    now = time.time()
+
+    if key in _OPTION_CACHE:
+        entry = _OPTION_CACHE[key]
+        if now - entry["ts"] < 30:
+            return entry["data"]
+
+    url = f"https://api.polygon.io/v2/last/trade/{full_option_symbol}"
+    params = {"apiKey": POLYGON_KEY}
+
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        print(f"[shared] last option trade failed for {full_option_symbol}: {e}")
+        return None
+
+    _OPTION_CACHE[key] = {"ts": now, "data": data}
+    return data
+
+
+# ---------------- GRADER ----------------
 
 def grade_equity_setup(move_pct: float, rvol: float, dollar_vol: float) -> str:
-    """
-    Rough letter grade for equity setups.
-
-    • move_pct: abs(% move today)
-    • rvol: relative volume (current / avg)
-    • dollar_vol: price * volume (approx)
-
-    Returns: "A+", "A", "B", or "C"
-    """
     score = 0
 
-    # Move component
-    if move_pct >= 3:
-        score += 1
-    if move_pct >= 7:
-        score += 1
-    if move_pct >= 12:
-        score += 1
+    if move_pct >= 3: score += 1
+    if move_pct >= 7: score += 1
+    if move_pct >= 12: score += 1
 
-    # RVOL component
-    if rvol >= 2:
-        score += 1
-    if rvol >= 4:
-        score += 1
+    if rvol >= 2: score += 1
+    if rvol >= 4: score += 1
 
-    # Dollar volume component
-    if dollar_vol >= 25_000_000:
-        score += 1
-    if dollar_vol >= 75_000_000:
-        score += 1
-    if dollar_vol >= 200_000_000:
-        score += 1
+    if dollar_vol >= 25_000_000: score += 1
+    if dollar_vol >= 75_000_000: score += 1
+    if dollar_vol >= 200_000_000: score += 1
 
-    if score >= 6:
-        return "A+"
-    elif score >= 4:
-        return "A"
-    elif score >= 2:
-        return "B"
-    else:
-        return "C"
+    if score >= 6: return "A+"
+    if score >= 4: return "A"
+    if score >= 2: return "B"
+    return "C"
