@@ -31,11 +31,16 @@ MIN_RVOL_GLOBAL: float = float(os.getenv("MIN_RVOL_GLOBAL", "2.0"))
 MIN_VOLUME_GLOBAL: float = float(os.getenv("MIN_VOLUME_GLOBAL", "500000"))  # shares
 
 # Telegram routing (your env)
+# - TELEGRAM_CHAT_ALL = single private chat ID for everything
+# - TELEGRAM_TOKEN_ALERTS = all-in-one alerts bot
+# - TELEGRAM_TOKEN_STATUS = dedicated status/heartbeat bot
 TELEGRAM_TOKEN_ALERTS = os.getenv("TELEGRAM_TOKEN_ALERTS")
+TELEGRAM_TOKEN_STATUS = os.getenv("TELEGRAM_TOKEN_STATUS")
 TELEGRAM_CHAT_ALL = os.getenv("TELEGRAM_CHAT_ALL")
 
-TELEGRAM_TOKEN_STATUS = os.getenv("TELEGRAM_TOKEN_STATUS")
-TELEGRAM_CHAT_STATUS = os.getenv("TELEGRAM_CHAT_STATUS")  # kept for compatibility, not required
+# Optionally present in your env; not required by the code
+TELEGRAM_CHAT_STATUS = os.getenv("TELEGRAM_CHAT_STATUS")
+
 
 # ---------------- TELEGRAM HELPERS ----------------
 
@@ -74,6 +79,11 @@ def send_alert(bot: str, ticker: str, price: float, rvol: float, extra: str = ""
     Most bots pass a fully formatted `extra` message (with emojis, dividers, etc.).
     In that case we send it as-is. If `extra` is empty, we fall back to a simple
     generic header using bot / ticker / price / rvol.
+
+    Alerts ALWAYS use:
+      - TELEGRAM_TOKEN_ALERTS
+      - TELEGRAM_CHAT_ALL
+      - Markdown formatting
     """
     if extra:
         msg = extra
@@ -83,29 +93,33 @@ def send_alert(bot: str, ticker: str, price: float, rvol: float, extra: str = ""
             f"💰 ${price:.2f} · 📊 RVOL {rvol:.1f}x"
         )
 
-    # Alerts stay Markdown-formatted
-    _send_telegram_raw(TELEGRAM_TOKEN_ALERTS, TELEGRAM_CHAT_ALL, msg, parse_mode="Markdown")
+    _send_telegram_raw(
+        TELEGRAM_TOKEN_ALERTS,
+        TELEGRAM_CHAT_ALL,
+        msg,
+        parse_mode="Markdown",
+    )
 
 
 def send_status(message: str) -> None:
     """Status / heartbeat / error digest messages.
 
-    Prefer the dedicated status bot token if configured; otherwise fall back
-    to the main alerts token. Always send to TELEGRAM_CHAT_ALL so there is
-    a single central status/alert feed.
+    Uses ONLY:
+      - TELEGRAM_TOKEN_STATUS (dedicated status bot)
+      - TELEGRAM_CHAT_ALL (same private chat as alerts)
+      - NO Markdown (plain text), so raw errors / stack traces cannot break it.
 
-    IMPORTANT:
-      Status messages may contain raw stack traces and error strings with
-      underscores, brackets, etc. To avoid Telegram Markdown parse errors
-      (400 "can't parse entities"), we send these as PLAIN TEXT (no Markdown).
+    If TELEGRAM_TOKEN_STATUS or TELEGRAM_CHAT_ALL is missing,
+    we log the status line to stdout and skip Telegram.
     """
-    token = TELEGRAM_TOKEN_STATUS or TELEGRAM_TOKEN_ALERTS
+    token = TELEGRAM_TOKEN_STATUS
     chat = TELEGRAM_CHAT_ALL
+
     if not token or not chat:
-        print(f"[status] (no telegram config) {message}")
+        print(f"[status] (no TELEGRAM_TOKEN_STATUS or TELEGRAM_CHAT_ALL) {message}")
         return
 
-    # No Markdown here → cannot be broken by weird error text
+    # Plain text: avoids 400 "can't parse entities" errors from Telegram
     _send_telegram_raw(token, chat, message, parse_mode=None)
 
 
@@ -123,7 +137,11 @@ _DEFAULT_ETF_BLACKLIST = {
     "XLV",
 }
 
-_env_etf = {s.strip().upper() for s in os.getenv("ETF_BLACKLIST", "").split(",") if s.strip()}
+_env_etf = {
+    s.strip().upper()
+    for s in os.getenv("ETF_BLACKLIST", "").split(",")
+    if s.strip()
+}
 ETF_BLACKLIST = _DEFAULT_ETF_BLACKLIST.union(_env_etf)
 
 
