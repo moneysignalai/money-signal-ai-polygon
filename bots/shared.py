@@ -40,19 +40,26 @@ TELEGRAM_CHAT_STATUS = os.getenv("TELEGRAM_CHAT_STATUS")  # kept for compatibili
 # ---------------- TELEGRAM HELPERS ----------------
 
 
-def _send_telegram_raw(token: Optional[str], chat_id: Optional[str], text: str) -> None:
+def _send_telegram_raw(
+    token: Optional[str],
+    chat_id: Optional[str],
+    text: str,
+    parse_mode: Optional[str] = "Markdown",
+) -> None:
     """Low-level Telegram sender. Logs failures but never raises."""
     if not token or not chat_id:
         print(f"[telegram] missing token/chat_id, message not sent: {text[:160]!r}")
         return
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
+    payload: Dict[str, Any] = {
         "chat_id": chat_id,
         "text": text,
-        "parse_mode": "Markdown",
         "disable_web_page_preview": True,
     }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+
     try:
         r = requests.post(url, json=payload, timeout=10)
         if not r.ok:
@@ -76,7 +83,8 @@ def send_alert(bot: str, ticker: str, price: float, rvol: float, extra: str = ""
             f"💰 ${price:.2f} · 📊 RVOL {rvol:.1f}x"
         )
 
-    _send_telegram_raw(TELEGRAM_TOKEN_ALERTS, TELEGRAM_CHAT_ALL, msg)
+    # Alerts stay Markdown-formatted
+    _send_telegram_raw(TELEGRAM_TOKEN_ALERTS, TELEGRAM_CHAT_ALL, msg, parse_mode="Markdown")
 
 
 def send_status(message: str) -> None:
@@ -85,13 +93,19 @@ def send_status(message: str) -> None:
     Prefer the dedicated status bot token if configured; otherwise fall back
     to the main alerts token. Always send to TELEGRAM_CHAT_ALL so there is
     a single central status/alert feed.
+
+    IMPORTANT: status messages may include raw stack traces and error text with
+    underscores, brackets, etc. To avoid Telegram Markdown parsing errors,
+    we send these as *plain text* (no parse_mode).
     """
     token = TELEGRAM_TOKEN_STATUS or TELEGRAM_TOKEN_ALERTS
     chat = TELEGRAM_CHAT_ALL
     if not token or not chat:
         print(f"[status] (no telegram config) {message}")
         return
-    _send_telegram_raw(token, chat, message)
+
+    # Send as plain text (no Markdown) to avoid 400 "can't parse entities" errors
+    _send_telegram_raw(token, chat, message, parse_mode=None)
 
 
 # ---------------- ETF BLACKLIST ----------------
