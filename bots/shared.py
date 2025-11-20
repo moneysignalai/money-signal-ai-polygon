@@ -1,7 +1,7 @@
 # bots/shared.py — MoneySignalAI core utilities
 #
-# - Telegram alert helpers
-# - Polygon universe helper with 3-min cache
+# - Telegram alert & status helpers
+# - Polygon dynamic universe helper with 3-min cache
 # - Option-chain + last-trade helpers with cache
 # - Common grading / filters
 
@@ -30,7 +30,7 @@ POLYGON_KEY: Optional[str] = os.getenv("POLYGON_KEY") or os.getenv("POLYGON_API_
 MIN_RVOL_GLOBAL: float = float(os.getenv("MIN_RVOL_GLOBAL", "2.0"))
 MIN_VOLUME_GLOBAL: float = float(os.getenv("MIN_VOLUME_GLOBAL", "500000"))  # shares
 
-# Telegram routing
+# Telegram routing (your env)
 TELEGRAM_TOKEN_ALERTS = os.getenv("TELEGRAM_TOKEN_ALERTS")
 TELEGRAM_CHAT_ALL = os.getenv("TELEGRAM_CHAT_ALL")
 
@@ -88,15 +88,16 @@ def send_alert(bot: str, ticker: str, price: float, rvol: float, extra: str = ""
 
 
 def send_status(message: str) -> None:
-    """Status / heartbeat messages.
+    """Status / heartbeat / error digest messages.
 
     Prefer the dedicated status bot token if configured; otherwise fall back
     to the main alerts token. Always send to TELEGRAM_CHAT_ALL so there is
     a single central status/alert feed.
 
-    IMPORTANT: status messages may include raw stack traces and error text with
-    underscores, brackets, etc. To avoid Telegram Markdown parsing errors,
-    we send these as *plain text* (no parse_mode).
+    IMPORTANT:
+      Status messages may contain raw stack traces and error strings with
+      underscores, brackets, etc. To avoid Telegram Markdown parse errors
+      (400 "can't parse entities"), we send these as PLAIN TEXT (no Markdown).
     """
     token = TELEGRAM_TOKEN_STATUS or TELEGRAM_TOKEN_ALERTS
     chat = TELEGRAM_CHAT_ALL
@@ -104,7 +105,7 @@ def send_status(message: str) -> None:
         print(f"[status] (no telegram config) {message}")
         return
 
-    # Send as plain text (no Markdown) to avoid 400 "can't parse entities" errors
+    # No Markdown here → cannot be broken by weird error text
     _send_telegram_raw(token, chat, message, parse_mode=None)
 
 
