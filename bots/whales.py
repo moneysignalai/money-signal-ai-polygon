@@ -1,9 +1,9 @@
-# bots/whales.py — Whale options flow bot (CALL + PUT, $1M+ defaults)
+# bots/whales.py — Whale options flow bot (CALL + PUT, $500k+ defaults)
 #
 # Hunts for:
 #   • Large single-option orders (CALL or PUT)
 #   • Uses Polygon option-chain + last-trade cache from shared.py
-#   • Focused on big notional (defaults: $1M+) and decent size
+#   • Focused on big notional (defaults: $500k+) and decent size
 #
 # One alert per contract per day, formatted in premium Telegram style.
 
@@ -26,125 +26,112 @@ eastern = pytz.timezone("US/Eastern")
 # ---------------- CONFIG (tunable via ENV) ----------------
 
 # Minimum notional for a whale order (price * size * 100)
-MIN_WHALE_NOTIONAL = float(os.getenv("WHALES_MIN_NOTIONAL", "1000000"))  # default $1M+
+MIN_WHALE_NOTIONAL = float(os.getenv("WHALES_MIN_NOTIONAL", "500000"))  # default $500k+
 
-# Minimum contracts in the print
-MIN_WHALE_SIZE = int(os.getenv("WHALES_MIN_SIZE", "100"))  # default 100 contracts
+# Minimum size in contracts
+MIN_WHALE_SIZE = int(os.getenv("WHALES_MIN_SIZE", "50"))  # default 50 contracts
 
 # Maximum DTE to keep focus on nearer-term flow
-MAX_WHALE_DTE = int(os.getenv("WHALES_MAX_DTE", "120"))  # default up to ~6 months
+MAX_WHALE_DTE = int(os.getenv("WHALES_MAX_DTE", "90"))  # default up to ~3 months
 
-# Per-day de-duplication by contract symbol
-_alert_date: date | None = None
-_alerted_contracts: set[str] = set()
+alert_date: date | None = None
+alerted_contracts: set[str] = set()
 
 
 def _reset_day() -> None:
-    global _alert_date, _alerted_contracts
+    global alert_date, alerted_contracts
     today = date.today()
-    if today != _alert_date:
-        _alert_date = today
-        _alerted_contracts = set()
+    if alert_date != today:
+        alert_date = today
+        alerted_contracts = set()
 
 
-def _already(contract: str) -> bool:
-    _reset_day()
-    return contract in _alerted_contracts
+def _already_alerted(contract: str) -> bool:
+    return contract in alerted_contracts
 
 
 def _mark(contract: str) -> None:
-    _reset_day()
-    _alerted_contracts.add(contract)
+    alerted_contracts.add(contract)
 
 
-def _in_rth() -> bool:
-    """Regular trading hours: 09:30–16:00 ET, Mon–Fri."""
-    now = datetime.now(eastern)
-    if now.weekday() >= 5:
-        return False
-    mins = now.hour * 60 + now.minute
-    return 9 * 60 + 30 <= mins < 16 * 60
+def _parse_option_symbol(sym: str):
+    if not sym.startswith("O:"):
+        return None, None, None, None
 
-
-def _calc_dte(expiration: str | None, today: date) -> int | None:
-    if not expiration:
-        return None
     try:
-        exp_d = datetime.strptime(expiration, "%Y-%m-%d").date()
-        return (exp_d - today).days
+        base = sym[2:]
+        under = base[: base.find("2")]
+        rest = base[len(under):]
+
+        exp_raw = rest[:6]      # YYMMDD
+        cp = rest[6]            # C/P
+        strike_raw = rest[7:]   # 000450000
+
+        yy = int("20" + exp_raw[0:2])
+        mm = int(exp_raw[2:4])
+        dd = int(exp_raw[4:6])
+        expiry = datetime(yy, mm, dd).date()
+
+        strike = int(strike_raw) / 1000.0
+
+        return under, expiry, cp, strike
     except Exception:
+        return None, None, None, None
+
+
+def _days_to_expiry(expiry) -> int | None:
+    if not expiry:
         return None
+    today = date.today()
+    return (expiry - today).days
 
 
 async def run_whales():
-    """Whale Flow Bot.
-
-    Logic:
-      • Only scans during RTH (09:30–16:00 ET, Mon–Fri).
-      • Universe: dynamic top-volume tickers (or TICKER_UNIVERSE if set).
-      • For each underlying:
-          - Fetch option chain via get_option_chain_cached(sym).
-          - For each contract:
-              • CALL or PUT
-              • 0 <= DTE <= MAX_WHALE_DTE
-              • Last trade exists via get_last_option_trades_cached(contract)
-              • size >= MIN_WHALE_SIZE
-              • notional >= MIN_WHALE_NOTIONAL
-          - Per-contract per-day de-dupe.
     """
-    if not _in_rth():
-        return
+    Look for very large, single-option whale orders.
+    """
+    _reset_day()
 
-    universe = get_dynamic_top_volume_universe()
+    universe = get_dynamic_top_volume_universe(max_tickers=200, volume_coverage=0.95)
     if not universe:
-        print("[whales] Universe empty; skipping.")
+        print("[whales] empty universe; skipping.")
         return
-
-    today = date.today()
 
     for sym in universe:
         chain = get_option_chain_cached(sym)
         if not chain:
             continue
 
-        results = chain.get("results") or chain.get("options") or []
-        if not results:
+        opts = chain.get("result") or chain.get("results") or []
+        if not opts:
             continue
 
-        for opt in results:
-            details = opt.get("details") or {}
-            contract = opt.get("ticker") or opt.get("option_symbol")
-            if not contract:
-                continue
-            contract = str(contract)
-
-            if _already(contract):
+        for opt in opts:
+            contract = opt.get("ticker")
+            if not contract or _already_alerted(contract):
                 continue
 
-            cp_raw = details.get("contract_type")
-            if cp_raw not in ("call", "put"):
+            last_trade = get_last_option_trades_cached(contract)
+            if not last_trade:
                 continue
-            cp = "CALL" if cp_raw == "call" else "PUT"
-
-            dte = _calc_dte(details.get("expiration_date"), today)
-            if dte is None or dte < 0 or dte > MAX_WHALE_DTE:
-                continue
-
-            trade = get_last_option_trades_cached(contract)
-            if not trade:
-                continue
-
-            last = trade.get("results") or {}
-            price = last.get("p")
-            size = last.get("s", 0)
 
             try:
-                price = float(price) if price is not None else None
+                last = last_trade.get("results", [{}])[0]
+            except Exception:
+                continue
+
+            price = last.get("p")
+            size = last.get("s")
+            if price is None or size is None:
+                continue
+
+            try:
+                price = float(price)
                 size = int(size)
             except Exception:
                 continue
 
-            if price is None or price <= 0:
+            if price <= 0:
                 continue
             if size < MIN_WHALE_SIZE:
                 continue
@@ -153,8 +140,18 @@ async def run_whales():
             if notional < MIN_WHALE_NOTIONAL:
                 continue
 
-            # Format alert
-            time_str = now_est()
+            under, expiry, cp_raw, _ = _parse_option_symbol(contract)
+            if not under or not expiry or not cp_raw:
+                continue
+
+            dte = _days_to_expiry(expiry)
+            if dte is None or dte < 0 or dte > MAX_WHALE_DTE:
+                continue
+
+            cp = "CALL" if cp_raw.upper() == "C" else "PUT"
+
+            # Nicely formatted EST timestamp
+            time_str = now_est().strftime("%I:%M %p EST · %b %d").lstrip("0")
 
             extra = (
                 f"🐋 WHALES — {sym}\n"
