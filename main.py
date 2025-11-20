@@ -1,36 +1,12 @@
 import os
 import threading
-import time
 import asyncio
+import importlib
 from datetime import datetime
-import pytz
 
+import pytz
 import uvicorn
 from fastapi import FastAPI
-
-# --------- BOT IMPORTS ---------
-# Core original bots (9-in-1)
-from bots.premarket import run_premarket           # make sure bots/premarket.py exists
-from bots.gap import run_gap
-from bots.orb import run_orb
-from bots.volume import run_volume
-from bots.cheap import run_cheap
-from bots.unusual import run_unusual
-from bots.squeeze import run_squeeze
-from bots.earnings import run_earnings
-from bots.momentum_reversal import run_momentum_reversal
-
-# Status / heartbeat bot (now also exposes error buffer API)
-from bots.status_report import run_status_report, record_bot_error
-
-# New advanced bots
-from bots.whales import run_whales
-from bots.trend_rider import run_trend_rider
-from bots.swing_pullback import run_swing_pullback
-from bots.panic_flush import run_panic_flush
-from bots.dark_pool_radar import run_dark_pool_radar
-from bots.iv_crush import run_iv_crush
-
 
 eastern = pytz.timezone("US/Eastern")
 
@@ -39,7 +15,26 @@ def now_est_str() -> str:
     return datetime.now(eastern).strftime("%I:%M %p EST · %b %d").lstrip("0")
 
 
-app = FastAPI(title="MoneySignalAi — Multi-Bot Suite")
+app = FastAPI(title="MoneySignalAI — Multi-Bot Suite")
+
+# List of all bots: (public_name, module_path, function_name)
+BOTS = [
+    ("premarket", "bots.premarket", "run_premarket"),
+    ("gap", "bots.gap", "run_gap"),
+    ("orb", "bots.orb", "run_orb"),
+    ("volume", "bots.volume", "run_volume"),
+    ("cheap", "bots.cheap", "run_cheap"),
+    ("unusual", "bots.unusual", "run_unusual"),
+    ("squeeze", "bots.squeeze", "run_squeeze"),
+    ("earnings", "bots.earnings", "run_earnings"),
+    ("momentum_reversal", "bots.momentum_reversal", "run_momentum_reversal"),
+    ("whales", "bots.whales", "run_whales"),
+    ("trend_rider", "bots.trend_rider", "run_trend_rider"),
+    ("swing_pullback", "bots.swing_pullback", "run_swing_pullback"),
+    ("panic_flush", "bots.panic_flush", "run_panic_flush"),
+    ("dark_pool_radar", "bots.dark_pool_radar", "run_dark_pool_radar"),
+    ("iv_crush", "bots.iv_crush", "run_iv_crush"),
+]
 
 
 @app.get("/")
@@ -48,124 +43,126 @@ def root():
     return {
         "status": "LIVE",
         "timestamp": now_est_str(),
-        "bots": [
-            "premarket",
-            "gap",
-            "orb",
-            "volume",
-            "cheap",
-            "unusual",
-            "squeeze",
-            "earnings",
-            "momentum_reversal",
-            "whales",
-            "trend_rider",
-            "swing_pullback",
-            "panic_flush",
-            "dark_pool_radar",
-            "iv_crush",
-        ],
+        "bots": [name for name, _, _ in BOTS] + ["status_report"],
     }
 
 
 async def run_all_once():
     """
-    Kick off all bots once.
-
-    IMPORTANT:
-    - Each bot has its own time-window checks inside the file.
-    - This function just calls everything; if it's outside a bot's window,
-      that bot prints "Outside window; skipping" and returns quickly.
+    One full scan cycle:
+      - Dynamically import each bot module.
+      - Schedule all found bot coroutines in parallel.
+      - Also schedule status_report.run_status_report() if available.
+      - Catch *all* exceptions and forward them to status_report.record_bot_error.
     """
-    tasks = [
-        # Core 9
-        run_premarket(),
-        run_gap(),
-        run_orb(),
-        run_volume(),
-        run_cheap(),
-        run_unusual(),
-        run_squeeze(),
-        run_earnings(),
-        run_momentum_reversal(),
+    # Try to import status_report first so we can record errors there.
+    status_mod = None
+    record_error = None
+    run_status = None
 
-        # New bots
-        run_whales(),
-        run_trend_rider(),
-        run_swing_pullback(),
-        run_panic_flush(),
-        run_dark_pool_radar(),
-        run_iv_crush(),
+    try:
+        status_mod = importlib.import_module("bots.status_report")
+        record_error = getattr(status_mod, "record_bot_error", None)
+        run_status = getattr(status_mod, "run_status_report", None)
+    except Exception as e:
+        print("[main] ERROR importing bots.status_report:", e)
+        status_mod = None
 
-        # Status / heartbeat (sends only at specific times)
-        run_status_report(),
-    ]
+    tasks = []
+    names = []
 
+    # Dynamically import and schedule each bot
+    for public_name, module_path, func_name in BOTS:
+        try:
+            mod = importlib.import_module(module_path)
+            fn = getattr(mod, func_name, None)
+            if fn is None:
+                raise AttributeError(f"{module_path}.{func_name} not found")
+
+            coro = fn()
+            tasks.append(coro)
+            names.append(public_name)
+
+        except Exception as e:
+            # Import/config error for this bot → log + report, but do NOT crash the app
+            print(f"[main] ERROR importing/initializing bot {public_name} ({module_path}.{func_name}): {e}")
+            if record_error:
+                try:
+                    record_error(public_name, e)
+                except Exception as inner:
+                    print("[main] ERROR while recording bot import error:", inner)
+
+    # Add status_report as just another async task if available
+    if run_status is not None:
+        try:
+            tasks.append(run_status())
+            names.append("status_report")
+        except Exception as e:
+            print("[main] ERROR scheduling status_report:", e)
+            if record_error:
+                try:
+                    record_error("status_report", e)
+                except Exception as inner:
+                    print("[main] ERROR while recording status_report scheduling error:", inner)
+
+    if not tasks:
+        print("[main] No bot tasks scheduled in this cycle.")
+        return
+
+    # Run all bots concurrently, but capture exceptions as results
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Log any exceptions instead of crashing the loop
-    bot_names = [
-        "premarket",
-        "gap",
-        "orb",
-        "volume",
-        "cheap",
-        "unusual",
-        "squeeze",
-        "earnings",
-        "momentum_reversal",
-        "whales",
-        "trend_rider",
-        "swing_pullback",
-        "panic_flush",
-        "dark_pool_radar",
-        "iv_crush",
-        "status_report",
-    ]
-
-    for name, result in zip(bot_names, results):
+    for name, result in zip(names, results):
         if isinstance(result, Exception):
-            # Log to console for raw debugging
             print(f"[ERROR] Bot {name} raised: {result}")
-            # Also push into the status_report error buffer
-            record_bot_error(name, result)
+            if record_error:
+                try:
+                    record_error(name, result)
+                except Exception as inner:
+                    print("[main] ERROR while recording bot runtime error:", inner)
 
 
-def run_forever():
+async def scheduler_loop(interval_seconds: int = 60):
     """
-    Background loop: runs run_all_once() every 60 seconds.
-
-    - All time filters are implemented inside each bot.
-    - If the market is closed, most bots just return immediately.
+    Main scheduler loop:
+      - Runs run_all_once() every interval_seconds.
+      - Catches any unexpected error at the scheduler level so it never dies.
     """
     cycle = 0
-    print(f"[main] MoneySignalAi multi-bot loop starting at {now_est_str()}")
+    print(f"[main] MoneySignalAI scheduler starting at {now_est_str()}")
+
     while True:
         cycle += 1
         print(
-            f"SCANNING CYCLE #{cycle} — "
+            f"[main] SCANNING CYCLE #{cycle} — "
             "Premarket, Gap, ORB, Volume, Cheap, Unusual, Squeeze, Earnings, "
-            "Momentum, Whales, TrendRider, Pullback, PanicFlush, DarkPool, IV Crush"
+            "Momentum, Whales, TrendRider, Pullback, PanicFlush, DarkPool, IV Crush, Status"
         )
-
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(run_all_once())
-        finally:
-            loop.close()
+            await run_all_once()
+        except Exception as e:
+            # Last-resort catch — we log but keep the scheduler alive
+            print("[main] FATAL error in run_all_once():", e)
 
-        # Adjust this if you want more or less frequency
-        time.sleep(60)
+        await asyncio.sleep(interval_seconds)
+
+
+def _start_background_scheduler():
+    """
+    Starts the asyncio scheduler loop in a dedicated background thread so the
+    FastAPI app (and uvicorn) can still serve HTTP requests.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(scheduler_loop())
 
 
 @app.on_event("startup")
 async def startup_event():
     """
-    When FastAPI starts (Render boot / redeploy), start the scanner loop
-    in a background thread so the HTTP server stays responsive.
+    On FastAPI startup (Render boot/redeploy), spin up the background scheduler thread.
     """
-    threading.Thread(target=run_forever, daemon=True).start()
+    threading.Thread(target=_start_background_scheduler, daemon=True).start()
 
 
 if __name__ == "__main__":
