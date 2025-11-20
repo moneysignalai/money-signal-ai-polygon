@@ -1,4 +1,4 @@
-# bots/shared.py — MoneySignalAi shared helpers
+# bots/shared.py — MoneySignalAI shared helpers
 
 import os
 import math
@@ -28,7 +28,9 @@ MIN_VOLUME_GLOBAL = float(os.getenv("MIN_VOLUME_GLOBAL", "800000"))
 # Telegram
 TELEGRAM_TOKEN_ALERTS = os.getenv("TELEGRAM_TOKEN_ALERTS", "")
 TELEGRAM_CHAT_ALL = os.getenv("TELEGRAM_CHAT_ALL", "")
+
 TELEGRAM_TOKEN_STATUS = os.getenv("TELEGRAM_TOKEN_STATUS", "")
+TELEGRAM_CHAT_STATUS = os.getenv("TELEGRAM_CHAT_STATUS", "")  # optional, else falls back to CHAT_ALL
 
 TELEGRAM_API_BASE = "https://api.telegram.org"
 
@@ -75,23 +77,25 @@ def send_alert(bot_name: str, ticker: str, price: float, rvol: float, extra: str
 
 def send_status(message: str) -> None:
     """Optional: send status/health pings via TELEGRAM_TOKEN_STATUS."""
-    token = TELEGRAM_TOKEN_STATUS
-    chat_id = os.getenv("TELEGRAM_CHAT_STATUS", "") or TELEGRAM_CHAT_ALL
+    token = TELEGRAM_TOKEN_STATUS or TELEGRAM_TOKEN_ALERTS
+    chat_id = TELEGRAM_CHAT_STATUS or TELEGRAM_CHAT_ALL
+
     if not token or not chat_id:
         print("[status] missing token/chat_id, printing message:")
         print(message)
         return
+
     _send_telegram_raw(token, chat_id, message)
 
 
-# ---------------- UNIVERSE / UTILITIES ----------------
+# ---------------- UTILITIES / UNIVERSE ----------------
 
 def chart_link(ticker: str) -> str:
     """TradingView chart link."""
     return f"https://www.tradingview.com/chart/?symbol={ticker.upper()}"
 
 
-# Very simple ETF/index blacklist so some bots stay focused on single names
+# Simple ETF/index blacklist so some bots stay focused on single names
 ETF_BLACKLIST = {
     "SPY",
     "QQQ",
@@ -115,51 +119,78 @@ def get_dynamic_top_volume_universe(
     volume_coverage: float = 0.95,
 ) -> List[str]:
     """
-    Build a dynamic universe based on Polygon's 'most active' snapshot.
+    Dynamic universe builder.
 
-    • Pulls /v2/snapshot/locale/us/markets/stocks/mostactive
-    • Ranks by volume (shares)
-    • Stops when either:
-        - we hit `max_tickers`, OR
-        - cumulative volume >= `volume_coverage` of total.
+    Priority:
+      1) If TICKER_UNIVERSE is set in ENV, use that list directly.
+      2) Otherwise, call Polygon's snapshot endpoint:
+         /v2/snapshot/locale/us/markets/stocks/tickers
+         and sort by daily volume descending.
+
+    We then pick tickers until we either:
+      • hit `max_tickers`, OR
+      • reach `volume_coverage` of total reported volume.
     """
+    # 1) Manual override
+    manual = os.getenv("TICKER_UNIVERSE")
+    if manual:
+        tickers = [x.strip().upper() for x in manual.split(",") if x.strip()]
+        print(f"[shared] using TICKER_UNIVERSE override ({len(tickers)} tickers).")
+        return tickers
+
+    # 2) Dynamic from Polygon
     if not POLYGON_KEY:
-        print("[shared] POLYGON_KEY missing; universe fallback to empty list.")
+        print("[shared] POLYGON_KEY missing; universe fallback empty.")
         return []
 
-    url = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/mostactive"
+    url = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
     params = {"apiKey": POLYGON_KEY}
+
     try:
-        resp = requests.get(url, params=params, timeout=10)
+        resp = requests.get(url, params=params, timeout=15)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
-        print(f"[shared] failed to fetch most active universe: {e}")
+        print(f"[shared] universe fetch failed: {e}")
         return []
 
     tickers_data = data.get("tickers", []) or []
-    # Sort by raw volume descending
-    tickers_data.sort(key=lambda x: x.get("day", {}).get("v", 0), reverse=True)
 
-    total_vol = sum(x.get("day", {}).get("v", 0) for x in tickers_data)
-    picked: List[str] = []
-    running_vol = 0
+    volumes = []
+    for t in tickers_data:
+        ticker = t.get("ticker")
+        day = t.get("day", {}) or {}
+        vol = day.get("v", 0) or 0
 
-    for row in tickers_data:
-        sym = row.get("ticker")
-        if not sym:
+        if not ticker:
             continue
-        v = row.get("day", {}).get("v", 0) or 0
 
-        picked.append(sym)
-        running_vol += v
+        volumes.append((ticker, vol))
 
-        if len(picked) >= max_tickers:
+    if not volumes:
+        print("[shared] universe: no tickers found in snapshot.")
+        return []
+
+    # Sort by volume descending
+    volumes.sort(key=lambda x: x[1], reverse=True)
+
+    total_volume = sum(v for _, v in volumes)
+    chosen: List[str] = []
+    running = 0
+
+    for ticker, vol in volumes:
+        chosen.append(ticker)
+        running += vol
+
+        if len(chosen) >= max_tickers:
             break
-        if total_vol > 0 and (running_vol / total_vol) >= volume_coverage:
+        if total_volume > 0 and (running / total_volume) >= volume_coverage:
             break
 
-    return picked
+    print(f"[shared] universe built: {len(chosen)} tickers, "
+          f"{running:,} / {total_volume:,} volume ({(running / total_volume * 100) if total_volume else 0:.1f}%).")
+
+    return chosen
 
 
 # ---------------- GRADING / SCORING ----------------
