@@ -18,23 +18,20 @@ from bots.shared import (
     grade_equity_setup,
     is_etf_blacklisted,
     chart_link,
+    now_est,
 )
 
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
-
 eastern = pytz.timezone("US/Eastern")
 
-# Gap thresholds (% of prior close)
+MIN_GAP_PRICE = float(os.getenv("MIN_GAP_PRICE", "2.0"))
 MIN_GAP_PCT = float(os.getenv("MIN_GAP_PCT", "4.0"))      # min |gap|
-MAX_GAP_PCT = float(os.getenv("MAX_GAP_PCT", "35.0"))     # max |gap|
-MIN_GAP_PRICE = float(os.getenv("MIN_GAP_PRICE", "2.0"))  # min last price
-MIN_GAP_RVOL = float(os.getenv("MIN_GAP_RVOL", "2.5"))    # min RVOL
+MAX_GAP_PCT = float(os.getenv("MAX_GAP_PCT", "35.0"))     # cap crazy microcaps
+MIN_GAP_RVOL = float(os.getenv("MIN_GAP_RVOL", "2.0"))
+MIN_GAP_DOLLAR_VOL = float(os.getenv("MIN_GAP_DOLLAR_VOL", "5000000"))  # $5M+
 
-_last_gap_run_date: date | None = None  # ensure only one run per trading day
-
-
+# Only 9:30–10:30
 def _in_gap_window() -> bool:
-    """Only run 9:30–10:30 AM EST."""
     now_et = datetime.now(eastern)
     minutes = now_et.hour * 60 + now_et.minute
     return 9 * 60 + 30 <= minutes <= 10 * 60 + 30
@@ -59,25 +56,15 @@ async def run_gap():
       • Only during 9:30–10:30 AM EST
       • Only runs once per calendar day per container
     """
-    global _last_gap_run_date
-
-    if not POLYGON_KEY:
-        print("[gap] POLYGON_KEY not set; skipping scan.")
-        return
-    if not _client:
-        print("[gap] Client not initialized; skipping scan.")
+    if not POLYGON_KEY or not _client:
+        print("[gap] no API key/client; skipping.")
         return
     if not _in_gap_window():
-        print("[gap] Outside 9:30–10:30 window; skipping scan.")
+        print("[gap] outside 9:30–10:30; skipping.")
         return
-
-    today = date.today()
-    if _last_gap_run_date == today:
-        print("[gap] Already ran today; skipping extra scans.")
-        return
-    _last_gap_run_date = today
 
     universe = _get_ticker_universe()
+    today = date.today()
     today_s = today.isoformat()
 
     for sym in universe:
@@ -111,72 +98,85 @@ async def run_gap():
 
         open_today = float(today_bar.open)
         last_price = float(today_bar.close)
+        day_high = float(today_bar.high)
+        day_low = float(today_bar.low)
+        vol_today = float(today_bar.volume)
+
         if last_price < MIN_GAP_PRICE:
             continue
 
-        # gap % (open vs prev close)
+        # basic gap stats
         gap_pct = (open_today - prev_close) / prev_close * 100.0
-        gap_mag = abs(gap_pct)
-
-        # Both directions allowed, but magnitude must be in band
-        if not (MIN_GAP_PCT <= gap_mag <= MAX_GAP_PCT):
+        if abs(gap_pct) < MIN_GAP_PCT or abs(gap_pct) > MAX_GAP_PCT:
             continue
 
-        # RVOL check (day level)
+        intraday_pct = (
+            (last_price - open_today) / open_today * 100.0
+            if open_today > 0
+            else 0.0
+        )
+        total_move_pct = (last_price - prev_close) / prev_close * 100.0
+
+        # RVOL
         hist = days[:-1]
         if hist:
             recent = hist[-20:] if len(hist) > 20 else hist
             avg_vol = float(sum(d.volume for d in recent)) / len(recent)
         else:
-            avg_vol = float(today_bar.volume)
+            avg_vol = vol_today
 
         if avg_vol > 0:
-            rvol = float(today_bar.volume) / avg_vol
+            rvol = vol_today / avg_vol
         else:
             rvol = 1.0
 
         if rvol < max(MIN_GAP_RVOL, MIN_RVOL_GLOBAL):
             continue
-
-        vol_today = float(today_bar.volume)
         if vol_today < MIN_VOLUME_GLOBAL:
             continue
 
-        total_move_pct = (last_price - prev_close) / prev_close * 100.0
-        intraday_pct = (
-            (last_price - open_today) / open_today * 100.0
-            if open_today > 0 else 0.0
-        )
+        dollar_vol = last_price * vol_today
+        if dollar_vol < MIN_GAP_DOLLAR_VOL:
+            continue
 
-        dv = last_price * vol_today
-        grade = grade_equity_setup(abs(total_move_pct), rvol, dv)
+        grade = grade_equity_setup(abs(total_move_pct), rvol, dollar_vol)
 
-        # Direction-specific bias + emoji
         if gap_pct > 0:
-            direction = "Gap-Up"
             emoji = "🚀"
-            bias = (
-                "Long gap-and-go momentum"
-                if total_move_pct > 0
-                else "Gap-up with weak follow-through (fade risk)"
-            )
+            direction = "Gap-up"
+            if intraday_pct > 0:
+                bias = "Gap-and-go long setup"
+            else:
+                bias = "Gap-up being faded (possible short)"
         else:
-            direction = "Gap-Down"
             emoji = "⚠️"
-            bias = (
-                "Short / continuation gap-down"
-                if total_move_pct < 0
-                else "Gap-down being bought (possible reversal)"
-            )
+            direction = "Gap-down"
+            if intraday_pct < 0:
+                bias = "Gap-down continuation short"
+            else:
+                bias = (
+                    "Gap-down being bought (possible reversal)"
+                    if total_move_pct < 0
+                    else "Gap-down being bought (possible reversal)"
+                )
 
-        extra = (
+        body = (
             f"{emoji} {direction}: {gap_pct:.1f}% vs prior close\n"
             f"📈 Prev Close: ${prev_close:.2f} → Open: ${open_today:.2f} → Last: ${last_price:.2f}\n"
             f"📊 Intraday from open: {intraday_pct:.1f}% · Total move: {total_move_pct:.1f}%\n"
+            f"📏 Day Range: Low ${day_low:.2f} – High ${day_high:.2f}\n"
             f"📦 Day Volume: {int(vol_today):,}\n"
             f"🎯 Setup Grade: {grade}\n"
             f"📌 Bias: {bias}\n"
             f"🔗 Chart: {chart_link(sym)}"
+        )
+
+        extra = (
+            f"📣 GAP — {sym}\n"
+            f"🕒 {now_est()}\n"
+            f"💰 ${last_price:.2f} · 📊 RVOL {rvol:.1f}x\n"
+            "────────────\n"
+            f"{body}"
         )
 
         send_alert("gap", sym, last_price, rvol, extra=extra)
