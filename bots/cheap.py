@@ -3,7 +3,7 @@
 # Hunts for:
 #   • 0–3 DTE CALLs & PUTs
 #   • Underlying in a reasonable price band (defaults: $3–$120)
-#   • Cheap premium (defaults: <= $0.40)
+#   • Cheap premium (defaults: <= $1.00)
 #   • Real flow: min volume + min notional
 #
 # One alert per contract per day, formatted in the premium Telegram style.
@@ -26,25 +26,23 @@ from bots.shared import (
     send_alert,
     get_dynamic_top_volume_universe,
     is_etf_blacklisted,
+    grade_equity_setup,
     chart_link,
     now_est,
-    get_option_chain_cached,
 )
 
-_client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 eastern = pytz.timezone("US/Eastern")
+_client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
-# ---------------- CONFIG ----------------
+# ------------- CONFIG (with ENV overrides) -------------
 
-# Underlying filters
 MIN_UNDERLYING_PRICE = float(os.getenv("CHEAP_MIN_UNDERLYING_PRICE", "3.0"))
 MAX_UNDERLYING_PRICE = float(os.getenv("CHEAP_MAX_UNDERLYING_PRICE", "120.0"))
-
-# Option filters
 MAX_CHEAP_DTE = int(os.getenv("CHEAP_MAX_DTE", "3"))  # 0–3 DTE by default
-MAX_OPTION_PRICE = float(os.getenv("CHEAP_MAX_OPTION_PRICE", "0.40"))  # premium <= $0.40
-MIN_OPTION_VOLUME = float(os.getenv("CHEAP_MIN_OPTION_VOLUME", "200"))  # contracts
-MIN_OPTION_NOTIONAL = float(os.getenv("CHEAP_MIN_OPTION_NOTIONAL", "10000"))  # $10k+
+
+MAX_OPTION_PRICE = float(os.getenv("CHEAP_MAX_OPTION_PRICE", "1.00"))  # premium <= $1.00
+MIN_OPTION_VOLUME = float(os.getenv("CHEAP_MIN_OPTION_VOLUME", "100"))  # contracts
+MIN_OPTION_NOTIONAL = float(os.getenv("CHEAP_MIN_OPTION_NOTIONAL", "5000"))  # $5k+
 
 # Time window (RTH only: 09:30–16:00 ET)
 CHEAP_START_MIN = 9 * 60 + 30
@@ -63,18 +61,15 @@ def _reset_if_new_day() -> None:
         _alerted_contracts = set()
 
 
-def _already_alerted_contract(contract: str) -> bool:
-    _reset_if_new_day()
+def _already_alerted(contract: str) -> bool:
     return contract in _alerted_contracts
 
 
 def _mark_alerted_contract(contract: str) -> None:
-    _reset_if_new_day()
     _alerted_contracts.add(contract)
 
 
-def _in_cheap_window() -> bool:
-    """Only scan 09:30–16:00 ET on weekdays."""
+def _in_trading_window() -> bool:
     now_et = datetime.now(eastern)
     if now_et.weekday() >= 5:  # 0=Mon, 6=Sun
         return False
@@ -89,260 +84,186 @@ def _get_universe() -> List[str]:
     return get_dynamic_top_volume_universe(max_tickers=100, volume_coverage=0.90)
 
 
-def _parse_dte(expiration: Optional[str], today: date) -> Optional[int]:
-    if not expiration:
-        return None
+def _parse_dte(expiry: str) -> int | None:
     try:
-        # expiration_date is usually "YYYY-MM-DD"
-        exp_d = datetime.strptime(expiration, "%Y-%m-%d").date()
-        return (exp_d - today).days
+        dt = datetime.strptime(expiry, "%Y-%m-%d").date()
+        return (dt - date.today()).days
     except Exception:
         return None
 
 
-def _extract_underlying_price(opt: Dict[str, Any]) -> Optional[float]:
-    ua = opt.get("underlying_asset") or {}
-    cand = ua.get("price") or ua.get("underlying_price") or opt.get("underlying_price")
-    try:
-        if cand is None:
-            return None
-        px = float(cand)
-        if px <= 0:
-            return None
-        return px
-    except Exception:
-        return None
-
-
-def _extract_option_metrics(opt: Dict[str, Any]) -> Tuple[Optional[float], float, float]:
-    """
-    Returns (last_price, volume, notional_per_100) where:
-      - last_price may be None if we can't infer a reasonable price.
-      - volume is contracts volume.
-      - notional assumes last_price * volume * 100.
-    """
-    # Polygon option snapshot can have several price fields; we prefer last_trade_price.
-    last_px = None
-
-    # Try "last_quote" then "last_trade" then direct "price"
-    last_trade = opt.get("last_trade") or {}
-    last_quote = opt.get("last_quote") or {}
-
-    # Priority: last trade price, then mid-quote, then bid/ask, then price
-    if "price" in last_trade and last_trade.get("price") is not None:
-        last_px = float(last_trade["price"])
-    else:
-        bid = last_quote.get("bid")
-        ask = last_quote.get("ask")
-        if bid is not None and ask is not None and bid > 0 and ask > 0:
-            last_px = (float(bid) + float(ask)) / 2.0
-        elif bid is not None and bid > 0:
-            last_px = float(bid)
-        elif ask is not None and ask > 0:
-            last_px = float(ask)
-        elif "price" in opt and opt.get("price") is not None:
-            last_px = float(opt["price"])
-
-    # Volume
-    volume = float(opt.get("day", {}).get("volume") or opt.get("volume") or 0.0)
-    notional = 0.0
-    if last_px is not None:
-        notional = last_px * volume * 100.0
-
-    return last_px, volume, notional
-
-
-def _within_underlying_band(price: float) -> bool:
-    return MIN_UNDERLYING_PRICE <= price <= MAX_UNDERLYING_PRICE
-
-
-def _within_option_filters(
-    dte: int,
-    last_price: Optional[float],
-    volume: float,
-    notional: float,
-) -> bool:
-    if dte < 0 or dte > MAX_CHEAP_DTE:
-        return False
-    if last_price is None or last_price <= 0:
-        return False
-    if last_price > MAX_OPTION_PRICE:
-        return False
-    if volume < MIN_OPTION_VOLUME:
-        return False
-    if notional < MIN_OPTION_NOTIONAL:
-        return False
-    return True
-
-
-def _nearest_strike(opt: Dict[str, Any]) -> Optional[float]:
-    try:
-        details = opt.get("details") or {}
-        strike = details.get("strike_price") or opt.get("strike_price")
-        if strike is None:
-            return None
-        return float(strike)
-    except Exception:
-        return None
-
-
-def _option_type_label(opt: Dict[str, Any]) -> str:
-    details = opt.get("details") or {}
-    t = details.get("contract_type") or opt.get("contract_type") or ""
-    t = str(t).lower()
-    if t == "call":
-        return "CALL"
-    if t == "put":
-        return "PUT"
-    return "OPT"
-
-
-def _distance_from_money(under_px: float, strike: Optional[float]) -> Tuple[str, float]:
-    """
-    Returns:
-      label: "ATM / ITM / OTM"
-      dist_pct: abs(strike - underlying) / underlying * 100
-    """
-    if strike is None or under_px <= 0:
-        return "N/A", 0.0
-
-    dist_pct = abs(strike - under_px) / under_px * 100.0
-
-    if dist_pct < 1.0:
-        label = "ATM"
-    elif strike < under_px:
-        label = "ITM"  # in-the-money for calls (approx)
-    else:
-        label = "OTM"
-    return label, dist_pct
+def _filter_underlying(under_px: float) -> bool:
+    return MIN_UNDERLYING_PRICE <= under_px <= MAX_UNDERLYING_PRICE
 
 
 async def run_cheap():
     """
-    Cheap 0–3 DTE options bot.
-
-    Logic:
-      • Runs 09:30–16:00 ET on weekdays.
-      • Universe: dynamic top-volume stocks (or TICKER_UNIVERSE if set).
-      • For each underlying:
-          - Underlying price between MIN_UNDERLYING_PRICE and MAX_UNDERLYING_PRICE.
-          - Fetch snapshot option chain (via get_option_chain_cached).
-          - For each option result:
-              • Contract type: CALL or PUT
-              • DTE in [0, MAX_CHEAP_DTE]
-              • Option last/avg price <= MAX_OPTION_PRICE
-              • Volume >= MIN_OPTION_VOLUME
-              • Notional >= MIN_OPTION_NOTIONAL
-          - Alert top cheap contract by notional for that underlying, per scan.
-      • De-dupe: each contract symbol alerts at most once per day.
+    Scan the universe for very cheap, short-dated contracts with real size/notional.
     """
-    if not POLYGON_KEY or not _client:
-        print("[cheap] POLYGON_KEY not set or client not initialized; skipping.")
-        return
-
-    if not _in_cheap_window():
-        print("[cheap] Outside 09:30–16:00 window; skipping scan.")
-        return
-
     _reset_if_new_day()
-    today = date.today()
+
+    if not POLYGON_KEY or not _client:
+        print("[cheap] no API key; skipping.")
+        return
+
+    if not _in_trading_window():
+        print("[cheap] outside RTH window; skipping.")
+        return
+
     universe = _get_universe()
+    if not universe:
+        print("[cheap] empty universe; skipping.")
+        return
 
     for sym in universe:
         if is_etf_blacklisted(sym):
             continue
 
-        chain = get_option_chain_cached(sym)
-        if not chain:
+        try:
+            snapshot = _client.get_snapshot_ticker(sym)
+        except Exception as e:
+            print(f"[cheap] snapshot error for {sym}: {e}")
             continue
 
-        results = chain.get("results") or chain.get("options") or []
-        if not results:
+        under_px = getattr(snapshot, "lastTrade", None)
+        if isinstance(under_px, dict):
+            under_px = under_px.get("p")
+        elif hasattr(under_px, "p"):
+            under_px = under_px.p
+
+        if under_px is None:
             continue
 
-        best_candidate: Optional[Dict[str, Any]] = None
-        best_notional = 0.0
-
-        for opt in results:
-            under_px = _extract_underlying_price(opt)
-            if under_px is None:
-                continue
-
-            if not _within_underlying_band(under_px):
-                continue
-
-            details = opt.get("details") or {}
-            expiration = details.get("expiration_date")
-            dte = _parse_dte(expiration, today)
-            if dte is None:
-                continue
-
-            opt_type = _option_type_label(opt)
-            if opt_type not in ("CALL", "PUT"):
-                continue
-
-            last_px, volume, notional = _extract_option_metrics(opt)
-            if not _within_option_filters(dte, last_px, volume, notional):
-                continue
-
-            strike = _nearest_strike(opt)
-            contract_symbol = opt.get("ticker") or opt.get("option_symbol")
-            if not contract_symbol:
-                continue
-            contract_symbol = str(contract_symbol)
-
-            if _already_alerted_contract(contract_symbol):
-                continue
-
-            # Option passed all filters; track best by notional for this underlying
-            if notional > best_notional:
-                best_notional = notional
-                best_candidate = {
-                    "contract": contract_symbol,
-                    "opt_type": opt_type,
-                    "dte": dte,
-                    "strike": strike,
-                    "under_px": under_px,
-                    "last_px": last_px,
-                    "volume": volume,
-                    "notional": notional,
-                }
-
-        if not best_candidate:
+        try:
+            under_px = float(under_px)
+        except Exception:
             continue
 
-        contract = best_candidate["contract"]
-        opt_type = best_candidate["opt_type"]
-        dte = best_candidate["dte"]
-        strike = best_candidate["strike"]
-        under_px = best_candidate["under_px"]
-        last_px = best_candidate["last_px"]
-        volume = best_candidate["volume"]
-        notional = best_candidate["notional"]
+        if not _filter_underlying(under_px):
+            continue
 
-        m_label, m_dist = _distance_from_money(under_px, strike)
+        # Minute bars / RVOL gates (using shared MIN_RVOL_GLOBAL / MIN_VOLUME_GLOBAL)
+        try:
+            aggs = _client.list_aggs(
+                sym,
+                1,
+                "minute",
+                date.today().isoformat(),
+                date.today().isoformat(),
+                limit=500,
+                sort="asc",
+            )
+            bars = list(aggs)
+        except Exception as e:
+            print(f"[cheap] agg error for {sym}: {e}")
+            continue
 
-        moneyness_str = f"{m_label}"
-        if m_dist > 0:
-            moneyness_str += f" ({m_dist:.1f}% from spot)"
+        if not bars:
+            continue
 
-        body = (
-            f"🎯 Cheap {opt_type} — `{contract}`\n"
-            f"📌 Underlying: {sym} ≈ ${under_px:.2f}\n"
-            f"🗓️ DTE: {dte} · Strike: {strike:.2f if strike is not None else 'N/A'}\n"
-            f"📍 Moneyness: {moneyness_str}\n"
-            f"💵 Option Price: ${last_px:.2f} (≤ ${MAX_OPTION_PRICE:.2f} cheap filter)\n"
-            f"📦 Volume: {int(volume):,} · Notional: ≈ ${notional:,.0f}\n"
-            f"🔗 Chart: {chart_link(sym)}"
-        )
+        total_volume = sum(getattr(b, "v", 0) for b in bars)
+        if total_volume < MIN_VOLUME_GLOBAL:
+            continue
 
-        extra = (
-            f"📣 CHEAP — {sym}\n"
-            f"🕒 {now_est()}\n"
-            f"💰 Underlying ${under_px:.2f} · 🎯 DTE {dte}\n"
-            "────────────\n"
-            f"{body}"
-        )
+        # Option chain
+        try:
+            chain = _client.list_options_ticker(symbol=sym, limit=1000)
+            options = list(chain)
+        except Exception as e:
+            print(f"[cheap] option chain error for {sym}: {e}")
+            continue
 
-        _mark_alerted_contract(contract)
-        send_alert("cheap", sym, under_px, MIN_RVOL_GLOBAL, extra=extra)
+        for opt in options:
+            contract = getattr(opt, "ticker", None)
+            if not contract or _already_alerted(contract):
+                continue
+
+            expiry = getattr(opt, "expiration_date", None)
+            dte = _parse_dte(expiry) if expiry else None
+            if dte is None or dte < 0 or dte > MAX_CHEAP_DTE:
+                continue
+
+            last_px = getattr(opt, "last_quote", None)
+            if isinstance(last_px, dict):
+                last_px = last_px.get("P") or last_px.get("p")
+            elif hasattr(last_px, "P"):
+                last_px = last_px.P
+
+            if last_px is None:
+                continue
+
+            try:
+                last_px = float(last_px)
+            except Exception:
+                continue
+
+            if last_px <= 0 or last_px > MAX_OPTION_PRICE:
+                continue
+
+            volume = getattr(opt, "day", None)
+            if isinstance(volume, dict):
+                volume = volume.get("v")
+            elif hasattr(volume, "v"):
+                volume = volume.v
+
+            if volume is None:
+                continue
+
+            try:
+                volume = float(volume)
+            except Exception:
+                continue
+
+            notional = last_px * volume * 100.0
+            if volume < MIN_OPTION_VOLUME:
+                continue
+            if notional < MIN_OPTION_NOTIONAL:
+                continue
+
+            strike = getattr(opt, "strike_price", None)
+            try:
+                strike = float(strike) if strike is not None else None
+            except Exception:
+                strike = None
+
+            cp_type = getattr(opt, "contract_type", "").upper()
+            cp_label = "CALL" if cp_type == "CALL" else "PUT"
+
+            moneyness_str = "N/A"
+            if under_px and strike:
+                dist = abs(strike - under_px) / under_px * 100.0
+                if cp_label == "CALL":
+                    if strike < under_px:
+                        ml = "ITM"
+                    elif dist <= 1.0:
+                        ml = "ATM"
+                    else:
+                        ml = "OTM"
+                else:
+                    if strike > under_px:
+                        ml = "ITM"
+                    elif dist <= 1.0:
+                        ml = "ATM"
+                    else:
+                        ml = "OTM"
+                moneyness_str = f"{ml} · {dist:.1f}%"
+
+            body = (
+                f"🎯 Contract: {contract} ({cp_label})\n"
+                f"🗓️ DTE: {dte} · Strike: {strike:.2f if strike is not None else 'N/A'}\n"
+                f"📍 Moneyness: {moneyness_str}\n"
+                f"💵 Option Price: ${last_px:.2f} (≤ ${MAX_OPTION_PRICE:.2f} cheap filter)\n"
+                f"📦 Volume: {int(volume):,} · Notional: ≈ ${notional:,.0f}\n"
+                f"🔗 Chart: {chart_link(sym)}"
+            )
+
+            extra = (
+                f"📣 CHEAP — {sym}\n"
+                f"🕒 {now_est().strftime(\"%I:%M %p EST · %b %d\").lstrip(\"0\")}\\n"
+                f"💰 Underlying ${under_px:.2f} · 🎯 DTE {dte}\n"
+                "────────────\n"
+                f"{body}"
+            )
+
+            _mark_alerted_contract(contract)
+            send_alert("cheap", sym, under_px, MIN_RVOL_GLOBAL, extra=extra)
