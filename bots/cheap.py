@@ -2,7 +2,7 @@
 #
 # Hunts for:
 #   • 0–3 DTE CALLs & PUTs
-#   • Underlying in a reasonable price band (defaults: $10–$80)
+#   • Underlying in a reasonable price band (defaults: $3–$120)
 #   • Cheap premium (defaults: <= $0.40)
 #   • Real flow: min volume + min notional
 #
@@ -37,8 +37,8 @@ eastern = pytz.timezone("US/Eastern")
 # ---------------- CONFIG ----------------
 
 # Underlying filters
-MIN_UNDERLYING_PRICE = float(os.getenv("CHEAP_MIN_UNDERLYING_PRICE", "10.0"))
-MAX_UNDERLYING_PRICE = float(os.getenv("CHEAP_MAX_UNDERLYING_PRICE", "80.0"))
+MIN_UNDERLYING_PRICE = float(os.getenv("CHEAP_MIN_UNDERLYING_PRICE", "3.0"))
+MAX_UNDERLYING_PRICE = float(os.getenv("CHEAP_MAX_UNDERLYING_PRICE", "120.0"))
 
 # Option filters
 MAX_CHEAP_DTE = int(os.getenv("CHEAP_MAX_DTE", "3"))  # 0–3 DTE by default
@@ -118,52 +118,102 @@ def _extract_option_metrics(opt: Dict[str, Any]) -> Tuple[Optional[float], float
     """
     Returns (last_price, volume, notional_per_100) where:
       - last_price may be None if we can't infer a reasonable price.
-      - volume is contract volume.
-      - notional_per_100 = last_price * volume * 100 (if last_price known) else 0.
+      - volume is contracts volume.
+      - notional assumes last_price * volume * 100.
     """
-    day = opt.get("day") or {}
+    # Polygon option snapshot can have several price fields; we prefer last_trade_price.
+    last_px = None
+
+    # Try "last_quote" then "last_trade" then direct "price"
     last_trade = opt.get("last_trade") or {}
+    last_quote = opt.get("last_quote") or {}
 
-    # Try last trade price first
-    price = last_trade.get("p")
-    if price is None:
-        price = day.get("vw") or day.get("c") or day.get("o")
+    # Priority: last trade price, then mid-quote, then bid/ask, then price
+    if "price" in last_trade and last_trade.get("price") is not None:
+        last_px = float(last_trade["price"])
+    else:
+        bid = last_quote.get("bid")
+        ask = last_quote.get("ask")
+        if bid is not None and ask is not None and bid > 0 and ask > 0:
+            last_px = (float(bid) + float(ask)) / 2.0
+        elif bid is not None and bid > 0:
+            last_px = float(bid)
+        elif ask is not None and ask > 0:
+            last_px = float(ask)
+        elif "price" in opt and opt.get("price") is not None:
+            last_px = float(opt["price"])
 
+    # Volume
+    volume = float(opt.get("day", {}).get("volume") or opt.get("volume") or 0.0)
+    notional = 0.0
+    if last_px is not None:
+        notional = last_px * volume * 100.0
+
+    return last_px, volume, notional
+
+
+def _within_underlying_band(price: float) -> bool:
+    return MIN_UNDERLYING_PRICE <= price <= MAX_UNDERLYING_PRICE
+
+
+def _within_option_filters(
+    dte: int,
+    last_price: Optional[float],
+    volume: float,
+    notional: float,
+) -> bool:
+    if dte < 0 or dte > MAX_CHEAP_DTE:
+        return False
+    if last_price is None or last_price <= 0:
+        return False
+    if last_price > MAX_OPTION_PRICE:
+        return False
+    if volume < MIN_OPTION_VOLUME:
+        return False
+    if notional < MIN_OPTION_NOTIONAL:
+        return False
+    return True
+
+
+def _nearest_strike(opt: Dict[str, Any]) -> Optional[float]:
     try:
-        last_price = float(price) if price is not None else None
+        details = opt.get("details") or {}
+        strike = details.get("strike_price") or opt.get("strike_price")
+        if strike is None:
+            return None
+        return float(strike)
     except Exception:
-        last_price = None
-
-    vol_raw = day.get("v") or day.get("volume") or 0
-    try:
-        volume = float(vol_raw)
-    except Exception:
-        volume = 0.0
-
-    if last_price is None or last_price <= 0 or volume <= 0:
-        return None, 0.0, 0.0
-
-    notional = last_price * volume * 100.0
-    return last_price, volume, notional
+        return None
 
 
-def _moneyness_label(
-    opt_type: str, strike: float, underlying_price: float
-) -> Tuple[str, float]:
+def _option_type_label(opt: Dict[str, Any]) -> str:
+    details = opt.get("details") or {}
+    t = details.get("contract_type") or opt.get("contract_type") or ""
+    t = str(t).lower()
+    if t == "call":
+        return "CALL"
+    if t == "put":
+        return "PUT"
+    return "OPT"
+
+
+def _distance_from_money(under_px: float, strike: Optional[float]) -> Tuple[str, float]:
     """
-    Returns (label, pct_distance) where label is "ITM" or "OTM"
-    and pct_distance is abs(strike - underlying) / underlying in %.
+    Returns:
+      label: "ATM / ITM / OTM"
+      dist_pct: abs(strike - underlying) / underlying * 100
     """
-    if underlying_price <= 0:
-        return ("", 0.0)
+    if strike is None or under_px <= 0:
+        return "N/A", 0.0
 
-    dist_pct = abs(strike - underlying_price) / underlying_price * 100.0
+    dist_pct = abs(strike - under_px) / under_px * 100.0
 
-    if opt_type.lower() == "call":
-        label = "ITM" if strike < underlying_price else "OTM"
-    else:  # put
-        label = "ITM" if strike > underlying_price else "OTM"
-
+    if dist_pct < 1.0:
+        label = "ATM"
+    elif strike < under_px:
+        label = "ITM"  # in-the-money for calls (approx)
+    else:
+        label = "OTM"
     return label, dist_pct
 
 
@@ -214,42 +264,28 @@ async def run_cheap():
         best_notional = 0.0
 
         for opt in results:
+            under_px = _extract_underlying_price(opt)
+            if under_px is None:
+                continue
+
+            if not _within_underlying_band(under_px):
+                continue
+
             details = opt.get("details") or {}
-            opt_type = (details.get("contract_type") or "").lower()
-            if opt_type not in ("call", "put"):
+            expiration = details.get("expiration_date")
+            dte = _parse_dte(expiration, today)
+            if dte is None:
                 continue
 
-            exp_str = details.get("expiration_date")
-            dte = _parse_dte(exp_str, today)
-            if dte is None or dte < 0 or dte > MAX_CHEAP_DTE:
+            opt_type = _option_type_label(opt)
+            if opt_type not in ("CALL", "PUT"):
                 continue
 
-            strike_raw = details.get("strike_price")
-            try:
-                strike = float(strike_raw)
-            except Exception:
+            last_px, volume, notional = _extract_option_metrics(opt)
+            if not _within_option_filters(dte, last_px, volume, notional):
                 continue
 
-            underlying_price = _extract_underlying_price(opt)
-            if underlying_price is None:
-                continue
-
-            if (
-                underlying_price < MIN_UNDERLYING_PRICE
-                or underlying_price > MAX_UNDERLYING_PRICE
-            ):
-                continue
-
-            last_price, volume, notional = _extract_option_metrics(opt)
-            if last_price is None or last_price <= 0:
-                continue
-            if last_price > MAX_OPTION_PRICE:
-                continue
-            if volume < MIN_OPTION_VOLUME:
-                continue
-            if notional < MIN_OPTION_NOTIONAL:
-                continue
-
+            strike = _nearest_strike(opt)
             contract_symbol = opt.get("ticker") or opt.get("option_symbol")
             if not contract_symbol:
                 continue
@@ -266,8 +302,8 @@ async def run_cheap():
                     "opt_type": opt_type,
                     "dte": dte,
                     "strike": strike,
-                    "under_px": underlying_price,
-                    "last_px": last_price,
+                    "under_px": under_px,
+                    "last_px": last_px,
                     "volume": volume,
                     "notional": notional,
                 }
@@ -275,26 +311,26 @@ async def run_cheap():
         if not best_candidate:
             continue
 
-        # Build and send alert for best candidate
-        c = best_candidate
-        contract = c["contract"]
-        opt_type = c["opt_type"]
-        dte = c["dte"]
-        strike = c["strike"]
-        under_px = c["under_px"]
-        last_px = c["last_px"]
-        volume = c["volume"]
-        notional = c["notional"]
+        contract = best_candidate["contract"]
+        opt_type = best_candidate["opt_type"]
+        dte = best_candidate["dte"]
+        strike = best_candidate["strike"]
+        under_px = best_candidate["under_px"]
+        last_px = best_candidate["last_px"]
+        volume = best_candidate["volume"]
+        notional = best_candidate["notional"]
 
-        label, dist_pct = _moneyness_label(opt_type, strike, under_px)
+        m_label, m_dist = _distance_from_money(under_px, strike)
 
-        emoji = "🎯" if opt_type == "call" else "🛡️"
-        dir_word = "CALL" if opt_type == "call" else "PUT"
+        moneyness_str = f"{m_label}"
+        if m_dist > 0:
+            moneyness_str += f" ({m_dist:.1f}% from spot)"
 
         body = (
-            f"{emoji} Cheap {dir_word}: {contract}\n"
-            f"📌 Underlying {sym}: ≈ ${under_px:.2f}\n"
-            f"🎯 Strike: {strike:.2f} · DTE: {dte} · {label} {dist_pct:.1f}% from spot\n"
+            f"🎯 Cheap {opt_type} — `{contract}`\n"
+            f"📌 Underlying: {sym} ≈ ${under_px:.2f}\n"
+            f"🗓️ DTE: {dte} · Strike: {strike:.2f if strike is not None else 'N/A'}\n"
+            f"📍 Moneyness: {moneyness_str}\n"
             f"💵 Option Price: ${last_px:.2f} (≤ ${MAX_OPTION_PRICE:.2f} cheap filter)\n"
             f"📦 Volume: {int(volume):,} · Notional: ≈ ${notional:,.0f}\n"
             f"🔗 Chart: {chart_link(sym)}"
