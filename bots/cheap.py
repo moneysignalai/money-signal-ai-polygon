@@ -257,13 +257,14 @@ async def run_cheap():
                 f"🔗 Chart: {chart_link(sym)}"
             )
 
-            extra = (
-                f"📣 CHEAP — {sym}\n"
-                f"🕒 {now_est().strftime(\"%I:%M %p EST · %b %d\").lstrip(\"0\")}\\n"
-                f"💰 Underlying ${under_px:.2f} · 🎯 DTE {dte}\n"
-                "────────────\n"
-                f"{body}"
-            )
+ts = now_est().strftime("%I:%M %p EST · %b %d").lstrip("0")
+extra = (
+    f"📣 CHEAP — {sym}\n"
+    f"🕒 {ts}\n"
+    f"💰 Underlying ${under_px:.2f} · 🎯 DTE {dte}\n"
+    "────────────\n"
+    f"{body}"
+)
 
             _mark_alerted_contract(contract)
             send_alert("cheap", sym, under_px, MIN_RVOL_GLOBAL, extra=extra)
