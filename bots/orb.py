@@ -17,21 +17,20 @@ from bots.shared import (
     MIN_VOLUME_GLOBAL,
     send_alert,
     get_dynamic_top_volume_universe,
-    grade_equity_setup,
     is_etf_blacklisted,
+    grade_equity_setup,
     chart_link,
     now_est,
 )
 
-_client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 eastern = pytz.timezone("US/Eastern")
+_client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
-# ---------------- CONFIG ----------------
-
-# Loosened so ORB will actually fire more:
-MIN_ORB_PRICE = float(os.getenv("MIN_ORB_PRICE", "3.0"))
-MIN_ORB_RVOL = float(os.getenv("MIN_ORB_RVOL", "1.8"))
-MIN_ORB_DOLLAR_VOL = float(os.getenv("MIN_ORB_DOLLAR_VOL", "5000000"))  # $5M+
+# -------- CONFIG --------
+# Base filters for which symbols are worth scanning for ORB
+MIN_ORB_PRICE = float(os.getenv("MIN_ORB_PRICE", "3.0"))          # was 5.0
+MIN_ORB_RVOL = float(os.getenv("MIN_ORB_RVOL", "1.8"))            # was 2.5
+MIN_ORB_DOLLAR_VOL = float(os.getenv("MIN_ORB_DOLLAR_VOL", "5000000"))  # was 8M+
 
 # ORB timing (EST)
 # 9:30–9:45 → build 15-min range (first 3×5m bars)
@@ -62,276 +61,343 @@ def _mark_alerted(sym: str) -> None:
     _alerted_syms.add(sym)
 
 
-def _now_minutes_et() -> int:
-    now = datetime.now(eastern)
-    return now.hour * 60 + now.minute
+def _in_build_window(now: Optional[datetime] = None) -> bool:
+    """Is it currently in the 09:30–09:45 build window? (EST)"""
+    if now is None:
+        now = datetime.now(eastern)
+    mins = now.hour * 60 + now.minute
+    return ORB_BUILD_START_MIN <= mins <= ORB_BUILD_END_MIN
 
 
-def _in_build_window() -> bool:
-    m = _now_minutes_et()
-    return ORB_BUILD_START_MIN <= m <= ORB_BUILD_END_MIN
-
-
-def _in_scan_window() -> bool:
-    m = _now_minutes_et()
-    return ORB_SCAN_START_MIN <= m <= ORB_SCAN_END_MIN
+def _in_scan_window(now: Optional[datetime] = None) -> bool:
+    """Is it currently in the 09:45–11:00 scan window? (EST)"""
+    if now is None:
+        now = datetime.now(eastern)
+    mins = now.hour * 60 + now.minute
+    return ORB_SCAN_START_MIN <= mins <= ORB_SCAN_END_MIN
 
 
 def _get_universe() -> List[str]:
-    env = os.getenv("TICKER_UNIVERSE")
+    env = os.getenv("ORB_TICKER_UNIVERSE")
     if env:
         return [s.strip().upper() for s in env.split(",") if s.strip()]
-    # Slightly larger for ORB
-    return get_dynamic_top_volume_universe(max_tickers=120, volume_coverage=0.95)
+    return get_dynamic_top_volume_universe(max_tickers=150, volume_coverage=0.90)
 
 
-def _fetch_5m_aggs(sym: str, day: date) -> List[Any]:
-    """Get all 5-minute bars for the day."""
+def _fetch_5m_aggs(sym: str, trading_day: date) -> List[Any]:
+    """Fetch 5-min intraday bars for the session via Polygon."""
     if not _client:
         return []
 
-    day_s = day.isoformat()
+    start = trading_day.isoformat()
+    end = trading_day.isoformat()
+
     try:
         aggs = _client.list_aggs(
             sym,
             5,
             "minute",
-            day_s,
-            day_s,
+            start,
+            end,
             limit=500,
             sort="asc",
         )
         return list(aggs)
     except Exception as e:
-        print(f"[orb] 5m aggs error for {sym}: {e}")
+        print(f"[orb] agg error for {sym}: {e}")
         return []
 
 
-def _fetch_1m_aggs(sym: str, day: date) -> List[Any]:
-    """Get all 1-minute bars for the day (for refinement / confirmation if needed)."""
-    if not _client:
-        return []
-
-    day_s = day.isoformat()
-    try:
-        aggs = _client.list_aggs(
-            sym,
-            1,
-            "minute",
-            day_s,
-            day_s,
-            limit=1500,
-            sort="asc",
-        )
-        return list(aggs)
-    except Exception as e:
-        print(f"[orb] 1m aggs error for {sym}: {e}")
-        return []
-
-
-def _build_orb_range_5m(bars_5m: List[Any]) -> Optional[Tuple[float, float]]:
+def _filter_session_bars(bars: List[Any], trading_day: date) -> List[Any]:
     """
-    Given the day's 5m bars in ascending order, build the opening 15-min range
-    from the first 3 bars that start at 9:30 ET.
+    Filter intraday 5-min bars to the regular session 09:30–16:00 ET.
+
+    NOTE: We assume Polygon aggregate timestamps are in ms UTC. We
+    convert to EST and filter to 09:30–current time in EST.
     """
-
-    if not bars_5m:
-        return None
-
-    orb_bars: List[Any] = []
-    for bar in bars_5m:
-        # Polygon massive vs polygon client differences; handle generically.
-        ts = getattr(bar, "timestamp", None) or getattr(bar, "t", None)
+    filtered: List[Any] = []
+    for b in bars:
+        ts = getattr(b, "timestamp", getattr(b, "t", None))
         if ts is None:
             continue
 
-        # ts may be ms since epoch
-        try:
-            ts_dt = datetime.fromtimestamp(ts / 1000.0, tz=eastern)
-        except Exception:
+        # ms → seconds
+        if ts > 1e12:  # ms vs s
+            ts = ts / 1000.0
+
+        dt_utc = datetime.utcfromtimestamp(ts).replace(tzinfo=pytz.utc)
+        dt_et = dt_utc.astimezone(eastern)
+
+        if dt_et.date() != trading_day:
             continue
 
-        if ts_dt.hour == 9 and ts_dt.minute in (30, 35, 40):
-            orb_bars.append(bar)
+        mins = dt_et.hour * 60 + dt_et.minute
+        if mins < 9 * 60 + 30 or mins > 16 * 60:
+            continue
 
-    if len(orb_bars) < 3:
-        return None
+        # Attach local timestamp for later logic
+        b._et = dt_et
+        filtered.append(b)
 
-    highs = [float(getattr(b, "high", getattr(b, "h", 0.0))) for b in orb_bars]
-    lows = [float(getattr(b, "low", getattr(b, "l", 0.0))) for b in orb_bars]
-
-    orb_high = max(highs)
-    orb_low = min(lows)
-
-    return orb_low, orb_high
+    return filtered
 
 
-def _day_rvol_and_volume(sym: str, day: date) -> Optional[Tuple[float, float, float, float]]:
+def _compute_day_stats(sym: str, trading_day: date) -> Tuple[float, float, float, float, float]:
     """
-    Compute day-level RVOL, volume, dollar volume, last price, prev close.
+    Compute:
+      - rvol (intraday vs last 20 days)
+      - day_vol
+      - last_price
+      - prev_close
+      - dollar_vol
     """
-
     if not _client:
-        return None
+        return 1.0, 0.0, 0.0, 0.0, 0.0
 
-    # Today + prior n days (for RVOL baseline)
-    start = day - timedelta(days=15)
-    end = day
+    # Today's intraday 5m bars
+    bars_5m = _fetch_5m_aggs(sym, trading_day)
+    if not bars_5m:
+        return 1.0, 0.0, 0.0, 0.0, 0.0
+
+    day_vol = float(sum(getattr(b, "volume", getattr(b, "v", 0)) for b in bars_5m))
+    last_price = float(getattr(bars_5m[-1], "close", getattr(bars_5m[-1], "c", 0)) or 0)
+
+    # Daily history (last 21 days including today)
     try:
-        aggs = _client.list_aggs(
-            sym,
-            1,
-            "day",
-            start.isoformat(),
-            end.isoformat(),
-            limit=50,
-            sort="asc",
+        start = (trading_day - timedelta(days=30)).isoformat()
+        end = trading_day.isoformat()
+        daily = list(
+            _client.list_aggs(
+                sym,
+                1,
+                "day",
+                start,
+                end,
+                limit=50,
+                sort="asc",
+            )
         )
-        days = list(aggs)
     except Exception as e:
         print(f"[orb] daily aggs error for {sym}: {e}")
-        return None
+        return 1.0, day_vol, last_price, 0.0, 0.0
 
-    if len(days) < 2:
-        return None
+    if not daily:
+        return 1.0, day_vol, last_price, 0.0, 0.0
 
-    d0 = days[-1]  # today
-    d1 = days[-2]  # yesterday
+    # Last daily bar is "today" (in theory)
+    d0 = daily[-1]
+    prev_close = float(getattr(daily[-2], "close", getattr(daily[-2], "c", 0))) if len(daily) >= 2 else 0.0
 
-    last_price = float(getattr(d0, "close", getattr(d0, "c", 0.0)))
-    prev_close = float(getattr(d1, "close", getattr(d1, "c", 0.0)))
-
-    if last_price <= 0 or prev_close <= 0:
-        return None
-
-    day_vol = float(getattr(d0, "volume", getattr(d0, "v", 0.0)))
-    hist = days[:-1]
+    # Compute 20-day average volume excluding today
+    hist = daily[:-1] if len(daily) > 1 else daily
     recent = hist[-20:] if len(hist) > 20 else hist
-    avg_vol = sum(float(getattr(d, "volume", getattr(d, "v", 0.0))) for d in recent) / len(recent)
-    rvol = day_vol / avg_vol if avg_vol > 0 else 1.0
+    if not recent:
+        avg_vol = float(getattr(d0, "volume", getattr(d0, "v", 0)))
+    else:
+        avg_vol = sum(float(getattr(d, "volume", getattr(d, "v", 0))) for d in recent) / len(recent)
 
+    rvol = day_vol / avg_vol if avg_vol > 0 else 1.0
     dollar_vol = last_price * day_vol
 
-    return last_price, prev_close, rvol, day_vol, dollar_vol
+    return rvol, day_vol, last_price, prev_close, dollar_vol
 
 
-def _detect_orb_breakout(
-    sym: str,
-    bars_5m: List[Any],
-    orb_low: float,
-    orb_high: float,
-    last_price: float,
-) -> Optional[Tuple[str, float, float]]:
+def _build_orb_range(bars_5m: List[Any]) -> Optional[Tuple[float, float]]:
     """
-    Simple ORB breakout logic:
-      • If we trade above orb_high by at least 0.25% and close > orb_high → bullish breakout.
-      • If we trade below orb_low by at least 0.25% and close < orb_low → bearish breakdown.
-    Returns (bias, breakout_level, last_price).
+    Build the 15m ORB from the first 3 × 5m bars after 09:30.
     """
+    first_3: List[Any] = []
+    for b in bars_5m:
+        dt_et = getattr(b, "_et", None)
+        if not isinstance(dt_et, datetime):
+            continue
+        mins = dt_et.hour * 60 + dt_et.minute
+        if mins < 9 * 60 + 30:
+            continue
+        if mins >= 9 * 60 + 45:
+            continue
+        first_3.append(b)
 
-    if not bars_5m:
+    if len(first_3) < 3:
         return None
 
-    # Just use the last 5m bar as of now
-    last_bar = bars_5m[-1]
-    high = float(getattr(last_bar, "high", getattr(last_bar, "h", 0.0)))
-    low = float(getattr(last_bar, "low", getattr(last_bar, "l", 0.0)))
-    close = float(getattr(last_bar, "close", getattr(last_bar, "c", 0.0)))
+    low = min(float(getattr(b, "low", getattr(b, "l", 0))) for b in first_3)
+    high = max(float(getattr(b, "high", getattr(b, "h", 0))) for b in first_3)
+    return low, high
 
-    up_trigger = orb_high * 1.0025  # 0.25% above high
-    down_trigger = orb_low * 0.9975  # 0.25% below low
 
-    if high >= up_trigger and close > orb_high:
-        return "Bullish ORB breakout", orb_high, last_price
+def _find_breakout_and_retest(
+    sym: str,
+    orb_low: float,
+    orb_high: float,
+    bars_5m: List[Any],
+) -> Optional[Tuple[str, Any, Any]]:
+    """
+    Look for breakout after ORB window:
+      - For longs: close above ORB high on a 5m bar
+      - For shorts: close below ORB low
+      - Then an FVG-style retest where price tags ORB level but holds bias.
+    """
+    breakout_idx = None
+    direction = None  # "long" or "short"
 
-    if low <= down_trigger and close < orb_low:
-        return "Bearish ORB breakdown", orb_low, last_price
+    # Pass 1: find breakout
+    for i, b in enumerate(bars_5m):
+        dt_et = getattr(b, "_et", None)
+        if not isinstance(dt_et, datetime):
+            continue
+        mins = dt_et.hour * 60 + dt_et.minute
+        if mins < ORB_SCAN_START_MIN:
+            continue
+        if mins > ORB_SCAN_END_MIN:
+            break
+
+        o = float(getattr(b, "open", getattr(b, "o", 0)))
+        h = float(getattr(b, "high", getattr(b, "h", 0)))
+        l = float(getattr(b, "low", getattr(b, "l", 0)))
+        c = float(getattr(b, "close", getattr(b, "c", 0)))
+
+        # Long breakout: candle closes above ORB high
+        if c > orb_high and l > orb_low:
+            breakout_idx = i
+            direction = "long"
+            break
+
+        # Short breakout: candle closes below ORB low
+        if c < orb_low and h < orb_high:
+            breakout_idx = i
+            direction = "short"
+            break
+
+    if breakout_idx is None or direction is None:
+        return None
+
+    breakout_bar = bars_5m[breakout_idx]
+
+    # Pass 2: FVG-ish retest: later bar tags ORB boundary while holding direction
+    for j in range(breakout_idx + 1, len(bars_5m)):
+        b = bars_5m[j]
+        dt_et = getattr(b, "_et", None)
+        if not isinstance(dt_et, datetime):
+            continue
+        mins = dt_et.hour * 60 + dt_et.minute
+        if mins > ORB_SCAN_END_MIN:
+            break
+
+        o = float(getattr(b, "open", getattr(b, "o", 0)))
+        h = float(getattr(b, "high", getattr(b, "h", 0)))
+        l = float(getattr(b, "low", getattr(b, "l", 0)))
+        c = float(getattr(b, "close", getattr(b, "c", 0)))
+
+        if direction == "long":
+            # Retest at/near ORB high but hold above ORB low and close green-ish
+            if l <= orb_high * 1.002 and c > o and c > orb_high:
+                retest_bar = b
+                return direction, breakout_bar, retest_bar
+
+        if direction == "short":
+            # Retest at/near ORB low but hold below ORB high and close red-ish
+            if h >= orb_low * 0.998 and c < o and c < orb_low:
+                retest_bar = b
+                return direction, breakout_bar, retest_bar
 
     return None
 
 
 async def run_orb():
     """
-    Opening Range Breakout bot.
+    ORB bot main entrypoint.
 
-    - Builds 15-min ORB from first 3×5m bars (9:30–9:45).
-    - Scans for breakouts 9:45–11:00.
-    - Requires:
-        • Price >= MIN_ORB_PRICE
-        • Day RVOL >= max(MIN_ORB_RVOL, MIN_RVOL_GLOBAL)
-        • Day volume >= MIN_VOLUME_GLOBAL
-        • Day dollar volume >= MIN_ORB_DOLLAR_VOL
+    High level:
+      1) Only operate between 09:30–11:00 EST.
+      2) Compute day RVOL & dollar volume; filter by MIN_ORB_RVOL, MIN_ORB_DOLLAR_VOL.
+      3) Build 15m ORB from first 3×5m bars.
+      4) Scan for breakout + FVG-style retest.
+      5) Alert once per symbol per day.
     """
-
     _reset_if_new_day()
 
+    now = datetime.now(eastern)
+    if not (_in_build_window(now) or _in_scan_window(now)):
+        print("[orb] outside ORB windows; skipping.")
+        return
+
     if not POLYGON_KEY or not _client:
-        print("[orb] no API key; skipping.")
+        print("[orb] missing POLYGON_KEY or REST client; skipping.")
         return
 
-    if not (_in_build_window() or _in_scan_window()):
-        print("[orb] outside ORB window; skipping.")
-        return
-
-    today = date.today()
     universe = _get_universe()
     if not universe:
         print("[orb] empty universe; skipping.")
         return
 
+    trading_day = date.today()
+
     for sym in universe:
-        if _already_alerted(sym):
-            continue
         if is_etf_blacklisted(sym):
             continue
-
-        # Day-level filters
-        day_info = _day_rvol_and_volume(sym, today)
-        if not day_info:
+        if _already_alerted(sym):
             continue
 
-        last_price, prev_close, rvol, day_vol, dollar_vol = day_info
+        # Fetch intraday bars and compute day stats
+        bars_5m = _fetch_5m_aggs(sym, trading_day)
+        if not bars_5m:
+            continue
 
+        bars_5m = _filter_session_bars(bars_5m, trading_day)
+        if not bars_5m:
+            continue
+
+        rvol, day_vol, last_price, prev_close, dollar_vol = _compute_day_stats(sym, trading_day)
+
+        if last_price <= 0 or prev_close <= 0:
+            continue
         if last_price < MIN_ORB_PRICE:
             continue
-        if rvol < max(MIN_ORB_RVOL, MIN_RVOL_GLOBAL):
+        # Use ORB-specific RVOL threshold (looser)
+        if rvol < MIN_ORB_RVOL:
             continue
         if day_vol < MIN_VOLUME_GLOBAL:
             continue
         if dollar_vol < MIN_ORB_DOLLAR_VOL:
             continue
 
-        # Build ORB from 5m bars
-        bars_5m = _fetch_5m_aggs(sym, today)
-        if not bars_5m:
-            continue
-
-        orb_range = _build_orb_range_5m(bars_5m)
+        # Build ORB range
+        orb_range = _build_orb_range(bars_5m)
         if not orb_range:
             continue
 
         orb_low, orb_high = orb_range
-        if orb_low <= 0 or orb_high <= 0:
+        if orb_high <= orb_low:
             continue
 
-        # If we are still in build window, we just skip alerts for now.
-        if _in_build_window():
+        # Check for breakout + retest
+        result = _find_breakout_and_retest(sym, orb_low, orb_high, bars_5m)
+        if not result:
             continue
 
-        # In scan window, look for breakout
-        breakout = _detect_orb_breakout(sym, bars_5m, orb_low, orb_high, last_price)
-        if not breakout:
-            continue
+        direction, breakout_bar, retest_bar = result
 
-        bias, breakout_level, _ = breakout
+        br_o = float(getattr(breakout_bar, "open", getattr(breakout_bar, "o", 0)))
+        br_h = float(getattr(breakout_bar, "high", getattr(breakout_bar, "h", 0)))
+        br_l = float(getattr(breakout_bar, "low", getattr(breakout_bar, "l", 0)))
+        br_c = float(getattr(breakout_bar, "close", getattr(breakout_bar, "c", 0)))
+        br_range = br_h - br_l
 
         move_pct = (last_price - prev_close) / prev_close * 100.0
-        grade = grade_equity_setup(abs(move_pct), rvol, dollar_vol)
+        dollar_grade = dollar_vol
+        grade = grade_equity_setup(move_pct, rvol, dollar_grade)
+
+        dir_text = "15m ORB LONG" if direction == "long" else "15m ORB SHORT"
+        bias = "Bullish breakout with FVG retest" if direction == "long" else "Bearish breakdown with FVG retest"
 
         body = (
-            f"🧱 ORB Range: {orb_low:.2f} → {orb_high:.2f}\n"
-            f"📍 Breakout Level: {breakout_level:.2f}\n"
-            f"💰 Price: ${last_price:.2f} (move {move_pct:.1f}% vs prev close)\n"
+            f"📣 {dir_text} (15m ORB, 5m FVG retest)\n"
+            f"📏 ORB Range (first 15m): {orb_low:.2f} – {orb_high:.2f}\n"
+            f"🧱 Breakout candle (5m): O {br_o:.2f} · H {br_h:.2f} · "
+            f"L {br_l:.2f} · C {br_c:.2f} (range {br_range:.2f})\n"
+            f"🔁 FVG-style retest confirmed on later 5m bar while holding ORB edge\n"
+            f"📈 Prev Close: ${prev_close:.2f} → Last: ${last_price:.2f} ({move_pct:.1f}%)\n"
             f"📦 Day Volume: {int(day_vol):,} (≈ ${dollar_vol:,.0f} notional)\n"
             f"📊 Day RVOL: {rvol:.1f}x\n"
             f"🎯 Setup Grade: {grade}\n"
@@ -339,12 +405,11 @@ async def run_orb():
             f"🔗 Chart: {chart_link(sym)}"
         )
 
-        # Nice formatted EST timestamp
-        ts = now_est().strftime("%I:%M %p EST · %b %d").lstrip("0")
+        time_str = now_est().strftime("%I:%M %p EST · %b %d").lstrip("0")
 
         extra = (
             f"📣 ORB — {sym}\n"
-            f"🕒 {ts}\n"
+            f"🕒 {time_str}\n"
             f"💰 ${last_price:.2f} · 📊 RVOL {rvol:.1f}x\n"
             "────────────\n"
             f"{body}"
