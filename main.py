@@ -15,9 +15,11 @@ def now_est_str() -> str:
     return datetime.now(eastern).strftime("%I:%M %p EST · %b %d").lstrip("0")
 
 
-app = FastAPI(title="MoneySignalAI — Multi-Bot Suite")
+app = FastAPI()
 
-# List of all bots: (public_name, module_path, function_name)
+
+# Ordered list of all bots we want to run every cycle.
+# (public_name, module_path, function_name)
 BOTS = [
     ("premarket", "bots.premarket", "run_premarket"),
     ("gap", "bots.gap", "run_gap"),
@@ -74,6 +76,7 @@ async def run_all_once():
     # Dynamically import and schedule each bot
     for public_name, module_path, func_name in BOTS:
         try:
+            print(f"[main] scheduling bot '{public_name}' ({module_path}.{func_name})")
             mod = importlib.import_module(module_path)
             fn = getattr(mod, func_name, None)
             if fn is None:
@@ -95,6 +98,7 @@ async def run_all_once():
     # Add status_report as just another async task if available
     if run_status is not None:
         try:
+            print("[main] scheduling bot 'status_report' (bots.status_report.run_status_report)")
             tasks.append(run_status())
             names.append("status_report")
         except Exception as e:
@@ -114,12 +118,16 @@ async def run_all_once():
 
     for name, result in zip(names, results):
         if isinstance(result, Exception):
+            # Bot raised an exception during execution
             print(f"[ERROR] Bot {name} raised: {result}")
             if record_error:
                 try:
                     record_error(name, result)
                 except Exception as inner:
                     print("[main] ERROR while recording bot runtime error:", inner)
+        else:
+            # Successful completion (even if that bot just skipped due to time window / filters)
+            print(f"[main] bot '{name}' completed cycle without crash")
 
 
 async def scheduler_loop(interval_seconds: int = 60):
