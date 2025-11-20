@@ -1,48 +1,40 @@
-# bots/shared.py — MoneySignalAI core utilities
-#
-# - Telegram alert & status helpers
-# - Polygon dynamic universe helper with 3-min cache
-# - Option-chain + last-trade helpers with cache
-# - Common grading / filters
-
+# bots/shared.py
 import os
 import time
-from datetime import datetime
-from typing import List, Dict, Any, Optional
+import math
+import json
+from dataclasses import dataclass
+from datetime import datetime, date, timedelta
+from typing import Dict, Any, List, Optional, Tuple
 
-import requests
 import pytz
+import requests
 
-# ---------------- TIME / ENV ----------------
+# ---------------- BASIC CONFIG ----------------
+
+POLYGON_KEY = os.getenv("POLYGON_KEY") or os.getenv("POLYGON_API_KEY")
+
+# Global RVOL / volume floors that other bots can reference
+MIN_RVOL_GLOBAL = float(os.getenv("MIN_RVOL_GLOBAL", "2.0"))
+MIN_VOLUME_GLOBAL = float(os.getenv("MIN_VOLUME_GLOBAL", "500000"))  # shares
+
+# Telegram routing (your env)
+# - TELEGRAM_CHAT_ALL = single private chat ID for everything
+# - TELEGRAM_TOKEN_ALERTS = all-in-one alerts bot for all trade signals
+# - TELEGRAM_TOKEN_STATUS = dedicated status/heartbeat bot
+TELEGRAM_CHAT_ALL = os.getenv("TELEGRAM_CHAT_ALL")
+
+TELEGRAM_TOKEN_ALERTS = os.getenv("TELEGRAM_TOKEN_ALERTS")
+TELEGRAM_TOKEN_STATUS = os.getenv("TELEGRAM_TOKEN_STATUS")
 
 eastern = pytz.timezone("US/Eastern")
 
 
 def now_est() -> datetime:
-    """Return current datetime in US/Eastern timezone."""
     return datetime.now(eastern)
 
 
-# --- API keys / global thresholds ---
-
-POLYGON_KEY: Optional[str] = os.getenv("POLYGON_KEY") or os.getenv("POLYGON_API_KEY")
-
-MIN_RVOL_GLOBAL: float = float(os.getenv("MIN_RVOL_GLOBAL", "2.0"))
-MIN_VOLUME_GLOBAL: float = float(os.getenv("MIN_VOLUME_GLOBAL", "500000"))  # shares
-
-# Telegram routing (your env)
-# - TELEGRAM_CHAT_ALL = single private chat ID for everything
-# - TELEGRAM_TOKEN_ALERTS = all-in-one alerts bot
-# - TELEGRAM_TOKEN_STATUS = dedicated status/heartbeat bot
-TELEGRAM_TOKEN_ALERTS = os.getenv("TELEGRAM_TOKEN_ALERTS")
-TELEGRAM_TOKEN_STATUS = os.getenv("TELEGRAM_TOKEN_STATUS")
-TELEGRAM_CHAT_ALL = os.getenv("TELEGRAM_CHAT_ALL")
-
-# Optionally present in your env; not required by the code
-TELEGRAM_CHAT_STATUS = os.getenv("TELEGRAM_CHAT_STATUS")
-
-
-# ---------------- TELEGRAM HELPERS ----------------
+# ---------------- TELEGRAM LOW-LEVEL ----------------
 
 
 def _send_telegram_raw(
@@ -51,16 +43,18 @@ def _send_telegram_raw(
     text: str,
     parse_mode: Optional[str] = "Markdown",
 ) -> None:
-    """Low-level Telegram sender. Logs failures but never raises."""
+    """Low-level Telegram sender used by alerts + status.
+
+    Safe: prints errors but never raises, so one bad message cannot crash the app.
+    """
     if not token or not chat_id:
-        print(f"[telegram] missing token/chat_id, message not sent: {text[:160]!r}")
+        print(f"[telegram] missing token/chat_id, skipping message: {text[:80]}")
         return
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload: Dict[str, Any] = {
+    payload = {
         "chat_id": chat_id,
         "text": text,
-        "disable_web_page_preview": True,
     }
     if parse_mode:
         payload["parse_mode"] = parse_mode
@@ -68,37 +62,47 @@ def _send_telegram_raw(
     try:
         r = requests.post(url, json=payload, timeout=10)
         if not r.ok:
-            print(f"[telegram] send failed {r.status_code}: {r.text[:200]}")
+            print(f"[telegram] send failed {r.status_code}: {r.text}")
     except Exception as e:
-        print(f"[telegram] exception sending telegram: {e}")
+        print(f"[telegram] exception while sending message: {e}")
 
 
-def send_alert(bot: str, ticker: str, price: float, rvol: float, extra: str = "") -> None:
-    """High-level alert sender used by all bots.
+# ---------------- PUBLIC ALERT SENDER ----------------
 
-    Most bots pass a fully formatted `extra` message (with emojis, dividers, etc.).
-    In that case we send it as-is. If `extra` is empty, we fall back to a simple
-    generic header using bot / ticker / price / rvol.
 
-    Alerts ALWAYS use:
+def send_alert(
+    bot_name: str,
+    symbol: str,
+    price: float,
+    rvol: float | None = None,
+    extra: str | None = None,
+) -> None:
+    """Main alert pipe for all trade bots.
+
+    Uses:
       - TELEGRAM_TOKEN_ALERTS
       - TELEGRAM_CHAT_ALL
-      - Markdown formatting
     """
-    if extra:
-        msg = extra
-    else:
-        msg = (
-            f"🔔 *{bot.upper()} — {ticker}*\n"
-            f"💰 ${price:.2f} · 📊 RVOL {rvol:.1f}x"
-        )
+    token = TELEGRAM_TOKEN_ALERTS
+    chat = TELEGRAM_CHAT_ALL
 
-    _send_telegram_raw(
-        TELEGRAM_TOKEN_ALERTS,
-        TELEGRAM_CHAT_ALL,
-        msg,
-        parse_mode="Markdown",
-    )
+    if not token or not chat:
+        print(f"[alert:{bot_name}] (no TELEGRAM_TOKEN_ALERTS or TELEGRAM_CHAT_ALL) {symbol} {price}")
+        if extra:
+            print(extra)
+        return
+
+    # Basic header line; bots are expected to supply a fully formatted 'extra' body
+    header = f"[{bot_name.upper()}] {symbol} @ ${price:.2f}"
+    if rvol is not None:
+        header += f" · RVOL {rvol:.1f}x"
+
+    if extra:
+        msg = f"{extra}"
+    else:
+        msg = header
+
+    _send_telegram_raw(token, chat, msg, parse_mode="Markdown")
 
 
 def send_status(message: str) -> None:
@@ -123,6 +127,23 @@ def send_status(message: str) -> None:
     _send_telegram_raw(token, chat, message, parse_mode=None)
 
 
+def report_status_error(bot: str, message: str) -> None:
+    """Bridge helper so shared/bots can push errors into status_report.
+
+    This keeps status reporting centralized without creating an import cycle.
+    Called by shared helpers when a *soft* error happens (e.g. Polygon fails),
+    so it shows up in the Telegram error digest even if the bot doesn't crash.
+    """
+    try:
+        from bots import status_report  # type: ignore
+
+        if hasattr(status_report, "record_bot_error"):
+            status_report.record_bot_error(bot, message)
+    except Exception as e:
+        # Never raise from here; last resort is just console logging
+        print(f"[shared] failed to forward error to status_report: {e}; original={message}")
+
+
 # ---------------- ETF BLACKLIST ----------------
 
 # Basic ETF blacklist; can be extended via ENV if you want
@@ -130,68 +151,70 @@ _DEFAULT_ETF_BLACKLIST = {
     "SPY",
     "QQQ",
     "IWM",
-    "DIA",
+    "UVXY",
+    "SVXY",
+    "SQQQ",
+    "TQQQ",
+    "SPXU",
+    "XLK",
     "XLF",
     "XLE",
-    "XLK",
+    "XLP",
     "XLV",
+    "XLY",
+    "XLI",
+    "XLB",
+    "XLU",
+    "ARKK",
 }
 
-_env_etf = {
-    s.strip().upper()
-    for s in os.getenv("ETF_BLACKLIST", "").split(",")
-    if s.strip()
-}
-ETF_BLACKLIST = _DEFAULT_ETF_BLACKLIST.union(_env_etf)
+_ETF_EXTRA = set(
+    x.strip().upper()
+    for x in os.getenv("ETF_BLACKLIST_EXTRA", "").split(",")
+    if x.strip()
+)
+
+ETF_BLACKLIST = _DEFAULT_ETF_BLACKLIST | _ETF_EXTRA
 
 
-def is_etf_blacklisted(ticker: str) -> bool:
-    return ticker.upper() in ETF_BLACKLIST
+def is_etf_blacklisted(symbol: str) -> bool:
+    return symbol.upper() in ETF_BLACKLIST
 
 
-# ---------------- CHART LINKS ----------------
+# ---------------- DYNAMIC UNIVERSE (TOP VOLUME) ----------------
 
 
-def chart_link(symbol: str) -> str:
-    """
-    Build a TradingView link for the given underlying symbol.
+@dataclass
+class TickerRecord:
+    ticker: str
+    volume: float
+    dollar_volume: float
 
-    Example:
-      https://www.tradingview.com/chart/?symbol=AAPL
-    """
-    sym = symbol.upper()
-    return f"https://www.tradingview.com/chart/?symbol={sym}"
-
-
-# ---------------- UNIVERSE / MOST ACTIVE (3-MIN CACHE) ----------------
 
 _UNIVERSE_CACHE: Dict[str, Any] = {
-    "ts": 0.0,
-    "tickers": ["SPY", "QQQ", "IWM", "AAPL", "MSFT", "NVDA"],
+    "ts": None,
+    "tickers": [],
 }
 
 
 def get_dynamic_top_volume_universe(
-    max_tickers: int = 100,
-    volume_coverage: float = 0.90,
+    max_tickers: int = 200,
+    volume_coverage: float = 0.97,
 ) -> List[str]:
-    """Approximate 'top N names that capture ~X% of market volume'.
+    """Fetch a dynamic ticker universe based on top dollar-volume.
 
-    Implementation:
-      • Uses Polygon's snapshot endpoint as a proxy for current volume leaders.
-      • Keeps a 3-minute in-memory cache to avoid hammering the API.
-      • Fallback: if Polygon fails or returns nothing, returns a static
-        baseline universe from the last cache.
+    Cached for a few minutes to avoid hammering Polygon.
     """
-    now = time.time()
-    if now - _UNIVERSE_CACHE["ts"] < 180 and _UNIVERSE_CACHE["tickers"]:
-        return _UNIVERSE_CACHE["tickers"]
-
     if not POLYGON_KEY:
-        print("[shared] POLYGON_KEY missing; using cached/static universe.")
-        return _UNIVERSE_CACHE["tickers"]
+        print("[shared] POLYGON_KEY missing; dynamic universe fallback = empty list.")
+        return []
 
-    url = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
+    now = time.time()
+    ts = _UNIVERSE_CACHE.get("ts")
+    if ts and now - ts < 180:
+        return list(_UNIVERSE_CACHE.get("tickers", []))
+
+    url = "https://api.polygon.io/v3/snapshot/stocks"
     params = {"apiKey": POLYGON_KEY, "limit": 1000}
 
     try:
@@ -199,72 +222,104 @@ def get_dynamic_top_volume_universe(
         r.raise_for_status()
         data = r.json()
     except Exception as e:
-        print(f"[shared] error fetching dynamic universe: {e}")
+        msg = f"[shared] error fetching dynamic universe: {e}"
+        print(msg)
+        report_status_error("shared:universe", msg)
         return _UNIVERSE_CACHE["tickers"]
 
     results = data.get("tickers") or []
     if not results:
-        print("[shared] no tickers in dynamic universe response.")
+        msg = "[shared] no tickers in dynamic universe response."
+        print(msg)
+        report_status_error("shared:universe", msg)
         return _UNIVERSE_CACHE["tickers"]
 
     def _vol(rec: Dict[str, Any]) -> float:
         try:
-            day = rec.get("day") or {}
-            return float(day.get("v", 0.0))
+            return float(rec.get("todaysVolume") or 0.0)
         except Exception:
             return 0.0
 
-    # Sort by day volume descending
-    sorted_by_vol = sorted(results, key=_vol, reverse=True)
+    def _dollar_vol(rec: Dict[str, Any]) -> float:
+        try:
+            c = float(rec.get("day", {}).get("c") or 0.0)
+            v = float(rec.get("day", {}).get("v") or 0.0)
+            return c * v
+        except Exception:
+            return 0.0
 
-    # Compute cumulative coverage and pick max_tickers or volume_coverage threshold, whichever hits first
-    total_vol = sum(_vol(r) for r in sorted_by_vol) or 1.0
-    picked: List[str] = []
-    running = 0.0
-
-    for rec in sorted_by_vol:
-        t = rec.get("ticker")
-        if not t:
+    records: List[TickerRecord] = []
+    for rec in results:
+        sym = rec.get("ticker")
+        if not sym:
             continue
-        v = _vol(rec)
-        running += v
-        picked.append(t)
-        if running / total_vol >= volume_coverage or len(picked) >= max_tickers:
+        dv = _dollar_vol(rec)
+        if dv <= 0:
+            continue
+        records.append(
+            TickerRecord(
+                ticker=sym,
+                volume=_vol(rec),
+                dollar_volume=dv,
+            )
+        )
+
+    records.sort(key=lambda r: r.dollar_volume, reverse=True)
+    if not records:
+        print("[shared] dynamic universe produced no valid records.")
+        return []
+
+    total_dv = sum(r.dollar_volume for r in records)
+    running = 0.0
+    chosen: List[str] = []
+
+    for r in records:
+        chosen.append(r.ticker)
+        running += r.dollar_volume
+        if running / total_dv >= volume_coverage or len(chosen) >= max_tickers:
             break
 
-    if not picked:
-        picked = _UNIVERSE_CACHE["tickers"]
-
     _UNIVERSE_CACHE["ts"] = now
-    _UNIVERSE_CACHE["tickers"] = picked
-    return picked
+    _UNIVERSE_CACHE["tickers"] = chosen
+    print(f"[shared] dynamic universe size={len(chosen)} coverage≈{running/total_dv:.1%}")
+    return chosen
 
 
-# ---------------- OPTION CHAIN CACHE ----------------
+# ---------------- OPTION SNAPSHOT + LAST TRADE (CACHED) ----------------
 
-_OPTION_CACHE: Dict[str, Dict[str, Any]] = {}
+@dataclass
+class OptionCacheEntry:
+    ts: float
+    data: Dict[str, Any]
 
 
-def get_option_chain_cached(ticker: str) -> Optional[Dict[str, Any]]:
-    """Get snapshot option chain for an underlying with a short cache.
+_OPTION_CACHE: Dict[str, OptionCacheEntry] = {}
 
-    Cache behaviour:
-      • 30-second TTL per underlying.
-      • Uses Polygon snapshot options endpoint.
+
+def _cache_key(prefix: str, identifier: str) -> str:
+    return f"{prefix}:{identifier}"
+
+
+def get_option_chain_cached(
+    underlying: str,
+    ttl_seconds: int = 60,
+) -> Optional[Dict[str, Any]]:
+    """Fetches Polygon snapshot option chain via HTTP and caches it.
+
+    Used by cheap / unusual / whales, etc.
     """
-    key = f"chain_{ticker.upper()}"
-    now = time.time()
-
-    # Cache hit
-    entry = _OPTION_CACHE.get(key)
-    if entry and now - entry.get("ts", 0) < 30:
-        return entry.get("data")
-
     if not POLYGON_KEY:
-        print("[shared] POLYGON_KEY not set; cannot fetch options.")
+        print("[shared] POLYGON_KEY missing; cannot fetch option chain.")
         return None
 
-    url = f"https://api.polygon.io/v3/snapshot/options/{ticker.upper()}"
+    key = _cache_key("chain", underlying.upper())
+    now = time.time()
+
+    entry = _OPTION_CACHE.get(key)
+    if entry and now - entry.ts < ttl_seconds:
+        return entry.data
+
+    url = f"https://api.polygon.io/v3/snapshot/options/{underlying.upper()}"
     params = {"apiKey": POLYGON_KEY}
 
     try:
@@ -272,71 +327,75 @@ def get_option_chain_cached(ticker: str) -> Optional[Dict[str, Any]]:
         r.raise_for_status()
         data = r.json()
     except Exception as e:
-        print(f"[shared] error fetching option chain for {ticker}: {e}")
+        msg = f"[shared] error fetching option chain for {underlying}: {e}"
+        print(msg)
+        report_status_error("shared:option_chain", msg)
         return None
 
-    # Store in cache
-    _OPTION_CACHE[key] = {"ts": now, "data": data}
+    _OPTION_CACHE[key] = OptionCacheEntry(ts=now, data=data)
     return data
 
 
-def get_last_option_trades_cached(full_option_symbol: str) -> Optional[Dict[str, Any]]:
-    """Get the last trade for a single option symbol with a short cache.
-
-    Behaviour:
-      • 30-second in-memory cache per option.
-      • On HTTP 404 (no trade / not found), returns None and logs softly.
-      • On other HTTP / network errors, logs and returns None.
-    """
-    key = f"trade_{full_option_symbol}"
-    now = time.time()
-
-    # Cache hit
-    entry = _OPTION_CACHE.get(key)
-    if entry and now - entry.get("ts", 0) < 30:
-        return entry.get("data")
-
+def get_last_option_trades_cached(
+    full_option_symbol: str,
+    ttl_seconds: int = 30,
+) -> Optional[Dict[str, Any]]:
+    """Fetches the last option trade for a specific contract (v3 last/trade)."""
     if not POLYGON_KEY:
+        print("[shared] POLYGON_KEY missing; cannot fetch last option trades.")
         return None
 
-    url = f"https://api.polygon.io/v2/last/trade/{full_option_symbol}"
+    key = _cache_key("last_trade", full_option_symbol)
+    now = time.time()
+
+    entry = _OPTION_CACHE.get(key)
+    if entry and now - entry.ts < ttl_seconds:
+        return entry.data
+
+    url = f"https://api.polygon.io/v3/last/trade/{full_option_symbol}"
     params = {"apiKey": POLYGON_KEY}
 
     try:
         r = requests.get(url, params=params, timeout=10)
         # Treat 404 (no data) as a normal, non-fatal condition
         if r.status_code == 404:
-            print(f"[shared] no last option trade for {full_option_symbol} (404).")
+            msg_404 = f"[shared] no last option trade for {full_option_symbol} (404)."
+            print(msg_404)
+            # 404 is benign; we do not spam status bot with it
             return None
 
         r.raise_for_status()
         data = r.json()
     except Exception as e:
-        print(f"[shared] error fetching last option trade for {full_option_symbol}: {e}")
+        msg = f"[shared] error fetching last option trade for {full_option_symbol}: {e}"
+        print(msg)
+        report_status_error("shared:last_option_trade", msg)
         return None
 
-    _OPTION_CACHE[key] = {"ts": now, "data": data}
+    _OPTION_CACHE[key] = OptionCacheEntry(ts=now, data=data)
     return data
 
 
-# ---- Backwards-compatible aliases for old bot imports ----
+# ---- Backwards-compat function names (old bots) ----
 
-def get_last_option_trade_cached(full_option_symbol: str) -> Optional[Dict[str, Any]]:
-    """Alias for older singular name."""
-    return get_last_option_trades_cached(full_option_symbol)
-
-
-def getLastOptionTradesCached(full_option_symbol: str) -> Optional[Dict[str, Any]]:
-    """Alias for older CamelCase import style."""
-    return get_last_option_trades_cached(full_option_symbol)
+def getOptionChainCached(underlying: str, ttl_seconds: int = 60):
+    """Legacy camelCase alias used by older bots."""
+    return get_option_chain_cached(underlying, ttl_seconds=ttl_seconds)
 
 
-def getlastoptiontradescached(full_option_symbol: str) -> Optional[Dict[str, Any]]:
-    """Alias for fully lowercase import style."""
-    return get_last_option_trades_cached(full_option_symbol)
+def getLastOptionTradesCached(full_option_symbol: str, ttl_seconds: int = 30):
+    """Legacy camelCase alias used by older bots."""
+    return get_last_option_trades_cached(full_option_symbol, ttl_seconds=ttl_seconds)
 
 
-# ---------------- GRADING / SETUP QUALITY ----------------
+# ---------------- CHART LINK ----------------
+
+
+def chart_link(symbol: str) -> str:
+    return f"https://www.tradingview.com/chart/?symbol={symbol.upper()}"
+
+
+# ---------------- GRADING HELPERS ----------------
 
 
 def grade_equity_setup(
@@ -344,50 +403,47 @@ def grade_equity_setup(
     rvol: float,
     dollar_vol: float,
 ) -> str:
-    """Very rough A+/A/B/C grade for an equity setup.
+    """Simple letter grade: A+ / A / B / C based on strength."""
+    score = 0.0
 
-    Inputs:
-      • move_pct: absolute % move from a reference (e.g. ORB break, gap, etc.)
-      • rvol: relative volume multiple vs typical
-      • dollar_vol: traded notional in USD
+    score += max(0.0, min(rvol / 2.0, 3.0))  # up to 3 points
+    score += max(0.0, min(abs(move_pct) / 3.0, 3.0))  # up to 3
+    score += max(0.0, min(math.log10(max(dollar_vol, 1.0)) - 6.0, 2.0))  # up to 2
 
-    Heuristic:
-      - movement:   0–2pt → low, 2–4 modest, 4–8 strong, >8 explosive
-      - RVOL:       1–2 moderate, 2–4 high, >4 extreme
-      - $ volume:   5–25M light, 25–75M solid, 75–200M large, >200M huge
-
-    Returns:
-      "A+", "A", "B", or "C"
-    """
-    score = 0
-
-    # Move contribution
-    m = abs(move_pct)
-    if m >= 2:
-        score += 1
-    if m >= 4:
-        score += 1
-    if m >= 8:
-        score += 1
-
-    # RVOL contribution
-    if rvol >= 2:
-        score += 1
-    if rvol >= 4:
-        score += 1
-
-    # Dollar-volume contribution
-    if dollar_vol >= 25_000_000:
-        score += 1
-    if dollar_vol >= 75_000_000:
-        score += 1
-    if dollar_vol >= 200_000_000:
-        score += 1
-
-    if score >= 6:
+    if score >= 7.0:
         return "A+"
-    if score >= 4:
+    if score >= 5.5:
         return "A"
-    if score >= 2:
+    if score >= 4.0:
         return "B"
     return "C"
+
+
+# ---------------- TIME WINDOWS HELPERS ----------------
+
+
+def is_between_times(
+    start_h: int,
+    start_m: int,
+    end_h: int,
+    end_m: int,
+    tz=eastern,
+) -> bool:
+    now = datetime.now(tz)
+    mins = now.hour * 60 + now.minute
+    start = start_h * 60 + start_m
+    end = end_h * 60 + end_m
+    return start <= mins <= end
+
+
+def is_rth() -> bool:
+    """Regular trading hours 09:30–16:00 ET."""
+    return is_between_times(9, 30, 16, 0, eastern)
+
+
+def is_premarket() -> bool:
+    return is_between_times(4, 0, 9, 29, eastern)
+
+
+def is_postmarket() -> bool:
+    return is_between_times(16, 1, 20, 0, eastern)
