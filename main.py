@@ -20,8 +20,8 @@ from bots.squeeze import run_squeeze
 from bots.earnings import run_earnings
 from bots.momentum_reversal import run_momentum_reversal
 
-# Status / heartbeat bot
-from bots.status_report import run_status_report
+# Status / heartbeat bot (now also exposes error buffer API)
+from bots.status_report import run_status_report, record_bot_error
 
 # New advanced bots
 from bots.whales import run_whales
@@ -125,7 +125,10 @@ async def run_all_once():
 
     for name, result in zip(bot_names, results):
         if isinstance(result, Exception):
+            # Log to console for raw debugging
             print(f"[ERROR] Bot {name} raised: {result}")
+            # Also push into the status_report error buffer
+            record_bot_error(name, result)
 
 
 def run_forever():
