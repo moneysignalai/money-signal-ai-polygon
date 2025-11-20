@@ -17,20 +17,43 @@ from bots.shared import (
     MIN_VOLUME_GLOBAL,
     send_alert,
     get_dynamic_top_volume_universe,
-    grade_equity_setup,
     is_etf_blacklisted,
+    grade_equity_setup,
     chart_link,
     now_est,
 )
 
-_client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 eastern = pytz.timezone("US/Eastern")
+_client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
 # ------- CONFIG -------
-# Loosened so you actually see more "monster" volume names:
-MIN_MONSTER_BAR_SHARES = float(os.getenv("MIN_MONSTER_BAR_SHARES", "1000000"))   # 1M+
-MIN_MONSTER_DOLLAR_VOL = float(os.getenv("MIN_MONSTER_DOLLAR_VOL", "10000000")) # $10M+
-MIN_MONSTER_PRICE = float(os.getenv("MIN_MONSTER_PRICE", "3.0"))
+MIN_MONSTER_BAR_SHARES = float(os.getenv("MIN_MONSTER_BAR_SHARES", "2000000"))   # was 8000000
+MIN_MONSTER_DOLLAR_VOL = float(os.getenv("MIN_MONSTER_DOLLAR_VOL", "12000000"))  # was 30000000
+MIN_MONSTER_PRICE = float(os.getenv("MIN_MONSTER_PRICE", "2.0"))
+
+# Per-symbol RVOL threshold for the day (volume bot specific)
+MIN_VOLUME_RVOL = float(os.getenv("VOLUME_MIN_RVOL", "1.8"))
+
+# Per-day de-dupe
+_alert_date: date | None = None
+_alerted_syms: set[str] = set()
+
+
+def _reset_if_new_day() -> None:
+    global _alert_date, _alerted_syms
+    today = date.today()
+    if _alert_date != today:
+        _alert_date = today
+        _alerted_syms = set()
+
+
+def _already_alerted(sym: str) -> bool:
+    return sym in _alerted_syms
+
+
+def _mark(sym: str) -> None:
+    _alerted_syms.add(sym)
+
 
 # ------- RTH WINDOW -------
 def _in_volume_window() -> bool:
@@ -47,146 +70,201 @@ def _get_universe() -> List[str]:
     return get_dynamic_top_volume_universe(max_tickers=120, volume_coverage=0.95)
 
 
+def _fetch_intraday(sym: str, trading_day: date) -> List:
+    if not _client:
+        return []
+    try:
+        aggs = _client.list_aggs(
+            sym,
+            1,
+            "minute",
+            trading_day.isoformat(),
+            trading_day.isoformat(),
+            limit=800,
+            sort="asc",
+        )
+        bars = list(aggs)
+    except Exception as e:
+        print(f"[volume] intraday agg error for {sym}: {e}")
+        return []
+
+    # Filter to RTH 09:30–16:00
+    filtered = []
+    for b in bars:
+        ts = getattr(b, "timestamp", getattr(b, "t", None))
+        if ts is None:
+            continue
+        if ts > 1e12:  # ms → s
+            ts = ts / 1000.0
+        dt_utc = datetime.utcfromtimestamp(ts).replace(tzinfo=pytz.utc)
+        dt_et = dt_utc.astimezone(eastern)
+        if dt_et.date() != trading_day:
+            continue
+        mins = dt_et.hour * 60 + dt_et.minute
+        if mins < 9 * 60 + 30 or mins > 16 * 60:
+            continue
+        b._et = dt_et
+        filtered.append(b)
+    return filtered
+
+
+def _compute_rvol_and_day_stats(sym: str, trading_day: date):
+    """Return (rvol, day_vol, last_price, prev_close, dollar_vol)."""
+    if not _client:
+        return 1.0, 0.0, 0.0, 0.0, 0.0
+
+    # Intraday minute bars for day volume / last price
+    bars = _fetch_intraday(sym, trading_day)
+    if not bars:
+        return 1.0, 0.0, 0.0, 0.0, 0.0
+
+    day_vol = float(sum(getattr(b, "volume", getattr(b, "v", 0)) for b in bars))
+    last_price = float(getattr(bars[-1], "close", getattr(bars[-1], "c", 0)) or 0)
+
+    # Daily history
+    try:
+        start = (trading_day - timedelta(days=30)).isoformat()
+        end = trading_day.isoformat()
+        daily = list(
+            _client.list_aggs(
+                sym,
+                1,
+                "day",
+                start,
+                end,
+                limit=50,
+                sort="asc",
+            )
+        )
+    except Exception as e:
+        print(f"[volume] daily agg error for {sym}: {e}")
+        return 1.0, day_vol, last_price, 0.0, 0.0
+
+    if not daily:
+        return 1.0, day_vol, last_price, 0.0, 0.0
+
+    d0 = daily[-1]
+    prev_close = float(getattr(daily[-2], "close", getattr(daily[-2], "c", 0))) if len(daily) >= 2 else 0.0
+
+    hist = daily[:-1] if len(daily) > 1 else daily
+    recent = hist[-20:] if len(hist) > 20 else hist
+    if not recent:
+        avg_vol = float(getattr(d0, "volume", getattr(d0, "v", 0)))
+    else:
+        avg_vol = sum(float(getattr(d, "volume", getattr(d, "v", 0))) for d in recent) / len(recent)
+
+    rvol = day_vol / avg_vol if avg_vol > 0 else 1.0
+    dollar_vol = last_price * day_vol
+    return rvol, day_vol, last_price, prev_close, dollar_vol
+
+
+def _find_monster_bar(sym: str, bars: List, last_price: float) -> tuple[bool, float]:
+    """
+    Look for a "monster" volume bar intraday relative to others.
+
+    Returns (found, monster_bar_vol).
+    """
+    if not bars or last_price <= 0:
+        return False, 0.0
+
+    vols = [float(getattr(b, "volume", getattr(b, "v", 0))) for b in bars]
+    if not vols:
+        return False, 0.0
+
+    max_bar_vol = max(vols)
+    dollar_bar = max_bar_vol * last_price
+
+    if max_bar_vol < MIN_MONSTER_BAR_SHARES:
+        return False, max_bar_vol
+    if dollar_bar < MIN_MONSTER_DOLLAR_VOL:
+        return False, max_bar_vol
+
+    return True, max_bar_vol
+
+
 # ------- MAIN BOT -------
 async def run_volume():
     """
-    Volume Monster Bot (FIXED):
+    Volume Monster Bot:
 
-      • Uses correct Polygon minute agg timestamps (Unix ms).
-      • Scans for 1-minute volume spikes.
-      • RVOL, price, and dollar-volume filters.
-      • Premium alert formatting.
+      • Uses dynamic universe (top volume names) unless TICKER_UNIVERSE is set.
+      • Filters by:
+          - Day RVOL >= MIN_VOLUME_RVOL (default 1.8x)
+          - Day volume >= MIN_VOLUME_GLOBAL
+          - Dollar volume >= MIN_MONSTER_DOLLAR_VOL
+          - At least one intraday bar with:
+              * volume >= MIN_MONSTER_BAR_SHARES
+              * bar-dollar-vol >= MIN_MONSTER_DOLLAR_VOL
+      • Alerts once per symbol per day.
     """
-
-    if not POLYGON_KEY or not _client:
-        print("[volume] no API key; skipping.")
-        return
+    _reset_if_new_day()
 
     if not _in_volume_window():
-        print("[volume] outside RTH; skipping.")
+        print("[volume] outside RTH window; skipping.")
+        return
+
+    if not POLYGON_KEY or not _client:
+        print("[volume] missing POLYGON_KEY or client; skipping.")
         return
 
     universe = _get_universe()
-    today = date.today()
-    today_s = today.isoformat()
+    if not universe:
+        print("[volume] empty universe; skipping.")
+        return
 
-    # Compute start-of-day and now timestamps for minute bars
-    now_et = datetime.now(eastern)
-    sod = datetime(now_et.year, now_et.month, now_et.day, 9, 30, 0, tzinfo=eastern)
-
-    sod_ms = int(sod.timestamp() * 1000)
-    now_ms = int(now_et.timestamp() * 1000)
+    trading_day = date.today()
 
     for sym in universe:
         if is_etf_blacklisted(sym):
             continue
-
-        # 1) Day-level filters via daily aggs
-        try:
-            daily = _client.list_aggs(
-                sym,
-                1,
-                "day",
-                (today - timedelta(days=20)).isoformat(),
-                today_s,
-                limit=30,
-                sort="asc",
-            )
-            days = list(daily)
-        except Exception as e:
-            print(f"[volume] daily aggs error for {sym}: {e}")
+        if _already_alerted(sym):
             continue
 
-        if len(days) < 2:
+        # Compute day stats
+        rvol, day_vol, last_price, prev_close, dollar_vol = _compute_rvol_and_day_stats(sym, trading_day)
+        if last_price <= 0 or prev_close <= 0:
+            continue
+        if last_price < MIN_MONSTER_PRICE:
             continue
 
-        d0 = days[-1]   # today
-        d1 = days[-2]   # prior day
-
-        last_price = float(getattr(d0, "close", getattr(d0, "c", 0.0)))
-        prev_close = float(getattr(d1, "close", getattr(d1, "c", 0.0)))
-
-        if last_price < MIN_MONSTER_PRICE or prev_close <= 0:
-            continue
-
-        # RVOL
-        hist = days[:-1]
-        recent = hist[-20:] if len(hist) > 20 else hist
-        avg_vol = sum(float(getattr(d, "volume", getattr(d, "v", 0.0))) for d in recent) / len(recent)
-        day_vol = float(getattr(d0, "volume", getattr(d0, "v", 0.0)))
-        rvol = day_vol / avg_vol if avg_vol > 0 else 1.0
-
-        # Loosened RVOL threshold a bit
-        if rvol < max(1.8, MIN_RVOL_GLOBAL):
+        # Softer, bot-specific RVOL gate
+        if rvol < MIN_VOLUME_RVOL:
             continue
         if day_vol < MIN_VOLUME_GLOBAL:
             continue
-
-        dollar_vol = last_price * day_vol
         if dollar_vol < MIN_MONSTER_DOLLAR_VOL:
             continue
 
+        # Intraday minute bars (for actual monster-bar detection)
+        bars = _fetch_intraday(sym, trading_day)
+        if not bars:
+            continue
+
+        found, monster_bar_vol = _find_monster_bar(sym, bars, last_price)
+        if not found:
+            continue
+
         move_pct = (last_price - prev_close) / prev_close * 100.0
+        grade = grade_equity_setup(move_pct, rvol, dollar_vol)
+        bias = "Bullish accumulation" if move_pct >= 0 else "Bearish distribution"
 
-        # 2) Minute-level monster bar
-        try:
-            mins_iter = _client.list_aggs(
-                sym,
-                1,
-                "minute",
-                today_s,
-                today_s,
-                limit=1500,
-                sort="asc",
-            )
-            mins = [m for m in mins_iter if getattr(m, "timestamp", getattr(m, "t", None)) and sod_ms <= getattr(m, "timestamp", getattr(m, "t", 0)) <= now_ms]
-        except Exception as e:
-            print(f"[volume] minute aggs error for {sym}: {e}")
-            continue
-
-        if not mins:
-            continue
-
-        # find highest volume bar
-        def _vol(m):
-            return float(getattr(m, "volume", getattr(m, "v", 0.0)) or 0.0)
-
-        monster = max(mins, key=_vol)
-        monster_vol = _vol(monster)
-        monster_price = float(getattr(monster, "close", getattr(monster, "c", last_price)))
-
-        if monster_vol < MIN_MONSTER_BAR_SHARES:
-            continue
-
-        # Bias
-        bias = (
-            "Aggressive buying detected"
-            if monster_price >= last_price
-            else "Aggressive selling detected"
-        )
-
-        # Grade
-        grade = grade_equity_setup(abs(move_pct), rvol, dollar_vol)
-
-        # -------------------------------------------------------------
-        # PREMIUM ALERT FORMAT (MATCHED TO ALL OTHER BOTS)
-        # -------------------------------------------------------------
         body = (
-            f"📊 Monster 1-min bar: {monster_vol:,.0f} shares\n"
-            f"💹 Bar Close: ${monster_price:.2f}\n"
+            f"💥 Monster Volume Spike Detected\n"
             f"📈 Prev Close: ${prev_close:.2f} → Last: ${last_price:.2f} ({move_pct:.1f}%)\n"
             f"📦 Day Volume: {int(day_vol):,} (≈ ${dollar_vol:,.0f} notional)\n"
+            f"📦 Biggest 1-min Bar: {int(monster_bar_vol):,} shares "
+            f"(≈ ${monster_bar_vol * last_price:,.0f})\n"
             f"📊 RVOL: {rvol:.1f}x\n"
             f"🎯 Setup Grade: {grade}\n"
             f"📌 Bias: {bias}\n"
             f"🔗 Chart: {chart_link(sym)}"
         )
 
-        ts = now_et.strftime("%I:%M %p EST · %b %d").lstrip("0")
+        time_str = now_est().strftime("%I:%M %p EST · %b %d").lstrip("0")
 
         extra = (
             f"📣 VOLUME — {sym}\n"
-            f"🕒 {ts}\n"
+            f"🕒 {time_str}\n"
             f"💰 ${last_price:.2f} · 📊 RVOL {rvol:.1f}x\n"
             "────────────\n"
             f"{body}"
