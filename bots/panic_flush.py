@@ -3,6 +3,7 @@
 import os
 from datetime import date, timedelta, datetime
 from typing import List
+
 import pytz
 
 try:
@@ -24,11 +25,17 @@ from bots.shared import (
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 eastern = pytz.timezone("US/Eastern")
 
+# ------------------- CONFIG -------------------
+
 MIN_PRICE = float(os.getenv("PANIC_MIN_PRICE", "5.0"))
-MIN_DROP_PCT = float(os.getenv("PANIC_MIN_DROP_PCT", "12.0"))  # -12%+
-MIN_PANIC_RVOL = float(os.getenv("PANIC_MIN_RVOL", "4.0"))
+MAX_PRICE = float(os.getenv("PANIC_MAX_PRICE", "200.0"))
 MIN_DOLLAR_VOL = float(os.getenv("PANIC_MIN_DOLLAR_VOL", "30000000"))  # $30M+
-NEAR_LOW_PCT = float(os.getenv("PANIC_NEAR_LOW_PCT", "2.0"))  # within 2% of 52w low
+MIN_RVOL = float(os.getenv("PANIC_MIN_RVOL", "2.0"))
+MIN_DOWN_PCT = float(os.getenv("PANIC_MIN_DOWN_PCT", "5.0"))
+NEAR_LOW_PCT = float(os.getenv("PANIC_NEAR_LOW_PCT", "5.0"))  # within 5% of 52w low
+LOOKBACK_DAYS = int(os.getenv("PANIC_LOOKBACK_DAYS", "252"))  # ~52w
+
+# ------------------- STATE -------------------
 
 _alert_date: date | None = None
 _alerted: set[str] = set()
@@ -55,7 +62,7 @@ def _mark(sym: str):
 def _in_rth() -> bool:
     now = datetime.now(eastern)
     mins = now.hour * 60 + now.minute
-    return 9 * 60 + 30 <= mins <= 16 * 60
+    return 9 * 60 + 30 <= mins <= 16 * 60  # 09:30–16:00 ET
 
 
 def _universe() -> List[str]:
@@ -65,16 +72,22 @@ def _universe() -> List[str]:
     return get_dynamic_top_volume_universe(max_tickers=200, volume_coverage=0.97)
 
 
+# ------------------- MAIN BOT -------------------
+
+
 async def run_panic_flush():
     """
-    Panic Flush Bot — real capitulation days.
+    Panic Flush Bot — capitulation into 52-week lows.
 
-      • Price >= MIN_PRICE
-      • Day move <= -MIN_DROP_PCT
-      • RVOL >= max(MIN_PANIC_RVOL, MIN_RVOL_GLOBAL)
-      • Dollar volume >= MIN_DOLLAR_VOL
-      • Close within NEAR_LOW_PCT of 52-week low.
-      • Today’s low is a new 30-day low.
+      • Time: RTH only (09:30–16:00 ET)
+      • Universe: TICKER_UNIVERSE env OR dynamic top volume universe (200 names)
+      • Filters:
+          - Price between MIN_PRICE and MAX_PRICE
+          - Day $ volume ≥ MIN_DOLLAR_VOL
+          - RVOL ≥ max(MIN_RVOL_GLOBAL, MIN_RVOL)
+          - Down ≥ MIN_DOWN_PCT% on day
+          - Making a new 30-day low
+          - Within NEAR_LOW_PCT% of 52-week low
     """
     if not POLYGON_KEY or not _client:
         print("[panic_flush] Missing client/API key.")
@@ -94,15 +107,16 @@ async def run_panic_flush():
         if _already(sym):
             continue
 
+        # --- Fetch daily data ---
         try:
             days = list(
                 _client.list_aggs(
                     ticker=sym,
                     multiplier=1,
                     timespan="day",
-                    from_=(today - timedelta(days=260)).isoformat(),
+                    from_=(today - timedelta(days=LOOKBACK_DAYS)).isoformat(),
                     to=today_s,
-                    limit=260,
+                    limit=LOOKBACK_DAYS,
                 )
             )
         except Exception as e:
@@ -115,36 +129,40 @@ async def run_panic_flush():
         today_bar = days[-1]
         prev_bar = days[-2]
 
-        last_price = float(today_bar.close)
-        prev_close = float(prev_bar.close)
-
-        if last_price < MIN_PRICE:
+        try:
+            last_price = float(today_bar.close)
+            prev_close = float(prev_bar.close)
+            day_vol = float(today_bar.volume or 0.0)
+            day_low = float(today_bar.low)
+        except Exception:
             continue
 
-        move_pct = (
-            (last_price - prev_close) / prev_close * 100.0
-            if prev_close > 0 else 0.0
-        )
-        if move_pct > -MIN_DROP_PCT:
-            continue
-
-        hist = days[:-1]
-        recent = hist[-20:] if len(hist) > 20 else hist
-        avg_vol = sum(d.volume for d in recent) / len(recent)
-        day_vol = float(today_bar.volume)
-        rvol = day_vol / avg_vol if avg_vol > 0 else 1.0
-
-        if rvol < max(MIN_PANIC_RVOL, MIN_RVOL_GLOBAL):
-            continue
-        if day_vol < MIN_VOLUME_GLOBAL:
+        if last_price < MIN_PRICE or last_price > MAX_PRICE:
             continue
 
         dollar_vol = last_price * day_vol
-        if dollar_vol < MIN_DOLLAR_VOL:
+        if dollar_vol < max(MIN_DOLLAR_VOL, MIN_VOLUME_GLOBAL * last_price):
             continue
 
-        lows = [float(d.low) for d in days]
-        low_52w = min(lows)
+        # --- RVOL ---
+        vols = [float(d.volume or 0.0) for d in days[-21:-1]]
+        avg_vol = sum(vols) / max(len(vols), 1)
+        if avg_vol <= 0:
+            continue
+        rvol = day_vol / avg_vol
+        if rvol < max(MIN_RVOL_GLOBAL, MIN_RVOL):
+            continue
+
+        # Day move vs yesterday
+        if prev_close <= 0:
+            continue
+        move_pct = (last_price / prev_close - 1.0) * 100.0
+        if move_pct > -MIN_DOWN_PCT:
+            continue  # not flushed enough
+
+        # 52-week low
+        lows_52w = [float(d.low) for d in days]
+        low_52w = min(lows_52w)
         if low_52w <= 0:
             continue
 
@@ -152,21 +170,21 @@ async def run_panic_flush():
         if distance_from_low_pct > NEAR_LOW_PCT:
             continue
 
-        # Today’s low must be a new 30-day low
+        # Today's low must be a new 30-day low
         last_30 = days[-31:-1]
         if last_30:
             min_last_30 = min(float(d.low) for d in last_30)
-            if float(today_bar.low) > min_last_30:
+            if day_low > min_last_30:
                 continue
 
-        grade = grade_equity_setup(abs(move_pct), rvol, dollar_vol)
+        grade = grade_equity_setup(move_pct, rvol, dollar_vol)
 
+        # --- Alert formatting (A-style) ---
+        timestamp = datetime.now(eastern).strftime("%I:%M %p EST · %b %d").lstrip("0")
         emoji = "💥"
         skull_emoji = "☠️"
         money_emoji = "💰"
         divider = "────────────"
-        now_et = datetime.now(eastern)
-        timestamp = now_et.strftime("%I:%M %p EST · %b %d").lstrip("0")
 
         extra = (
             f"{emoji} PANIC FLUSH — {sym}\n"
