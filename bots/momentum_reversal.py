@@ -18,53 +18,50 @@ from bots.shared import (
     grade_equity_setup,
     is_etf_blacklisted,
     chart_link,
+    now_est,
 )
 
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
-
 eastern = pytz.timezone("US/Eastern")
 
-MIN_RUN_PCT = float(os.getenv("MIN_REVERSAL_RUN_PCT", "8.0"))          # move up from open to HOD
-MIN_PULLBACK_PCT = float(os.getenv("MIN_REVERSAL_PULLBACK_PCT", "3.0"))  # from HOD down to close
-MIN_REVERSAL_PRICE = float(os.getenv("MIN_REVERSAL_PRICE", "2.0"))
-MIN_REVERSAL_RVOL = float(os.getenv("MIN_REVERSAL_RVOL", "2.5"))
+MIN_RUN_PCT = float(os.getenv("MOM_RUN_MIN_PCT", "8.0"))
+MIN_PULLBACK_PCT = float(os.getenv("MOM_PULLBACK_MIN_PCT", "3.0"))
+MIN_MOM_PRICE = float(os.getenv("MOM_MIN_PRICE", "3.0"))
+MIN_MOM_RVOL = float(os.getenv("MOM_MIN_RVOL", "2.0"))
+MIN_MOM_DOLLAR_VOL = float(os.getenv("MOM_MIN_DOLLAR_VOL", "8000000"))
 
 
-def _in_reversal_window() -> bool:
-    """Only run AFTER 11:30 AM EST (through close)."""
-    now_et = datetime.now(eastern)
-    minutes = now_et.hour * 60 + now_et.minute
-    return 11 * 60 + 30 <= minutes <= 16 * 60
+def _in_momentum_window() -> bool:
+    now = datetime.now(eastern)
+    mins = now.hour * 60 + now.minute
+    # only after 11:30 to catch late-day reversals
+    return 11 * 60 + 30 <= mins <= 16 * 60
 
 
-def _get_ticker_universe() -> List[str]:
+def _get_universe() -> List[str]:
     env = os.getenv("TICKER_UNIVERSE")
     if env:
         return [t.strip().upper() for t in env.split(",") if t.strip()]
-    return get_dynamic_top_volume_universe(max_tickers=100, volume_coverage=0.90)
+    return get_dynamic_top_volume_universe(max_tickers=120, volume_coverage=0.95)
 
 
 async def run_momentum_reversal():
     """
-    Momentum Reversal (late-day):
+    Momentum Reversal Bot:
 
-      • Stock runs ≥ MIN_RUN_PCT from open to HOD
-      • Then pulls back ≥ MIN_PULLBACK_PCT from HOD to close
-      • Price >= MIN_REVERSAL_PRICE
-      • RVOL + volume filters
-      • Only scans after 11:30 AM EST
+      • Stock runs ≥ MIN_RUN_PCT from open to high.
+      • Then pulls back ≥ MIN_PULLBACK_PCT from high to close.
+      • Filters on price, RVOL, volume, dollar volume.
+      • Only scans after 11:30 AM ET (late-day swings).
     """
-    if not POLYGON_KEY:
-        print("[momentum_reversal] POLYGON_KEY not set; skipping scan.")
+    if not POLYGON_KEY or not _client:
+        print("[momentum_reversal] no API key/client; skipping.")
         return
-    if not _client:
-        print("[momentum_reversal] Client not initialized; skipping scan.")
-        return
-    if not _in_reversal_window():
-        print("[momentum_reversal] Outside 11:30–16:00 window; skipping scan.")
+    if not _in_momentum_window():
+        print("[momentum_reversal] outside 11:30–16:00; skipping.")
         return
 
-    universe = _get_ticker_universe()
+    universe = _get_universe()
     today = date.today()
     today_s = today.isoformat()
 
@@ -72,39 +69,41 @@ async def run_momentum_reversal():
         if is_etf_blacklisted(sym):
             continue
 
-        # intraday minute bars
+        # intraday 1d-agg to get OHLC and volume
         try:
-            mins = list(
+            intrabars = list(
                 _client.list_aggs(
                     ticker=sym,
                     multiplier=1,
-                    timespan="minute",
+                    timespan="day",
                     from_=today_s,
                     to=today_s,
-                    limit=10_000,
+                    limit=1,
                 )
             )
         except Exception as e:
-            print(f"[momentum_reversal] minute fetch failed for {sym}: {e}")
+            print(f"[momentum_reversal] intraday fetch failed for {sym}: {e}")
             continue
 
-        if len(mins) < 20:
+        if not intrabars:
             continue
 
-        open_price = float(mins[0].open)
-        last_price = float(mins[-1].close)
-        day_high = max(float(b.high) for b in mins)
-        day_low = min(float(b.low) for b in mins)
+        ib = intrabars[0]
+        day_open = float(ib.open)
+        day_high = float(ib.high)
+        day_low = float(ib.low)
+        last_price = float(ib.close)
+        vol_today = float(ib.volume)
 
-        if open_price <= 0 or last_price < MIN_REVERSAL_PRICE:
+        if last_price < MIN_MOM_PRICE:
+            continue
+        if day_open <= 0 or day_high <= 0:
             continue
 
-        # Run up from open to high
-        run_pct = (day_high - open_price) / open_price * 100.0
+        run_pct = (day_high - day_open) / day_open * 100.0
         if run_pct < MIN_RUN_PCT:
             continue
 
-        # Pullback from high to close
         pullback_pct = (day_high - last_price) / day_high * 100.0
         if pullback_pct < MIN_PULLBACK_PCT:
             continue
@@ -130,7 +129,10 @@ async def run_momentum_reversal():
 
         today_bar = days[-1]
         prev = days[-2]
+
         prev_close = float(prev.close)
+        if prev_close <= 0:
+            continue
 
         hist = days[:-1]
         if hist:
@@ -144,35 +146,29 @@ async def run_momentum_reversal():
         else:
             rvol = 1.0
 
-        if rvol < max(MIN_REVERSAL_RVOL, MIN_RVOL_GLOBAL):
+        if rvol < max(MIN_MOM_RVOL, MIN_RVOL_GLOBAL):
             continue
 
-        vol_today = float(today_bar.volume)
         if vol_today < MIN_VOLUME_GLOBAL:
             continue
 
-        move_pct = (last_price - prev_close) / prev_close * 100.0 if prev_close > 0 else 0.0
-        dv = last_price * vol_today
-        grade = grade_equity_setup(abs(move_pct), rvol, dv)
+        dollar_vol = last_price * vol_today
+        if dollar_vol < MIN_MOM_DOLLAR_VOL:
+            continue
 
-        # Bias explanation: could be dip-buy or short
-        bias = (
-            "Potential dip-buy zone after strong run"
-            if move_pct > 0
-            else "Potential short entry after failed run"
-        )
+        move_pct = (last_price - prev_close) / prev_close * 100.0
 
-        if day_high > 0:
-            from_high_pct = (day_high - last_price) / day_high * 100.0
+        if last_price > day_open:
+            bias = "Dip-buy opportunity after strong run"
         else:
-            from_high_pct = 0.0
+            bias = "Mean-reversion short after exhaustion"
 
-        if abs(from_high_pct) < 1.0:
-            hod_text = "at/near HOD"
-        else:
-            hod_text = f"{from_high_pct:.1f}% below HOD"
+        from_high_pct = (day_high - last_price) / day_high * 100.0
+        hod_text = f"{from_high_pct:.1f}% below HOD"
 
-        extra = (
+        grade = grade_equity_setup(abs(move_pct), rvol, dollar_vol)
+
+        body = (
             f"🔄 Late-day momentum reversal\n"
             f"🚀 Run from open to high: {run_pct:.1f}%\n"
             f"📉 Pullback from high to close: {pullback_pct:.1f}%\n"
@@ -182,6 +178,14 @@ async def run_momentum_reversal():
             f"🎯 Setup Grade: {grade}\n"
             f"📌 Bias: {bias}\n"
             f"🔗 Chart: {chart_link(sym)}"
+        )
+
+        extra = (
+            f"📣 MOMENTUM_REVERSAL — {sym}\n"
+            f"🕒 {now_est()}\n"
+            f"💰 ${last_price:.2f} · 📊 RVOL {rvol:.1f}x\n"
+            "────────────\n"
+            f"{body}"
         )
 
         send_alert("momentum_reversal", sym, last_price, rvol, extra=extra)
