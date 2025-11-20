@@ -151,7 +151,8 @@ async def run_swing_pullback():
             continue
 
         dollar_vol = last_price * day_vol
-        if dollar_vol < MAX(MIN_DOLLAR_VOL, MIN_VOLUME_GLOBAL * last_price):
+        # FIX: use built-in max(), not undefined MAX
+        if dollar_vol < max(MIN_DOLLAR_VOL, MIN_VOLUME_GLOBAL * last_price):
             continue
 
         # --- RVOL ---
