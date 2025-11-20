@@ -34,7 +34,7 @@ REQUIRE_SHORT_DATA = os.getenv("SQUEEZE_REQUIRE_SHORT_DATA", "false").lower() ==
 
 
 def _in_squeeze_window() -> bool:
-    now = datetime.now(eastern)
+    now = now_est()
     mins = now.hour * 60 + now.minute
     return 9 * 60 + 30 <= mins <= 16 * 60
 
@@ -129,6 +129,10 @@ async def run_squeeze():
 
         # Optional short-interest gate – left as placeholder
         si_text = "Short interest data not enforced"
+        if REQUIRE_SHORT_DATA:
+            # If you wire short-interest in later, you can enforce a gate here.
+            # For now we just annotate the message.
+            si_text = "Short interest gate enabled, but external data not wired."
 
         grade = grade_equity_setup(abs(move_pct), rvol, dollar_vol)
 
@@ -138,7 +142,11 @@ async def run_squeeze():
             else "off highs"
         )
 
-        bias = "Nuclear long squeeze candidate" if move_pct > 0 else "Violent downside squeeze / liquidation"
+        bias = (
+            "Nuclear long squeeze candidate"
+            if move_pct > 0
+            else "Violent downside squeeze / liquidation"
+        )
 
         body = (
             f"🔥 Short Squeeze Behaviour Detected\n"
@@ -151,9 +159,12 @@ async def run_squeeze():
             f"🔗 Chart: {chart_link(sym)}"
         )
 
+        # Nicely formatted timestamp like the other bots
+        ts = now_est().strftime("%I:%M %p EST · %b %d").lstrip("0")
+
         extra = (
             f"📣 SQUEEZE — {sym}\n"
-            f"🕒 {now_est()}\n"
+            f"🕒 {ts}\n"
             f"💰 ${last_price:.2f} · 📊 RVOL {rvol:.1f}x\n"
             "────────────\n"
             f"{body}"
