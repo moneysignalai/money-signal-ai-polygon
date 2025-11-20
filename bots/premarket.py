@@ -247,12 +247,7 @@ async def run_premarket():
             else "Watch for continuation / short setup on weakness"
         )
 
-        header_emoji = "📣"
-        extra = (
-            f"{header_emoji} PREMARKET — {sym}\n"
-            f"🕒 {now_est()}\n"
-            f"💰 ${last_px:.2f} · 📊 RVOL {rvol:.1f}x\n"
-            "────────────\n"
+        body = (
             f"{emoji} Premarket move: {move_pct:.1f}% {direction} vs prior close\n"
             f"📈 Prev Close: ${prev_close:.2f} → Premarket Last: ${last_px:.2f}\n"
             f"📏 Premarket Range: ${pre_low:.2f} – ${pre_high:.2f}\n"
@@ -264,4 +259,13 @@ async def run_premarket():
         )
 
         _mark_alerted(sym)
+        
+        extra = (
+            f"📣 PREMARKET — {sym}\n"
+            f"🕒 {now_est()}\n"
+            f"💰 ${last_px:.2f} · 📊 RVOL {rvol:.1f}x\n"
+            "────────────\n"
+            f"{body}"
+        )
+
         send_alert("premarket", sym, last_px, rvol, extra=extra)
