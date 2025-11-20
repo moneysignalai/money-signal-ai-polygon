@@ -1,6 +1,6 @@
 import os
 from datetime import date, timedelta, datetime
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Any
 
 import pytz
 
@@ -36,11 +36,11 @@ PREMARKET_START_MIN = 4 * 60
 PREMARKET_END_MIN = 9 * 60 + 29
 
 # Per-day de-dupe
-_alerted_date = None
-_alerted_syms = set()
+_alerted_date: Optional[date] = None
+_alerted_syms: set[str] = set()
 
 
-def _reset_if_new_day():
+def _reset_if_new_day() -> None:
     global _alerted_date, _alerted_syms
     today = date.today()
     if _alerted_date != today:
@@ -53,7 +53,7 @@ def _already(sym: str) -> bool:
     return sym in _alerted_syms
 
 
-def _mark_alerted(sym: str):
+def _mark_alerted(sym: str) -> None:
     _reset_if_new_day()
     _alerted_syms.add(sym)
 
@@ -97,13 +97,34 @@ def _get_prev_and_today(sym: str):
     return days[-2], days[-1]
 
 
+def _get_bar_timestamp_et(bar: Any) -> Optional[datetime]:
+    """
+    Convert Polygon agg bar timestamp (ms) to a timezone-aware datetime in EST.
+    Polygon v2 aggs typically expose 'timestamp' or 't' in milliseconds since epoch.
+    """
+    ts = getattr(bar, "timestamp", None)
+    if ts is None:
+        ts = getattr(bar, "t", None)
+    if ts is None:
+        return None
+    try:
+        # Polygon uses ms; convert to seconds
+        dt_utc = datetime.fromtimestamp(ts / 1000.0, tz=pytz.UTC)
+        return dt_utc.astimezone(eastern)
+    except Exception:
+        return None
+
+
 def _get_premarket_window_aggs(sym: str) -> Tuple[float, float, float, float]:
     """
     Returns (pre_low, pre_high, pre_last, pre_volume) for 1m bars between 04:00–09:29.
+
+    IMPORTANT: Polygon complained about ISO datetimes in 'from'.
+    To keep it happy, we request the whole **day** using just YYYY-MM-DD and
+    then filter 04:00–09:29 ET in Python based on each bar's timestamp.
     """
     today = date.today()
-    start = datetime(today.year, today.month, today.day, 4, 0, tzinfo=eastern)
-    end = datetime(today.year, today.month, today.day, 9, 29, tzinfo=eastern)
+    day_str = today.isoformat()
 
     try:
         bars = list(
@@ -111,8 +132,8 @@ def _get_premarket_window_aggs(sym: str) -> Tuple[float, float, float, float]:
                 ticker=sym,
                 multiplier=1,
                 timespan="minute",
-                from_=start.isoformat(),
-                to=end.isoformat(),
+                from_=day_str,  # YYYY-MM-DD (Polygon-friendly)
+                to=day_str,
                 limit=2000,
             )
         )
@@ -123,13 +144,25 @@ def _get_premarket_window_aggs(sym: str) -> Tuple[float, float, float, float]:
     if not bars:
         return 0.0, 0.0, 0.0, 0.0
 
-    lows = [float(b.low) for b in bars]
-    highs = [float(b.high) for b in bars]
-    vols = [float(b.volume) for b in bars]
+    pre_bars = []
+    for b in bars:
+        dt_et = _get_bar_timestamp_et(b)
+        if not dt_et:
+            continue
+        mins = dt_et.hour * 60 + dt_et.minute
+        if PREMARKET_START_MIN <= mins <= PREMARKET_END_MIN:
+            pre_bars.append(b)
+
+    if not pre_bars:
+        return 0.0, 0.0, 0.0, 0.0
+
+    lows = [float(b.low) for b in pre_bars]
+    highs = [float(b.high) for b in pre_bars]
+    vols = [float(b.volume) for b in pre_bars]
 
     pre_low = min(lows)
     pre_high = max(highs)
-    pre_last = float(bars[-1].close)
+    pre_last = float(pre_bars[-1].close)
     pre_vol = sum(vols)
 
     return pre_low, pre_high, pre_last, pre_vol
@@ -259,7 +292,7 @@ async def run_premarket():
         )
 
         _mark_alerted(sym)
-        
+
         extra = (
             f"📣 PREMARKET — {sym}\n"
             f"🕒 {now_est()}\n"
