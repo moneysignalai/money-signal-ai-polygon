@@ -21,14 +21,14 @@ eastern = pytz.timezone("US/Eastern")
 #   UNUSUAL_MIN_NOTIONAL, UNUSUAL_MIN_SIZE, UNUSUAL_MAX_DTE
 
 # Minimum notional (price * size * 100) per sweep
-# 🔥 Raise floor to $100k by default
-MIN_NOTIONAL = float(os.getenv("UNUSUAL_MIN_NOTIONAL", "100000"))  # default $100k+
+# ✅ default $100k+ as requested
+MIN_NOTIONAL = float(os.getenv("UNUSUAL_MIN_NOTIONAL", "100000"))
 
 # Minimum number of contracts in the last trade
-MIN_TRADE_SIZE = int(os.getenv("UNUSUAL_MIN_SIZE", "10"))          # default 10+ contracts
+MIN_TRADE_SIZE = int(os.getenv("UNUSUAL_MIN_SIZE", "10"))  # default 10+ contracts
 
 # Maximum days to expiration
-MAX_DTE = int(os.getenv("UNUSUAL_MAX_DTE", "45"))                  # default 45 days out
+MAX_DTE = int(os.getenv("UNUSUAL_MAX_DTE", "45"))  # default 45 days out
 
 # --------------- Per-day dedupe (per contract) ----------------
 alert_date: date | None = None
@@ -71,14 +71,8 @@ def _parse_option_symbol(sym: str):
 
     try:
         base = sym[2:]
-
-        # Find first digit – start of YYMMDD
-        idx = 0
-        while idx < len(base) and not base[idx].isdigit():
-            idx += 1
-
-        under = base[:idx]
-        rest = base[idx:]
+        under = base[: base.find("2")]
+        rest = base[len(under):]
 
         exp_raw = rest[:6]      # YYMMDD
         cp = rest[6]            # C/P
@@ -147,53 +141,6 @@ def _moneyness_label(under_px: float | None, strike: float | None, cp: str | Non
     return label, dist_pct
 
 
-def _extract_price_and_size(last_trade: dict):
-    """
-    Make this robust to different Polygon shapes.
-
-    Expected possibilities:
-      • {"results": {...}}               # dict
-      • {"results": [{...}, ...]}        # list
-      • {"last": {...}}                  # some endpoints
-    """
-    if not last_trade:
-        return None, None
-
-    trade = None
-
-    if "results" in last_trade:
-        res = last_trade["results"]
-        if isinstance(res, list) and res:
-            trade = res[0]
-        elif isinstance(res, dict):
-            trade = res
-    elif "last" in last_trade:
-        trade = last_trade["last"]
-
-    if trade is None:
-        trade = last_trade
-
-    price = (
-        trade.get("p")
-        or trade.get("price")
-        or trade.get("P")
-    )
-    size = (
-        trade.get("s")
-        or trade.get("size")
-        or trade.get("q")
-        or trade.get("volume")
-    )
-
-    try:
-        price = float(price)
-        size = int(size)
-    except Exception:
-        return None, None
-
-    return price, size
-
-
 # --------------- Core scan ----------------
 
 
@@ -203,9 +150,34 @@ async def run_unusual():
     """
     _reset_day()
 
+    # Primary source: dynamic universe from Polygon
     universe = get_dynamic_top_volume_universe(max_tickers=150, volume_coverage=0.90)
+
+    # ✅ Fallback if dynamic universe is empty
     if not universe:
-        print("[unusual] empty universe; skipping.")
+        # 1) Try explicit TICKER_UNIVERSE env if you ever set it
+        env = os.getenv("TICKER_UNIVERSE")
+        if env:
+            universe = [x.strip().upper() for x in env.split(",") if x.strip()]
+        else:
+            # 2) Hard-coded top 50 popular, liquid, options-heavy names
+            universe = [
+                "SPY", "QQQ", "IWM", "DIA",
+                "AAPL", "MSFT", "NVDA", "TSLA", "AMD",
+                "META", "GOOGL", "AMZN", "NFLX", "AVGO",
+                "SMCI", "MU", "INTC", "ORCL", "CRM",
+                "SHOP", "PANW", "ARM", "PLTR", "SOFI",
+                "COIN", "HOOD", "RIVN", "LCID", "NIO",
+                "F", "GM", "T", "VZ", "BAC",
+                "JPM", "WFC", "C", "XOM", "CVX",
+                "OXY", "SLB", "PFE", "MRK", "LLY",
+                "UNH", "TSM", "BABA", "JD", "SQ",
+                "UBER",
+            ]
+
+    if not universe:
+        # Only hits if *everything* is broken (Polygon + env + fallback)
+        print("[unusual] empty universe even after fallback; skipping.")
         return
 
     for sym in universe:
@@ -226,9 +198,20 @@ async def run_unusual():
             if not last_trade:
                 continue
 
-            # 🔧 Robust extraction of price & size
-            price, size = _extract_price_and_size(last_trade)
+            try:
+                last = last_trade.get("results", [{}])[0]
+            except Exception:
+                continue
+
+            price = last.get("p")
+            size = last.get("s")
             if price is None or size is None:
+                continue
+
+            try:
+                price = float(price)
+                size = int(size)
+            except Exception:
                 continue
 
             if size < MIN_TRADE_SIZE:
@@ -246,14 +229,8 @@ async def run_unusual():
             if dte is None or dte < 0 or dte > MAX_DTE:
                 continue
 
-            # Explicit CALL + PUT handling
-            cp_raw_up = cp_raw.upper()
-            if cp_raw_up == "C":
-                cp = "CALL"
-            elif cp_raw_up == "P":
-                cp = "PUT"
-            else:
-                continue  # unknown type, skip
+            # Interpret call/put correctly
+            cp = "CALL" if cp_raw.upper() == "C" else "PUT"
 
             under_px = _underlying_price_from_opt(opt)
             m_label, m_dist = _moneyness_label(under_px, strike, cp)
