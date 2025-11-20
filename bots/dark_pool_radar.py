@@ -61,16 +61,27 @@ def _mark(sym: str):
 
 def _in_dark_window() -> bool:
     """
-    Dark/ATS prints exist in premarket + RTH + after-hours, not literal 24/7.
-    We'll monitor 4:00–20:00 ET Mon–Fri.
+    Dark/ATS prints (FINRA TRF) can hit:
+      • Premarket
+      • Regular hours
+      • After-hours
+    and can be reported with a short delay.
+
+    We monitor:
+      • Weekdays only
+      • 04:00–20:15 ET (premarket → RTH → after-hours + ~15 min for late prints).
     """
     now = datetime.now(eastern)
+
+    # Skip weekends entirely
     if now.weekday() >= 5:
         print("[dark_pool] Weekend; skipping.")
         return False
 
     mins = now.hour * 60 + now.minute
-    return 4 * 60 <= mins <= 20 * 60  # 4:00–20:00 ET
+
+    # 04:00 = 240, 20:15 = 1215
+    return 4 * 60 <= mins <= 20 * 60 + 15  # 4:00–20:15 ET
 
 
 def _universe() -> List[str]:
@@ -88,7 +99,7 @@ async def run_dark_pool_radar():
     """
     Dark Pool Radar Bot — "oh wow" clusters.
 
-      • Time: 4:00–20:00 ET (premarket + RTH + after-hours).
+      • Time: 4:00–20:15 ET (premarket + RTH + after-hours + delay buffer).
       • Underlying:
           - RVOL ≥ max(MIN_DARK_RVOL, MIN_RVOL_GLOBAL)
           - Volume ≥ MIN_VOLUME_GLOBAL
@@ -102,7 +113,7 @@ async def run_dark_pool_radar():
         print("[dark_pool] Missing client/API key.")
         return
     if not _in_dark_window():
-        print("[dark_pool] Outside dark window; skipping.")
+        print("[dark_pool] Outside 04:00–20:15 EST window; skipping.")
         return
 
     _reset_if_new_day()
