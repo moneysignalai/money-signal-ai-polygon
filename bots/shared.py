@@ -2,7 +2,6 @@
 import os
 import time
 import math
-import json
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from typing import Dict, Any, List, Optional, Tuple
@@ -36,7 +35,13 @@ eastern = pytz.timezone("US/Eastern")
 
 
 def now_est() -> str:
-    """Human-friendly time string in Eastern, e.g. '10:48 AM EST · Nov 20'."""
+    """
+    Human-friendly time string in Eastern, e.g. '10:48 AM EST · Nov 20'.
+
+    NOTE: this returns a STRING on purpose, so bots can just do:
+        ts = now_est()
+    and drop it straight into messages.
+    """
     return datetime.now(eastern).strftime("%I:%M %p EST · %b %d").lstrip("0")
 
 
@@ -117,11 +122,57 @@ def report_status_error(bot: str, message: str) -> None:
     Soft error reporting to the status bot.
 
     Called by shared helpers when a non-fatal error happens (e.g. Polygon fails),
-    so it shows up in the Telegram error digest even if the main bot continues.
+    so it shows up in Telegram even if the main bot continues.
     """
     ts = now_est()
     text = f"⚠️ [{bot}] {ts}\n{message}"
     _send_status(text)
+
+
+# ---------------- HTTP HELPER WITH RETRIES ----------------
+
+
+def _http_get_json(
+    url: str,
+    params: Dict[str, Any],
+    *,
+    tag: str,
+    timeout: float = 20.0,
+    retries: int = 2,
+    backoff_seconds: float = 2.5,
+) -> Optional[Dict[str, Any]]:
+    """
+    Thin wrapper around requests.get with:
+      • configurable timeout
+      • a few retries with exponential backoff
+      • optional status reporting on final failure
+
+    This is used for ALL Polygon grouped/agg/snapshot GETs so that transient
+    slowness does not kill the bots or flood them with exceptions.
+    """
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.get(url, params=params, timeout=timeout)
+            # Graceful handling of rate limits
+            if resp.status_code == 429:
+                wait = backoff_seconds * (attempt + 1)
+                print(f"[{tag}] Polygon 429 rate-limit; sleeping {wait:.1f}s before retry.")
+                time.sleep(wait)
+                continue
+
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            if attempt < retries:
+                wait = backoff_seconds * (attempt + 1)
+                print(f"[{tag}] HTTP error on attempt {attempt+1}/{retries+1}: {e} — retrying in {wait:.1f}s")
+                time.sleep(wait)
+            else:
+                msg = f"[{tag}] error after {retries+1} attempts: {e}"
+                print(msg)
+                report_status_error(tag, msg)
+                return None
+    return None
 
 
 # ---------------- DYNAMIC UNIVERSE ----------------
@@ -134,28 +185,38 @@ def get_dynamic_top_volume_universe(
     """
     Use Polygon's previous day's most-active (by dollar volume) to build a liquid universe.
 
-    We try the v2 /aggs/grouped endpoint with sort by 'v' or 'otc' as needed.
+    Mode A (stable): we also allow env overrides to keep the universe size sane:
+      • DYNAMIC_MAX_TICKERS — global cap on tickers regardless of caller's request
+      • DYNAMIC_VOLUME_COVERAGE — override coverage fraction (e.g. 0.95)
     """
     if not POLYGON_KEY:
         print("[shared] POLYGON_KEY missing; cannot build dynamic universe.")
         return []
 
+    # Apply global caps from env for safety
+    try:
+        env_cap = int(os.getenv("DYNAMIC_MAX_TICKERS", str(max_tickers)))
+        max_tickers = max(1, min(max_tickers, env_cap))
+    except Exception:
+        pass
+
+    try:
+        env_cov = os.getenv("DYNAMIC_VOLUME_COVERAGE")
+        if env_cov is not None:
+            volume_coverage = float(env_cov)
+    except Exception:
+        pass
+
     today = today_est_date()
     prev = today - timedelta(days=1)
     from_ = prev.isoformat()
-    to_ = prev.isoformat()
 
     url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{from_}"
     params = {"adjusted": "true", "apiKey": POLYGON_KEY}
 
-    try:
-        r = requests.get(url, params=params, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        msg = f"[shared] error fetching dynamic universe: {e}"
-        print(msg)
-        report_status_error("shared:universe", msg)
+    data = _http_get_json(url, params, tag="shared:universe", timeout=20.0, retries=2)
+    if not data:
+        # Error already reported by _http_get_json
         return []
 
     results = data.get("results") or []
@@ -165,10 +226,14 @@ def get_dynamic_top_volume_universe(
         sym = row.get("T")
         vol = float(row.get("v") or 0.0)
         vwap = float(row.get("vw") or 0.0)
-        dollar_vol = vol * vwap
+        dollar_vol = vol * max(vwap, 0.0)
         if not sym or dollar_vol <= 0:
             continue
         enriched.append((sym, vol, dollar_vol))
+
+    if not enriched:
+        print("[shared] dynamic universe: 0 names after filtering.")
+        return []
 
     enriched.sort(key=lambda x: x[2], reverse=True)
 
@@ -225,36 +290,36 @@ _LAST_TRADE_CACHE: Dict[str, LastTradeCacheEntry] = {}
 def get_last_trade_cached(symbol: str, ttl_seconds: int = 15) -> Tuple[Optional[float], Optional[float]]:
     """
     Cached last / dollar volume for the underlying (equity/ETF).
-    Uses v2 last trade + previous day's volume as an approximation.
+    Uses v2 last trade + MIN_VOLUME_GLOBAL as a rough dollar-vol approximation.
+
+    Mode A tweaks:
+      • Uses shared HTTP helper with retries + longer timeout.
+      • Keeps TTL modest (15s) so rapidly moving names still refresh.
     """
     if not POLYGON_KEY:
         print("[shared] POLYGON_KEY missing; cannot fetch last trade.")
         return None, None
 
     key = symbol.upper()
-    now = time.time()
+    now_ts = time.time()
     entry = _LAST_TRADE_CACHE.get(key)
-    if entry and isinstance(entry.ts, (int, float)) and now - float(entry.ts) < ttl_seconds:
+    if entry and isinstance(entry.ts, (int, float)) and now_ts - float(entry.ts) < ttl_seconds:
         return entry.last, entry.dollar_vol
 
     # v2 last trade
     url = f"https://api.polygon.io/v2/last/trade/{symbol.upper()}"
     params = {"apiKey": POLYGON_KEY}
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        msg = f"[shared] error fetching last trade for {symbol}: {e}"
-        print(msg)
-        report_status_error("shared:last_trade", msg)
+
+    data = _http_get_json(url, params, tag="shared:last_trade", timeout=15.0, retries=1)
+    if not data:
         return None, None
 
-    last_raw = (
-        (data.get("results") or {}).get("p")
-        if isinstance(data.get("results"), dict)
-        else None
-    )
+    results = data.get("results")
+    if isinstance(results, dict):
+        last_raw = results.get("p")
+    else:
+        last_raw = None
+
     try:
         last_price = float(last_raw) if last_raw is not None else None
     except (TypeError, ValueError):
@@ -264,10 +329,9 @@ def get_last_trade_cached(symbol: str, ttl_seconds: int = 15) -> Tuple[Optional[
         return None, None
 
     # approximate dollar volume from previous day's volume * last price
-    # (bots that need exact intraday RVOL will fetch their own aggs)
     dollar_vol = last_price * MIN_VOLUME_GLOBAL
 
-    _LAST_TRADE_CACHE[key] = LastTradeCacheEntry(ts=now, last=last_price, dollar_vol=dollar_vol)
+    _LAST_TRADE_CACHE[key] = LastTradeCacheEntry(ts=now_ts, last=last_price, dollar_vol=dollar_vol)
     return last_price, dollar_vol
 
 
@@ -288,81 +352,78 @@ def _cache_key(prefix: str, identifier: str) -> str:
 
 def get_option_chain_cached(
     underlying: str,
-    ttl_seconds: int = 60,
+    ttl_seconds: int = 90,
 ) -> Optional[Dict[str, Any]]:
     """Fetches Polygon snapshot option chain via HTTP and caches it.
 
     Used by cheap / unusual / whales, etc.
+
+    Mode A tweaks:
+      • Slightly longer TTL (default 90s) to reduce pressure on Polygon.
+      • Uses HTTP helper with retries + 20s timeout.
     """
     if not POLYGON_KEY:
         print("[shared] POLYGON_KEY missing; cannot fetch option chain.")
         return None
 
     key = _cache_key("chain", underlying.upper())
-    now = time.time()
+    now_ts = time.time()
 
     entry = _OPTION_CACHE.get(key)
     # Be robust to any legacy / malformed cache entries
     if isinstance(entry, OptionCacheEntry) and isinstance(entry.ts, (int, float)):
-        if now - float(entry.ts) < ttl_seconds:
+        if now_ts - float(entry.ts) < ttl_seconds:
             return entry.data
 
     url = f"https://api.polygon.io/v3/snapshot/options/{underlying.upper()}"
     params = {"apiKey": POLYGON_KEY}
 
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        msg = f"[shared] error fetching option chain for {underlying}: {e}"
-        print(msg)
-        report_status_error("shared:option_chain", msg)
+    data = _http_get_json(url, params, tag="shared:option_chain", timeout=20.0, retries=1)
+    if not data:
         return None
 
-    _OPTION_CACHE[key] = OptionCacheEntry(ts=now, data=data)
+    _OPTION_CACHE[key] = OptionCacheEntry(ts=now_ts, data=data)
     return data
 
 
 def get_last_option_trades_cached(
     full_option_symbol: str,
-    ttl_seconds: int = 30,
+    ttl_seconds: int = 45,
 ) -> Optional[Dict[str, Any]]:
-    """Fetches the last option trade for a specific contract (v3 last/trade/options)."""
+    """Fetches the last option trade for a specific contract (v3 last/trade).
+
+    NOTE: 404s are treated as benign (no trade yet) and do NOT hit the status bot.
+    """
     if not POLYGON_KEY:
         print("[shared] POLYGON_KEY missing; cannot fetch last option trades.")
         return None
 
     key = _cache_key("last_trade", full_option_symbol)
-    now = time.time()
+    now_ts = time.time()
 
     entry = _OPTION_CACHE.get(key)
     # Be robust to any legacy / malformed cache entries
     if isinstance(entry, OptionCacheEntry) and isinstance(entry.ts, (int, float)):
-        if now - float(entry.ts) < ttl_seconds:
+        if now_ts - float(entry.ts) < ttl_seconds:
             return entry.data
 
-    # ✅ FIXED ENDPOINT HERE
-    url = f"https://api.polygon.io/v3/last/trade/options/{full_option_symbol}"
+    url = f"https://api.polygon.io/v3/last/trade/{full_option_symbol}"
     params = {"apiKey": POLYGON_KEY}
 
     try:
-        r = requests.get(url, params=params, timeout=10)
-        # Treat 404 (no data) as a normal, non-fatal condition
-        if r.status_code == 404:
-            # benign: just means no trades yet for this contract
-            # print(f"[shared] no last option trade for {full_option_symbol} (404).")
+        resp = requests.get(url, params=params, timeout=15.0)
+        if resp.status_code == 404:
+            # Benign: no last option trade exists yet for this contract.
             return None
-
-        r.raise_for_status()
-        data = r.json()
+        resp.raise_for_status()
+        data = resp.json()
     except Exception as e:
         msg = f"[shared] error fetching last option trade for {full_option_symbol}: {e}"
         print(msg)
         report_status_error("shared:last_option_trade", msg)
         return None
 
-    _OPTION_CACHE[key] = OptionCacheEntry(ts=now, data=data)
+    _OPTION_CACHE[key] = OptionCacheEntry(ts=now_ts, data=data)
     return data
 
 
