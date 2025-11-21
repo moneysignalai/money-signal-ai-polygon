@@ -303,13 +303,26 @@ def _sma(values: List[float], window: int) -> List[float]:
     return out
 
 #------------SCANNER FOR STATUS_REPORT.PY BOT-----------------
+from bots.status_report import record_bot_stats
+
+BOT_NAME = "equity_flow"
+...
+start_ts = time.time()
+alerts_sent = 0
+matches = []
+
+# ... your scan logic ...
+
+run_seconds = time.time() - start_ts
+
 record_bot_stats(
-    "equity_flow",
+    BOT_NAME,
     scanned=len(universe),
     matched=len(matches),
     alerts=alerts_sent,
     runtime=run_seconds,
 )
+
 
 # -------------------------------------------------------------------
 # STRATEGY LOGIC (uses shared stats so we only compute once)
