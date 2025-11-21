@@ -15,11 +15,8 @@ import requests
 POLYGON_KEY = os.getenv("POLYGON_KEY") or os.getenv("POLYGON_API_KEY")
 
 # Global RVOL / volume floors that other bots can reference
-# Made more aggressive:
-#   • MIN_RVOL_GLOBAL: 2.0 → 1.3
-#   • MIN_VOLUME_GLOBAL: 500k → 250k
-MIN_RVOL_GLOBAL = float(os.getenv("MIN_RVOL_GLOBAL", "1.3"))
-MIN_VOLUME_GLOBAL = float(os.getenv("MIN_VOLUME_GLOBAL", "250000"))  # shares
+MIN_RVOL_GLOBAL = float(os.getenv("MIN_RVOL_GLOBAL", "2.0"))
+MIN_VOLUME_GLOBAL = float(os.getenv("MIN_VOLUME_GLOBAL", "500000"))  # shares
 
 # Telegram routing (your env)
 # - TELEGRAM_CHAT_ALL = single private chat ID for everything
@@ -131,7 +128,7 @@ def report_status_error(bot: str, message: str) -> None:
 
 
 def get_dynamic_top_volume_universe(
-    max_tickers: int = 150,
+    max_tickers: int = 100,
     volume_coverage: float = 0.90,
 ) -> List[str]:
     """
@@ -173,10 +170,6 @@ def get_dynamic_top_volume_universe(
             continue
         enriched.append((sym, vol, dollar_vol))
 
-    if not enriched:
-        print("[shared] dynamic universe: 0 names (no results from Polygon).")
-        return []
-
     enriched.sort(key=lambda x: x[2], reverse=True)
 
     universe: List[str] = []
@@ -190,11 +183,7 @@ def get_dynamic_top_volume_universe(
         if total_dollar > 0 and running / total_dollar >= volume_coverage:
             break
 
-    print(
-        f"[shared] dynamic universe: {len(universe)} names, "
-        f"covers ~{volume_coverage*100:.0f}% vol. "
-        f"(global MIN_RVOL={MIN_RVOL_GLOBAL}, MIN_VOL={MIN_VOLUME_GLOBAL:,})"
-    )
+    print(f"[shared] dynamic universe: {len(universe)} names, covers ~{volume_coverage*100:.0f}% vol.")
     return universe
 
 
@@ -339,7 +328,7 @@ def get_last_option_trades_cached(
     full_option_symbol: str,
     ttl_seconds: int = 30,
 ) -> Optional[Dict[str, Any]]:
-    """Fetches the last option trade for a specific contract (v3 last/trade)."""
+    """Fetches the last option trade for a specific contract (v3 last/trade/options)."""
     if not POLYGON_KEY:
         print("[shared] POLYGON_KEY missing; cannot fetch last option trades.")
         return None
@@ -353,17 +342,16 @@ def get_last_option_trades_cached(
         if now - float(entry.ts) < ttl_seconds:
             return entry.data
 
-    url = f"https://api.polygon.io/v3/last/trade/{full_option_symbol}"
+    # ✅ FIXED ENDPOINT HERE
+    url = f"https://api.polygon.io/v3/last/trade/options/{full_option_symbol}"
     params = {"apiKey": POLYGON_KEY}
 
     try:
         r = requests.get(url, params=params, timeout=10)
         # Treat 404 (no data) as a normal, non-fatal condition
         if r.status_code == 404:
-            # Benign: no last option trade exists yet for this contract.
-            # Commented out to avoid log spam.
-            # msg_404 = f"[shared] no last option trade for {full_option_symbol} (404)."
-            # print(msg_404)
+            # benign: just means no trades yet for this contract
+            # print(f"[shared] no last option trade for {full_option_symbol} (404).")
             return None
 
         r.raise_for_status()
