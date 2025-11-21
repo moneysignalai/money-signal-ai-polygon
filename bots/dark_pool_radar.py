@@ -90,7 +90,6 @@ def _safe(o: Any, name: str, default=None):
     except Exception:
         return default
 
-
 # ------------------- MAIN BOT -------------------
 
 async def run_dark_pool_radar():
@@ -200,6 +199,15 @@ async def run_dark_pool_radar():
             and largest_dark_print < MIN_DARK_SINGLE_NOTIONAL
         ):
             continue
+            
+            #------------SCANNER FOR STATUS_REPORT.PY BOT-----------------
+record_bot_stats(
+    "trend_flow",
+    scanned=len(universe),
+    matched=len(matches),
+    alerts=alerts_sent,
+    runtime=run_seconds,
+)
 
         # ---- Send Alert ----
         now_str = now_et.strftime("%I:%M %p EST · %b %d").lstrip("0")
