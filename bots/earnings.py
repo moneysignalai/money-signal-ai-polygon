@@ -203,6 +203,15 @@ async def run_earnings():
             else 0.0
         )
 
+        #------------SCANNER FOR STATUS_REPORT.PY BOT-----------------
+record_bot_stats(
+    "trend_flow",
+    scanned=len(universe),
+    matched=len(matches),
+    alerts=alerts_sent,
+    runtime=run_seconds,
+)
+
         # --- Confirm actual earnings event + enrich with fundamentals ---
         earnings_rec = _fetch_earnings_for_symbol(sym, today)
         if not earnings_rec:
