@@ -17,6 +17,10 @@ def now_est_str() -> str:
 
 app = FastAPI()
 
+# How often to run a full scan cycle (seconds).
+# More aggressive default: 30 seconds instead of 60.
+SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "30"))
+
 # Ordered list of all bots we want to run every cycle.
 # (public_name, module_path, function_name)
 BOTS = [
@@ -35,11 +39,8 @@ BOTS = [
     ("panic_flush", "bots.panic_flush", "run_panic_flush"),
     ("dark_pool_radar", "bots.dark_pool_radar", "run_dark_pool_radar"),
     ("iv_crush", "bots.iv_crush", "run_iv_crush"),
-
-    # 🔍 Debug bots
-    ("debug_ping", "bots.debug_ping", "run_debug_ping"),
-    ("debug_status_ping", "bots.debug_status_ping", "run_debug_status_ping"),
 ]
+
 
 @app.get("/")
 def root():
@@ -47,6 +48,7 @@ def root():
     return {
         "status": "LIVE",
         "timestamp": now_est_str(),
+        "scan_interval_seconds": SCAN_INTERVAL_SECONDS,
         "bots": [name for name, _, _ in BOTS] + ["status_report"],
     }
 
@@ -88,6 +90,8 @@ async def run_all_once():
             if fn is None:
                 raise AttributeError(f"{module_path}.{func_name} not found")
 
+            # Log that we are scheduling this bot in this cycle
+            print(f"[main] scheduling bot '{public_name}' ({module_path}.{func_name})")
             coro = fn()
             tasks.append(coro)
             names.append(public_name)
@@ -119,6 +123,7 @@ async def run_all_once():
         return
 
     # 4) Run all bots concurrently, but capture exceptions as results
+    print(f"[main] running {len(tasks)} bot tasks concurrently...")
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # 5) Interpret results and forward to status_report
@@ -146,7 +151,7 @@ async def run_all_once():
                     print("[main] ERROR while logging bot run (ok):", inner)
 
 
-async def scheduler_loop(interval_seconds: int = 60):
+async def scheduler_loop(interval_seconds: int = SCAN_INTERVAL_SECONDS):
     """Main scheduler loop.
 
     Repeatedly:
@@ -156,7 +161,10 @@ async def scheduler_loop(interval_seconds: int = 60):
     Any unexpected exceptions at the scheduler level are logged but do NOT stop the loop.
     """
     cycle = 0
-    print(f"[main] MoneySignalAI scheduler starting at {now_est_str()}")
+    print(
+        f"[main] MoneySignalAI scheduler starting at {now_est_str()} "
+        f"with interval={interval_seconds}s"
+    )
 
     while True:
         cycle += 1
@@ -171,6 +179,10 @@ async def scheduler_loop(interval_seconds: int = 60):
             # Last-resort catch — we log but keep the scheduler alive
             print("[main] FATAL error in run_all_once():", e)
 
+        print(
+            f"[main] cycle #{cycle} finished at {now_est_str()} — "
+            f"sleeping {interval_seconds} seconds before next scan."
+        )
         await asyncio.sleep(interval_seconds)
 
 
@@ -191,6 +203,8 @@ async def startup_event():
 
     On app startup (Render boot/redeploy), spin up the background scheduler thread.
     """
+    print(f"[main] startup_event fired at {now_est_str()}")
+    print(f"[main] launching background scheduler thread (interval={SCAN_INTERVAL_SECONDS}s)")
     threading.Thread(target=_start_background_scheduler, daemon=True).start()
 
 
