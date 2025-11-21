@@ -226,8 +226,20 @@ def _format_time() -> str:
         return datetime.now(eastern).strftime("%I:%M %p EST · %b %d").lstrip("0")
         
         #------------SCANNER FOR STATUS_REPORT.PY BOT-----------------
+from bots.status_report import record_bot_stats
+
+BOT_NAME = "squeeze"
+...
+start_ts = time.time()
+alerts_sent = 0
+matches = []
+
+# ... your scan logic ...
+
+run_seconds = time.time() - start_ts
+
 record_bot_stats(
-    "squeeze",
+    BOT_NAME,
     scanned=len(universe),
     matched=len(matches),
     alerts=alerts_sent,
