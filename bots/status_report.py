@@ -4,20 +4,21 @@
 #
 # Responsibilities:
 #   • Collect errors from all bots via record_bot_error(...)
-#   • Optionally collect shared/universe info via record_shared_error(...) and record_universe_health(...)
+#   • Collect shared/universe info via record_shared_error(...) and record_universe_health(...)
+#   • Track recent bot runs via log_bot_run(...)
 #   • On each run_status_report() call:
-#       - If there are NEW errors since last digest → send an error summary to the status Telegram.
+#       - If there are NEW errors since last digest → send an error summary.
 #       - Else, send a periodic heartbeat (startup + every ~10 minutes).
 
 from __future__ import annotations
 
 import os
+import threading
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 
 import pytz
 import requests
-import threading
 
 # --------------- CONFIG / ENV ---------------
 
@@ -28,27 +29,22 @@ TELEGRAM_CHAT_ALL = os.getenv("TELEGRAM_CHAT_ALL")
 
 # --------------- BOT RUN LOGGING ---------------
 
-# (timestamp, bot_name, outcome) where outcome in {"ok", "error"}
-_BOT_RUN_LOG: List[Tuple[datetime, str, str]] = []
+# (timestamp, bot_name, outcome)
+_BOT_RUN_LOG: list[tuple[datetime, str, str]] = []
 
 
 def log_bot_run(bot_name: str, outcome: str) -> None:
     """
-    Called by main.py after each bot finishes.
-
-    outcome:
-      • "ok"    → bot finished without raising an exception
-      • "error" → bot raised an exception
+    outcome in {"ok", "error"} (you can extend if needed).
     """
     now_et = datetime.now(eastern)
     _BOT_RUN_LOG.append((now_et, bot_name, outcome))
-
-    # keep the buffer from growing unbounded
+    # keep it small
     if len(_BOT_RUN_LOG) > 500:
         del _BOT_RUN_LOG[:-500]
 
 
-def consume_recent_bot_runs() -> List[Tuple[datetime, str, str]]:
+def consume_recent_bot_runs() -> list[tuple[datetime, str, str]]:
     """
     Pop and return all accumulated bot run entries since the last status cycle.
     """
@@ -82,7 +78,7 @@ _LOCK = threading.Lock()
 # --------------- TIME HELPERS ---------------
 
 def now_est() -> datetime:
-    """Current time in US/Eastern."""
+    """Current time in US/Eastern as a datetime."""
     return datetime.now(eastern)
 
 
@@ -105,11 +101,8 @@ def _send_status_telegram(text: str) -> None:
 
     if not token or not chat_id:
         # Don't crash the app just because env isn't wired.
-        print(
-            "[status_report] missing TELEGRAM_TOKEN_STATUS or TELEGRAM_CHAT_ALL; "
-            "status message not sent. Text was:\n"
-            f"{text}"
-        )
+        print(f"[status_report] missing TELEGRAM_TOKEN_STATUS or TELEGRAM_CHAT_ALL; "
+              f"status message not sent. Text was:\n{text}")
         return
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -213,13 +206,7 @@ def _build_error_digest(now: datetime) -> Optional[str]:
 
     # Format digest outside the lock
     head_time = _format_est_timestamp(now)
-    lines = [
-        "⚠️ MoneySignalAI — Recent Bot Errors",
-        "",
-        head_time,
-        "",
-        "The following errors were recorded:",
-    ]
+    lines = [f"⚠️ MoneySignalAI — Recent Bot Errors", "", head_time, "", "The following errors were recorded:"]
 
     for e in new_events[-15:]:  # cap at 15 lines per message
         t_s = e["time"].strftime("%H:%M:%S")
@@ -233,32 +220,21 @@ def _build_error_digest(now: datetime) -> Optional[str]:
     return "\n".join(lines)
 
 
-def _build_heartbeat(now: datetime) -> Optional[str]:
+def _build_heartbeat(now: datetime) -> str:
     """
     Build a light heartbeat / health snapshot.
-
-    Behavior:
-      • Always allowed to build (no universe/errors required)
-      • run_status_report() controls the frequency (startup + every ~10 minutes).
+    Caller controls how often this is sent.
     """
     with _LOCK:
         universe = _universe_health
         one_hour_ago = now - timedelta(hours=1)
         recent_errors = [e for e in _error_events if e["time"] >= one_hour_ago]
         total_errors_1h = len(recent_errors)
-
-        # attach recent run info (if any)
         recent_runs = consume_recent_bot_runs()
 
     head_time = _format_est_timestamp(now)
-    lines = [
-        "✅ MoneySignalAI — Heartbeat",
-        "",
-        head_time,
-        "",
-    ]
+    lines = [f"✅ MoneySignalAI — Heartbeat", "", head_time, ""]
 
-    # Universe info
     if universe is not None:
         cov_pct = universe["coverage"] * 100.0
         size = universe["size"]
@@ -267,20 +243,17 @@ def _build_heartbeat(now: datetime) -> Optional[str]:
     else:
         lines.append("📊 Universe: no recent universe snapshot recorded.")
 
-    # Errors last hour
     if total_errors_1h:
         lines.append(f"⚠️ Errors last 60m: {total_errors_1h}")
     else:
         lines.append("✅ Errors last 60m: none recorded.")
 
-    # Recent run outcomes
+    # Recent bot runs
     if recent_runs:
+        ok_count = sum(1 for _, _, outcome in recent_runs if outcome == "ok")
+        err_count = sum(1 for _, _, outcome in recent_runs if outcome == "error")
         lines.append("")
-        lines.append("🧪 Recent bot runs:")
-        for ts, bot_name, outcome in recent_runs[-20:]:
-            t_s = ts.strftime("%H:%M:%S")
-            icon = "✅" if outcome == "ok" else "⚠️"
-            lines.append(f"• {t_s} — {bot_name}: {icon} {outcome}")
+        lines.append(f"🧪 Recent bot runs: {ok_count} ok · {err_count} error")
     else:
         lines.append("")
         lines.append("🧪 Recent bot runs: no entries logged this cycle.")
@@ -314,13 +287,11 @@ async def run_status_report() -> None:
     # 2a) On first run after startup, always send a heartbeat
     if not _startup_heartbeat_sent:
         hb = _build_heartbeat(now)
-        if hb:
-            _send_status_telegram(hb)
-            _startup_heartbeat_sent = True
-            with _LOCK:
-                _last_heartbeat_sent_at = now
-            print("[status_report] sent startup heartbeat.")
-            return
+        _send_status_telegram(hb)
+        _startup_heartbeat_sent = True
+        _last_heartbeat_sent_at = now
+        print("[status_report] sent startup heartbeat.")
+        return
 
     # 2b) Periodic heartbeat every ~10 minutes
     with _LOCK:
@@ -331,12 +302,11 @@ async def run_status_report() -> None:
 
     if elapsed_ok:
         hb = _build_heartbeat(now)
-        if hb:
-            _send_status_telegram(hb)
-            with _LOCK:
-                _last_heartbeat_sent_at = now
-            print("[status_report] sent periodic heartbeat.")
-            return
+        _send_status_telegram(hb)
+        with _LOCK:
+            _last_heartbeat_sent_at = now
+        print("[status_report] sent periodic heartbeat.")
+        return
 
     # 3) Nothing to send this minute
     print("[status_report] No status to send at this minute.")
