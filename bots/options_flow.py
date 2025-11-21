@@ -4,12 +4,15 @@
 #   – CHEAP lottos
 #   – UNUSUAL sweeps
 #   – WHALE-sized orders
+#   – IV CRUSH (big IV drops on short-dated options)
 #
 # Reads env thresholds from the same vars you already use:
-#   CHEAP_* , UNUSUAL_* , WHALES_*
+#   CHEAP_* , UNUSUAL_* , WHALES_* , IVCRUSH_*
 # So you don't need to change your environment.
 
 import os
+import json
+import math
 from datetime import datetime, date
 
 import pytz
@@ -47,14 +50,20 @@ CHEAP_MIN_SIZE      = int(os.getenv("CHEAP_MIN_SIZE", "100"))
 CHEAP_MIN_NOTIONAL  = float(os.getenv("CHEAP_MIN_NOTIONAL", "10000"))
 
 # Unusual sweeps
-UNUSUAL_MIN_NOTION  = float(os.getenv("UNUSUAL_MIN_NOTIONAL", "100000"))
-UNUSUAL_MIN_SIZE    = int(os.getenv("UNUSUAL_MIN_SIZE", "10"))
-UNUSUAL_MAX_DTE     = int(os.getenv("UNUSUAL_MAX_DTE", "45"))
+UNUSUAL_MIN_NOTIONAL  = float(os.getenv("UNUSUAL_MIN_NOTIONAL", "100000"))
+UNUSUAL_MIN_SIZE      = int(os.getenv("UNUSUAL_MIN_SIZE", "10"))
+UNUSUAL_MAX_DTE       = int(os.getenv("UNUSUAL_MAX_DTE", "45"))
 
 # Whale flows
 WHALES_MIN_NOTIONAL = float(os.getenv("WHALES_MIN_NOTIONAL", "500000"))
 WHALES_MIN_SIZE     = int(os.getenv("WHALES_MIN_SIZE", "50"))
 WHALES_MAX_DTE      = int(os.getenv("WHALES_MAX_DTE", "90"))
+
+# IV Crush
+IVCRUSH_MIN_IV_DROP_PCT = float(os.getenv("IVCRUSH_MIN_IV_DROP_PCT", "30.0"))
+IVCRUSH_MAX_DTE         = int(os.getenv("IVCRUSH_MAX_DTE", "7"))       # short-dated
+IVCRUSH_MIN_VOL         = int(os.getenv("IVCRUSH_MIN_VOL", "200"))     # option volume / size floor
+IVCRUSH_CACHE_PATH      = os.getenv("IVCRUSH_CACHE_PATH", "/tmp/iv_crush_cache.json")
 
 # Universe size
 MAX_UNIVERSE = int(os.getenv("OPTIONS_FLOW_MAX_UNIVERSE", "120"))
@@ -64,16 +73,52 @@ _alert_date: date | None = None
 _seen_cheap: set[str] = set()
 _seen_unusual: set[str] = set()
 _seen_whale: set[str] = set()
+_seen_ivcrush: set[str] = set()  # IV crush per contract
+
+# IV cache (prev day IV per underlying+expiry)
+_iv_cache: dict = {}
 
 
 def _reset_if_new_day() -> None:
-    global _alert_date, _seen_cheap, _seen_unusual, _seen_whale
+    global _alert_date, _seen_cheap, _seen_unusual, _seen_whale, _seen_ivcrush
     today = date.today()
     if _alert_date != today:
         _alert_date = today
         _seen_cheap = set()
         _seen_unusual = set()
         _seen_whale = set()
+        _seen_ivcrush = set()
+
+
+# ---------------- IV CACHE HELPERS ----------------
+
+def _load_iv_cache() -> dict:
+    global _iv_cache
+    if _iv_cache:
+        return _iv_cache
+    try:
+        if os.path.exists(IVCRUSH_CACHE_PATH):
+            with open(IVCRUSH_CACHE_PATH, "r") as f:
+                _iv_cache = json.load(f)
+            return _iv_cache
+    except Exception:
+        pass
+    _iv_cache = {}
+    return _iv_cache
+
+
+def _save_iv_cache() -> None:
+    if not _iv_cache:
+        return
+    try:
+        os.makedirs(os.path.dirname(IVCRUSH_CACHE_PATH), exist_ok=True)
+    except Exception:
+        pass
+    try:
+        with open(IVCRUSH_CACHE_PATH, "w") as f:
+            json.dump(_iv_cache, f)
+    except Exception:
+        pass
 
 
 # ---------------- HELPERS ----------------
@@ -193,6 +238,99 @@ def _resolve_universe() -> list[str]:
     return get_dynamic_top_volume_universe(max_tickers=MAX_UNIVERSE, volume_coverage=0.90)
 
 
+# ---------------- IV CRUSH CHECK ----------------
+
+def _maybe_iv_crush(
+    sym: str,
+    contract: str,
+    under: str,
+    expiry: date | None,
+    dte: int | None,
+    opt: dict,
+    size: int,
+    time_str: str,
+) -> None:
+    """
+    Lightweight IV Crush detection per contract:
+      • short-dated (<= IVCRUSH_MAX_DTE)
+      • sufficient volume/size
+      • big IV drop vs cached prior IV for same underlying+expiry
+    Fires an additional "IV CRUSH" alert, separate from cheap/unusual/whale.
+    """
+    if contract in _seen_ivcrush:
+        return
+    if dte is None or dte < 0 or dte > IVCRUSH_MAX_DTE:
+        return
+    if size < IVCRUSH_MIN_VOL:
+        return
+
+    day = opt.get("day") or {}
+    iv = opt.get("implied_volatility") or day.get("implied_volatility")
+    if not iv:
+        return
+    try:
+        iv = float(iv)
+    except Exception:
+        return
+    if iv <= 0:
+        return
+
+    # Cache key at underlying+expiry level
+    if not expiry:
+        return
+    key = f"{under}:{expiry.isoformat()}"
+
+    cache = _load_iv_cache()
+    prev = cache.get(key)
+    today_str = date.today().strftime("%Y-%m-%d")
+
+    if prev and "iv" in prev:
+        try:
+            prev_iv = float(prev["iv"])
+        except Exception:
+            prev_iv = iv
+    else:
+        # First time seeing this; seed cache and skip signal
+        _iv_cache[key] = {"iv": iv, "date": today_str}
+        return
+
+    # Compute IV drop
+    if prev_iv <= 0:
+        return
+    iv_drop_pct = (prev_iv - iv) / prev_iv * 100.0
+    if iv_drop_pct < IVCRUSH_MIN_IV_DROP_PCT:
+        return
+
+    # Update cache with current IV
+    _iv_cache[key] = {"iv": iv, "date": today_str}
+
+    # Underlying price (for alert)
+    under_px = _underlying_price_from_opt(opt)
+    under_line = f"💰 Underlying ${under_px:.2f}" if under_px is not None else "💰 Underlying price N/A"
+
+    implied_move_pct = iv * math.sqrt(1.0 / 252.0) * 100.0
+
+    extra_lines = [
+        f"🧊 IV CRUSH — {sym}",
+        f"🕒 {time_str}",
+        under_line,
+        "────────────",
+        f"🎯 Contract: {contract}",
+        f"📅 Exp: {expiry.strftime('%Y-%m-%d')} · DTE: {dte}",
+        f"📊 IV now: {iv * 100:.1f}% (prev {prev_iv * 100:.1f}%, drop {iv_drop_pct:.1f}%)",
+        f"📦 Volume / Size: {size:,}",
+        f"📉 Implied 1-day move: ≈ {implied_move_pct:.1f}%",
+        f"🔗 Chart: {chart_link(sym)}",
+    ]
+
+    extra_text = "\n".join(extra_lines)
+
+    # We don't know last trade underlying RVOL here → pass 0.0
+    last_price_for_bot = under_px if under_px is not None else 0.0
+    send_alert("iv_crush", sym, last_price_for_bot, 0.0, extra=extra_text)
+    _seen_ivcrush.add(contract)
+
+
 # ---------------- MAIN BOT ----------------
 
 async def run_options_flow():
@@ -208,6 +346,8 @@ async def run_options_flow():
                a) WHALE (highest priority)
                b) UNUSUAL
                c) CHEAP
+           - Independently, also check for IV CRUSH conditions and fire a
+             separate IV CRUSH alert per contract per day.
            - Fire a single alert per contract per category per day.
     """
     if not POLYGON_KEY:
@@ -219,6 +359,7 @@ async def run_options_flow():
         return
 
     _reset_if_new_day()
+    _load_iv_cache()  # initialize cache from disk if present
 
     universe = _resolve_universe()
     if not universe:
@@ -300,7 +441,7 @@ async def run_options_flow():
             elif (
                 dte <= UNUSUAL_MAX_DTE
                 and size >= UNUSUAL_MIN_SIZE
-                and notional >= UNUSUAL_MIN_NOTION
+                and notional >= UNUSUAL_MIN_NOTIONAL
                 and contract not in _seen_unusual
             ):
                 category = "unusual"
@@ -315,6 +456,9 @@ async def run_options_flow():
             ):
                 category = "cheap"
 
+            # Even if no category, we still may want to check IV CRUSH
+            _maybe_iv_crush(sym, contract, under, expiry, dte, opt, size, time_str)
+
             if not category:
                 continue
 
@@ -325,7 +469,8 @@ async def run_options_flow():
             cp_letter = "C" if cp == "CALL" else "P" if cp == "PUT" else "?"
 
             # Base contract line
-            contract_line = f"{under} {expiry.strftime('%b %d %Y') if expiry else 'N/A'} {cp_letter}"
+            exp_str = expiry.strftime('%b %d %Y') if expiry else 'N/A'
+            contract_line = f"{under} {exp_str} {cp_letter}"
 
             # Build category-specific header & description
             if category == "whale":
@@ -372,5 +517,8 @@ async def run_options_flow():
                 _seen_unusual.add(contract)
             else:
                 _seen_cheap.add(contract)
+
+    # Persist IV cache at end of scan
+    _save_iv_cache()
 
     print("[options_flow] scan complete.")
