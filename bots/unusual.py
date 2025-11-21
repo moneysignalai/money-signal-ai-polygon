@@ -8,29 +8,27 @@ import pytz
 from bots.shared import (
     get_dynamic_top_volume_universe,
     get_option_chain_cached,
-    get_last_option_trades_cached,  # uses shared cached last-trade helper
+    get_last_option_trades_cached,  # cached v3 /last/trade helper
     send_alert,
     chart_link,
-    now_est,
+    now_est,  # may be str OR datetime depending on shared.py
 )
 
 eastern = pytz.timezone("US/Eastern")
 
 # ---------------- ENV CONFIG (tunable) ----------------
-# Override on Render if you want different aggressiveness:
-#   UNUSUAL_MIN_NOTIONAL, UNUSUAL_MIN_SIZE, UNUSUAL_MAX_DTE
 
 # Minimum notional (price * size * 100) per sweep
-# ✅ default $100k+ as requested
 MIN_NOTIONAL = float(os.getenv("UNUSUAL_MIN_NOTIONAL", "100000"))
 
 # Minimum number of contracts in the last trade
-MIN_TRADE_SIZE = int(os.getenv("UNUSUAL_MIN_SIZE", "10"))  # default 10+ contracts
+MIN_TRADE_SIZE = int(os.getenv("UNUSUAL_MIN_SIZE", "10"))
 
 # Maximum days to expiration
-MAX_DTE = int(os.getenv("UNUSUAL_MAX_DTE", "45"))  # default 45 days out
+MAX_DTE = int(os.getenv("UNUSUAL_MAX_DTE", "45"))
 
 # --------------- Per-day dedupe (per contract) ----------------
+
 alert_date: date | None = None
 alerted_contracts: set[str] = set()
 
@@ -54,28 +52,34 @@ def _mark(contract: str) -> None:
 
 # --------------- Helpers to parse option symbols ----------------
 
-
 def _parse_option_symbol(sym: str):
     """
-    Polygon option symbol example:
-
-    O:TSLA251121C00450000
+    Polygon option symbol example: O:TSLA251121C00450000
 
     Underlying: TSLA
     Expiry: 2025-11-21
     Call/Put: C or P
     Strike: 450.00
     """
-    if not sym.startswith("O:"):
+    if not sym or not sym.startswith("O:"):
         return None, None, None, None
 
     try:
         base = sym[2:]
-        under = base[: base.find("2")]
-        rest = base[len(under):]
+
+        # find first digit (start of YYMMDD)
+        idx = 0
+        while idx < len(base) and not base[idx].isdigit():
+            idx += 1
+
+        under = base[:idx]
+        rest = base[idx:]
+
+        if len(rest) < 7:
+            return None, None, None, None
 
         exp_raw = rest[:6]      # YYMMDD
-        cp = rest[6]            # C/P
+        cp_char = rest[6]       # C/P
         strike_raw = rest[7:]   # 000450000
 
         yy = int("20" + exp_raw[0:2])
@@ -83,9 +87,9 @@ def _parse_option_symbol(sym: str):
         dd = int(exp_raw[4:6])
         expiry = datetime(yy, mm, dd).date()
 
-        strike = int(strike_raw) / 1000.0
+        strike = int(strike_raw) / 1000.0 if strike_raw else None
 
-        return under, expiry, cp, strike
+        return under, expiry, cp_char, strike
     except Exception:
         return None, None, None, None
 
@@ -98,15 +102,27 @@ def _days_to_expiry(expiry) -> int | None:
 
 
 def _underlying_price_from_opt(opt: dict) -> float | None:
+    """
+    For Polygon v3 snapshot /options:
+      opt["underlying_asset"]["price"]
+    """
     try:
-        return float(opt.get("underlying_price"))
+        ua = opt.get("underlying_asset") or {}
+        val = ua.get("price")
+        return float(val) if val is not None else None
     except Exception:
         return None
 
 
 def _strike_from_opt(opt: dict) -> float | None:
+    """
+    For Polygon v3 snapshot /options:
+      opt["details"]["strike_price"]
+    """
     try:
-        return float(opt.get("strike_price"))
+        details = opt.get("details") or {}
+        val = details.get("strike_price")
+        return float(val) if val is not None else None
     except Exception:
         return None
 
@@ -141,26 +157,55 @@ def _moneyness_label(under_px: float | None, strike: float | None, cp: str | Non
     return label, dist_pct
 
 
-# --------------- Core scan ----------------
+def _safe_float(x):
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except (TypeError, ValueError):
+        return None
 
+
+def _safe_int(x):
+    try:
+        if x is None:
+            return None
+        return int(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_now_est() -> str:
+    """
+    Make a nice EST timestamp, regardless of whether shared.now_est()
+    returns a datetime or a string.
+    """
+    try:
+        ts = now_est()
+        if isinstance(ts, str):
+            return ts
+        return ts.strftime("%I:%M %p EST · %b %d").lstrip("0")
+    except Exception:
+        return datetime.now(eastern).strftime("%I:%M %p EST · %b %d").lstrip("0")
+
+
+# --------------- Core scan ----------------
 
 async def run_unusual():
     """
-    Scan the dynamic universe for large, unusual single-sweep options trades.
+    Scan a liquid universe for large, unusual single-sweep options trades.
     """
     _reset_day()
 
     # Primary source: dynamic universe from Polygon
     universe = get_dynamic_top_volume_universe(max_tickers=150, volume_coverage=0.90)
 
-    # ✅ Fallback if dynamic universe is empty
+    # Fallbacks if dynamic universe is empty
     if not universe:
-        # 1) Try explicit TICKER_UNIVERSE env if you ever set it
         env = os.getenv("TICKER_UNIVERSE")
         if env:
             universe = [x.strip().upper() for x in env.split(",") if x.strip()]
         else:
-            # 2) Hard-coded top 100 popular, liquid, options-heavy names
             universe = [
                 "SPY","QQQ","IWM","DIA","VTI",
                 "XLK","XLF","XLE","XLY","XLI",
@@ -185,44 +230,50 @@ async def run_unusual():
             ]
 
     if not universe:
-        # Only hits if *everything* is broken (Polygon + env + fallback)
         print("[unusual] empty universe even after fallback; skipping.")
         return
+
+    time_str = _format_now_est()
 
     for sym in universe:
         chain = get_option_chain_cached(sym)
         if not chain:
             continue
 
-        opts = chain.get("result") or chain.get("results") or []
-        if not opts:
+        # v3 snapshot options: main payload usually under "results"
+        opts = chain.get("results") or chain.get("result") or []
+        if not isinstance(opts, list) or not opts:
             continue
 
         for opt in opts:
-            contract = opt.get("ticker")
+            details = opt.get("details") or {}
+
+            # Full option ticker, e.g., "O:TSLA251121C00450000"
+            contract = details.get("ticker") or opt.get("ticker")
             if not contract or _already_alerted(contract):
                 continue
 
-            last_trade = get_last_option_trades_cached(contract)
-            if not last_trade:
+            # Last trade for this contract (v3 /last/trade)
+            trade = get_last_option_trades_cached(contract)
+            if not trade:
                 continue
 
-            try:
-                last = last_trade.get("results", [{}])[0]
-            except Exception:
+            t_res = trade.get("results") or {}
+            if isinstance(t_res, list):
+                if not t_res:
+                    continue
+                last = t_res[0]
+            elif isinstance(t_res, dict):
+                last = t_res
+            else:
                 continue
 
-            price = last.get("p")
-            size = last.get("s")
+            price = _safe_float(last.get("p") or last.get("price"))
+            size = _safe_int(last.get("s") or last.get("size"))
             if price is None or size is None:
                 continue
-
-            try:
-                price = float(price)
-                size = int(size)
-            except Exception:
+            if price <= 0 or size <= 0:
                 continue
-
             if size < MIN_TRADE_SIZE:
                 continue
 
@@ -230,23 +281,45 @@ async def run_unusual():
             if notional < MIN_NOTIONAL:
                 continue
 
-            under, expiry, cp_raw, strike = _parse_option_symbol(contract)
-            if not under or not expiry or not cp_raw:
-                continue
+            # Parse symbol first, then fall back to details
+            under, expiry, cp_raw, strike_from_sym = _parse_option_symbol(contract)
 
-            dte = _days_to_expiry(expiry)
+            if not expiry:
+                exp_str = details.get("expiration_date")
+                if exp_str:
+                    try:
+                        expiry = datetime.strptime(exp_str, "%Y-%m-%d").date()
+                    except Exception:
+                        expiry = None
+
+            if not under:
+                under = sym
+
+            dte = _days_to_expiry(expiry) if expiry else None
             if dte is None or dte < 0 or dte > MAX_DTE:
                 continue
 
-            # Interpret call/put correctly
-            cp = "CALL" if cp_raw.upper() == "C" else "PUT"
+            # Determine CALL / PUT
+            cp = None
+            if cp_raw:
+                cp = "CALL" if cp_raw.upper() == "C" else "PUT"
+            else:
+                ct = (details.get("contract_type") or "").upper()
+                if ct in ("CALL", "PUT"):
+                    cp = ct
 
             under_px = _underlying_price_from_opt(opt)
+            strike = strike_from_sym if strike_from_sym is not None else _strike_from_opt(opt)
             m_label, m_dist = _moneyness_label(under_px, strike, cp)
 
-            exp_fmt = expiry.strftime("%b %d %Y")
+            if expiry:
+                exp_fmt = expiry.strftime("%b %d %Y")
+            else:
+                exp_fmt = "N/A"
+
             strike_str = f"{strike:.2f}" if strike is not None else "N/A"
-            cp_letter = "C" if cp == "CALL" else "P"
+            cp_letter = "C" if cp == "CALL" else "P" if cp == "PUT" else "?"
+
             contract_line = f"{sym} {exp_fmt} {strike_str} {cp_letter}"
 
             if m_label == "N/A":
@@ -259,21 +332,18 @@ async def run_unusual():
             else:
                 header_price_line = "💰 Underlying price N/A"
 
-            # Nice EST timestamp
-            time_str = now_est().strftime("%I:%M %p EST · %b %d").lstrip("0")
-
             extra = (
                 f"🕵️ UNUSUAL — {sym}\n"
                 f"🕒 {time_str}\n"
                 f"{header_price_line}\n"
                 "────────────\n"
-                f"🕵️ Unusual {cp} sweep: {contract_line}\n"
-                f"📌 Flow Type: Single large {cp.lower()} sweep\n"
+                f"🕵️ Unusual {cp or 'Option'} sweep: {contract_line}\n"
+                f"📌 Flow Type: Single large {(cp or 'option').lower()} sweep\n"
                 f"⏱ DTE: {dte} · {moneyness_text}\n"
                 f"📦 Volume: {size:,} · Avg: ${price:.2f}\n"
                 f"💰 Notional: ≈ ${notional:,.0f}\n"
                 f"🔗 Chart: {chart_link(sym)}"
             )
 
-            send_alert("unusual", sym, price, 0, extra=extra)
+            send_alert("unusual", sym, price, 0.0, extra=extra)
             _mark(contract)
