@@ -20,35 +20,28 @@ app = FastAPI()
 # ---------------- CONFIG ----------------
 
 # How often to run a full scan cycle (seconds).
-# More aggressive default: 30 seconds (override with SCAN_INTERVAL_SECONDS env).
+# Default: 30 seconds (override with SCAN_INTERVAL_SECONDS env).
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "30"))
 
 # Per-bot hard timeout in seconds so a slow request can't block the whole cycle.
 # If a bot takes longer than this, it raises TimeoutError and gets logged as "error".
 BOT_TIMEOUT_SECONDS = int(os.getenv("BOT_TIMEOUT_SECONDS", "40"))
 
-# Ordered list of all bots we want to run every cycle.
+# Ordered list of all *strategy* bots we want to run every cycle.
 # (public_name, module_path, function_name)
 BOTS = [
     ("premarket", "bots.premarket", "run_premarket"),
-    ("gap", "bots.gap", "run_gap"),
-    ("orb", "bots.orb", "run_orb"),
-    ("volume", "bots.volume", "run_volume"),
-    # OLD:
-    # ("cheap", "bots.cheap", "run_cheap"),
-    # ("unusual", "bots.unusual", "run_unusual"),
-    # ("whales", "bots.whales", "run_whales"),
-    # NEW unified options flow bot:
+    ("openingrangebreakout", "bots.openingrangebreakout", "run_openingrangebreakout"),
+    ("intraday_flow", "bots.intraday_flow", "run_intraday_flow"),
+    ("trend_flow", "bots.trend_flow", "run_trend_flow"),
     ("options_flow", "bots.options_flow", "run_options_flow"),
     ("squeeze", "bots.squeeze", "run_squeeze"),
     ("earnings", "bots.earnings", "run_earnings"),
-    ("momentum_reversal", "bots.momentum_reversal", "run_momentum_reversal"),
-    ("trend_rider", "bots.trend_rider", "run_trend_rider"),
-    ("swing_pullback", "bots.swing_pullback", "run_swing_pullback"),
-    ("panic_flush", "bots.panic_flush", "run_panic_flush"),
     ("dark_pool_radar", "bots.dark_pool_radar", "run_dark_pool_radar"),
-    ("iv_crush", "bots.iv_crush", "run_iv_crush"),
+    # NOTE: debug_ping / debug_status_ping / equity_flow are *not*
+    # scheduled here so they don't spam production alerts.
 ]
+
 
 @app.get("/")
 def root():
@@ -90,7 +83,7 @@ async def run_all_once():
     tasks = []
     names = []
 
-    # 2) Import every bot and schedule its run_* coroutine (with timeout wrapper)
+    # 2) Import every strategy bot and schedule its run_* coroutine (with timeout wrapper)
     for public_name, module_path, func_name in BOTS:
         try:
             mod = importlib.import_module(module_path)
@@ -100,7 +93,6 @@ async def run_all_once():
 
             print(f"[main] scheduling bot '{public_name}' ({module_path}.{func_name})")
 
-            # Call the function; typically returns a coroutine (async def run_xxx()).
             maybe_coro = fn()
 
             if asyncio.iscoroutine(maybe_coro):
@@ -201,8 +193,8 @@ async def scheduler_loop(interval_seconds: int = SCAN_INTERVAL_SECONDS):
         cycle += 1
         print(
             f"[main] SCANNING CYCLE #{cycle} — "
-            "Premarket, Gap, ORB, Volume, Cheap, Unusual, Squeeze, Earnings, "
-            "Momentum, Whales, TrendRider, Pullback, PanicFlush, DarkPool, IV Crush, Status"
+            "premarket, openingrangebreakout, intraday_flow, trend_flow, "
+            "options_flow, squeeze, earnings, dark_pool_radar, status_report"
         )
         try:
             await run_all_once()
