@@ -10,29 +10,6 @@ from typing import Dict, Any, List, Optional, Tuple
 import pytz
 import requests
 
-# --- STATUS REPORT INTEGRATION ---
-"""
-We try to integrate with bots.status_report so that:
-  • shared-level errors (Polygon, universe, option chain, etc.) get included
-    in the central error digest (record_bot_error).
-  • dynamic-universe health is visible in the heartbeat (record_universe_health).
-
-If status_report fails to import for any reason, we fall back to no-op
-functions so shared.py never crashes on import.
-"""
-try:
-    from bots.status_report import (
-        record_bot_error as _record_bot_error,
-        record_universe_health as _record_universe_health,
-    )
-except Exception:
-    def _record_bot_error(*args, **kwargs) -> None:
-        pass
-
-    def _record_universe_health(*args, **kwargs) -> None:
-        pass
-
-
 # ---------------- BASIC CONFIG ----------------
 
 POLYGON_KEY = os.getenv("POLYGON_KEY") or os.getenv("POLYGON_API_KEY")
@@ -59,7 +36,12 @@ eastern = pytz.timezone("US/Eastern")
 
 
 def now_est() -> str:
-    """Human-friendly time string in Eastern, e.g. '10:48 AM EST · Nov 20'."""
+    """
+    Human-friendly time string in Eastern, e.g. '10:48 AM EST · Nov 20'.
+
+    NOTE: This returns a STRING, not a datetime. Callers should NOT do .strftime()
+    on the return value.
+    """
     return datetime.now(eastern).strftime("%I:%M %p EST · %b %d").lstrip("0")
 
 
@@ -146,13 +128,6 @@ def report_status_error(bot: str, message: str) -> None:
     text = f"⚠️ [{bot}] {ts}\n{message}"
     _send_status(text)
 
-    # Also forward into central status_report, if available
-    try:
-        _record_bot_error(bot, message)
-    except Exception:
-        # Never let error-reporting itself crash anything
-        pass
-
 
 # ---------------- DYNAMIC UNIVERSE ----------------
 
@@ -167,15 +142,12 @@ def get_dynamic_top_volume_universe(
     We try the v2 /aggs/grouped endpoint with sort by 'v' or 'otc' as needed.
     """
     if not POLYGON_KEY:
-        msg = "[shared] POLYGON_KEY missing; cannot build dynamic universe."
-        print(msg)
-        report_status_error("shared:universe", msg)
+        print("[shared] POLYGON_KEY missing; cannot build dynamic universe.")
         return []
 
     today = today_est_date()
     prev = today - timedelta(days=1)
     from_ = prev.isoformat()
-    to_ = prev.isoformat()
 
     url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{from_}"
     params = {"adjusted": "true", "apiKey": POLYGON_KEY}
@@ -214,15 +186,6 @@ def get_dynamic_top_volume_universe(
             break
         if total_dollar > 0 and running / total_dollar >= volume_coverage:
             break
-
-    # Record universe health snapshot for status_report heartbeat
-    coverage = 0.0
-    if total_dollar > 0:
-        coverage = running / total_dollar
-    try:
-        _record_universe_health(len(universe), float(coverage))
-    except Exception:
-        pass
 
     print(f"[shared] dynamic universe: {len(universe)} names, covers ~{volume_coverage*100:.0f}% vol.")
     return universe
@@ -269,9 +232,7 @@ def get_last_trade_cached(symbol: str, ttl_seconds: int = 15) -> Tuple[Optional[
     Uses v2 last trade + previous day's volume as an approximation.
     """
     if not POLYGON_KEY:
-        msg = "[shared] POLYGON_KEY missing; cannot fetch last trade."
-        print(msg)
-        report_status_error("shared:last_trade", msg)
+        print("[shared] POLYGON_KEY missing; cannot fetch last trade.")
         return None, None
 
     key = symbol.upper()
@@ -307,7 +268,6 @@ def get_last_trade_cached(symbol: str, ttl_seconds: int = 15) -> Tuple[Optional[
         return None, None
 
     # approximate dollar volume from previous day's volume * last price
-    # (bots that need exact intraday RVOL will fetch their own aggs)
     dollar_vol = last_price * MIN_VOLUME_GLOBAL
 
     _LAST_TRADE_CACHE[key] = LastTradeCacheEntry(ts=now, last=last_price, dollar_vol=dollar_vol)
@@ -338,9 +298,7 @@ def get_option_chain_cached(
     Used by cheap / unusual / whales, etc.
     """
     if not POLYGON_KEY:
-        msg = "[shared] POLYGON_KEY missing; cannot fetch option chain."
-        print(msg)
-        report_status_error("shared:option_chain", msg)
+        print("[shared] POLYGON_KEY missing; cannot fetch option chain.")
         return None
 
     key = _cache_key("chain", underlying.upper())
@@ -373,11 +331,14 @@ def get_last_option_trades_cached(
     full_option_symbol: str,
     ttl_seconds: int = 30,
 ) -> Optional[Dict[str, Any]]:
-    """Fetches the last option trade for a specific contract (v3 last/trade)."""
+    """
+    Fetches the last option trade for a specific contract (Polygon v3).
+
+    Uses the correct endpoint:
+      /v3/last/trade/options/{option_symbol}
+    """
     if not POLYGON_KEY:
-        msg = "[shared] POLYGON_KEY missing; cannot fetch last option trades."
-        print(msg)
-        report_status_error("shared:last_option_trade", msg)
+        print("[shared] POLYGON_KEY missing; cannot fetch last option trades.")
         return None
 
     key = _cache_key("last_trade", full_option_symbol)
@@ -389,7 +350,7 @@ def get_last_option_trades_cached(
         if now - float(entry.ts) < ttl_seconds:
             return entry.data
 
-    url = f"https://api.polygon.io/v3/last/trade/{full_option_symbol}"
+    url = f"https://api.polygon.io/v3/last/trade/options/{full_option_symbol}"
     params = {"apiKey": POLYGON_KEY}
 
     try:
@@ -397,9 +358,7 @@ def get_last_option_trades_cached(
         # Treat 404 (no data) as a normal, non-fatal condition
         if r.status_code == 404:
             # Benign: no last option trade exists yet for this contract.
-            # Suppressed to avoid log spam.
-            # msg_404 = f"[shared] no last option trade for {full_option_symbol} (404)."
-            # print(msg_404)
+            # We skip logging here to avoid log spam.
             return None
 
         r.raise_for_status()
