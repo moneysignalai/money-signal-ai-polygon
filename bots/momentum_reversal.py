@@ -1,6 +1,8 @@
+# bots/momentum_reversal.py — Optimized / More Alerts / Safer
+
 import os
 from datetime import date, timedelta, datetime
-from typing import List
+from typing import List, Any
 
 import pytz
 
@@ -24,17 +26,37 @@ from bots.shared import (
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 eastern = pytz.timezone("US/Eastern")
 
-MIN_RUN_PCT = float(os.getenv("MOM_RUN_MIN_PCT", "8.0"))
-MIN_PULLBACK_PCT = float(os.getenv("MOM_PULLBACK_MIN_PCT", "3.0"))
-MIN_MOM_PRICE = float(os.getenv("MOM_MIN_PRICE", "3.0"))
-MIN_MOM_RVOL = float(os.getenv("MOM_MIN_RVOL", "2.0"))
-MIN_MOM_DOLLAR_VOL = float(os.getenv("MOM_MIN_DOLLAR_VOL", "8000000"))
+# ---------- LOOSENED CONFIG (more hits) ----------
+
+# How big the intraday run from open to high needs to be
+MIN_RUN_PCT = float(os.getenv("MOM_RUN_MIN_PCT", "6.0"))          # was 8.0
+
+# How big the pullback from high to close needs to be
+MIN_PULLBACK_PCT = float(os.getenv("MOM_PULLBACK_MIN_PCT", "2.0"))  # was 3.0
+
+# Minimum stock price
+MIN_MOM_PRICE = float(os.getenv("MOM_MIN_PRICE", "2.0"))          # was 3.0
+
+# Minimum RVOL
+MIN_MOM_RVOL = float(os.getenv("MOM_MIN_RVOL", "1.5"))            # was 2.0
+
+# Minimum dollar volume
+MIN_MOM_DOLLAR_VOL = float(os.getenv("MOM_MIN_DOLLAR_VOL", "5000000"))  # was 8M
+
+
+def _safe_float(x: Any) -> float | None:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except (TypeError, ValueError):
+        return None
 
 
 def _in_momentum_window() -> bool:
     now = datetime.now(eastern)
     mins = now.hour * 60 + now.minute
-    # only after 11:30 to catch late-day reversals
+    # still focused on late-day reversals, but you can tweak here if needed
     return 11 * 60 + 30 <= mins <= 16 * 60
 
 
@@ -42,12 +64,13 @@ def _get_universe() -> List[str]:
     env = os.getenv("TICKER_UNIVERSE")
     if env:
         return [t.strip().upper() for t in env.split(",") if t.strip()]
-    return get_dynamic_top_volume_universe(max_tickers=120, volume_coverage=0.95)
+    # slightly bigger + higher coverage
+    return get_dynamic_top_volume_universe(max_tickers=200, volume_coverage=0.97)
 
 
 async def run_momentum_reversal():
     """
-    Momentum Reversal Bot:
+    Momentum Reversal Bot (late-day):
 
       • Stock runs ≥ MIN_RUN_PCT from open to high.
       • Then pulls back ≥ MIN_PULLBACK_PCT from high to close.
@@ -62,6 +85,10 @@ async def run_momentum_reversal():
         return
 
     universe = _get_universe()
+    if not universe:
+        print("[momentum_reversal] empty universe; skipping.")
+        return
+
     today = date.today()
     today_s = today.isoformat()
 
@@ -69,7 +96,7 @@ async def run_momentum_reversal():
         if is_etf_blacklisted(sym):
             continue
 
-        # intraday 1d-agg to get OHLC and volume
+        # ---- Intraday context (using 1-day agg for OHLC + volume) ----
         try:
             intrabars = list(
                 _client.list_aggs(
@@ -89,11 +116,21 @@ async def run_momentum_reversal():
             continue
 
         ib = intrabars[0]
-        day_open = float(ib.open)
-        day_high = float(ib.high)
-        day_low = float(ib.low)
-        last_price = float(ib.close)
-        vol_today = float(ib.volume)
+
+        day_open = _safe_float(getattr(ib, "open", None))
+        day_high = _safe_float(getattr(ib, "high", None))
+        day_low = _safe_float(getattr(ib, "low", None))
+        last_price = _safe_float(getattr(ib, "close", None))
+        vol_today = _safe_float(getattr(ib, "volume", None))
+
+        if (
+            day_open is None
+            or day_high is None
+            or day_low is None
+            or last_price is None
+            or vol_today is None
+        ):
+            continue
 
         if last_price < MIN_MOM_PRICE:
             continue
@@ -108,7 +145,7 @@ async def run_momentum_reversal():
         if pullback_pct < MIN_PULLBACK_PCT:
             continue
 
-        # Daily bars for RVOL / volume / prev close
+        # ---- Daily bars for RVOL / volume / prev close ----
         try:
             days = list(
                 _client.list_aggs(
@@ -130,19 +167,23 @@ async def run_momentum_reversal():
         today_bar = days[-1]
         prev = days[-2]
 
-        prev_close = float(prev.close)
-        if prev_close <= 0:
+        prev_close = _safe_float(getattr(prev, "close", None))
+        if prev_close is None or prev_close <= 0:
             continue
 
+        # Build recent volume history for RVOL
         hist = days[:-1]
         if hist:
             recent = hist[-20:] if len(hist) > 20 else hist
-            avg_vol = float(sum(d.volume for d in recent)) / len(recent)
+            vols = [_safe_float(getattr(d, "volume", None)) or 0.0 for d in recent]
+            avg_vol = sum(vols) / max(len(vols), 1)
         else:
-            avg_vol = float(today_bar.volume)
+            avg_vol = _safe_float(getattr(today_bar, "volume", None)) or 0.0
+
+        today_vol = _safe_float(getattr(today_bar, "volume", None)) or vol_today
 
         if avg_vol > 0:
-            rvol = float(today_bar.volume) / avg_vol
+            rvol = today_vol / avg_vol
         else:
             rvol = 1.0
 
@@ -189,3 +230,4 @@ async def run_momentum_reversal():
         )
 
         send_alert("momentum_reversal", sym, last_price, rvol, extra=extra)
+        # no per-day dedupe here; momentum reversals are naturally limited by filters
