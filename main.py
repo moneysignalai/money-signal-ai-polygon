@@ -17,7 +17,6 @@ def now_est_str() -> str:
 
 app = FastAPI()
 
-
 # Ordered list of all bots we want to run every cycle.
 # (public_name, module_path, function_name)
 BOTS = [
@@ -50,22 +49,27 @@ def root():
 
 
 async def run_all_once():
+    """Run one full scan cycle.
+
+    Steps:
+      1) Import status_report so we can forward errors and log bot runs.
+      2) Import every bot in BOTS and schedule its coroutine.
+      3) Schedule status_report.run_status_report() as another coroutine.
+      4) Await all tasks with asyncio.gather(return_exceptions=True).
+      5) For each result:
+           - If it's an Exception → record via status_report.record_bot_error + log_bot_run("error").
+           - Else → log_bot_run("ok").
     """
-    One full scan cycle:
-      - Dynamically import each bot module.
-      - Schedule all found bot coroutines in parallel.
-      - Also schedule status_report.run_status_report() if available.
-      - Catch *all* exceptions and forward them to status_report.record_bot_error.
-    """
-    # Try to import status_report first so we can record errors there.
-    status_mod = None
+    # 1) Try to import status_report helpers first
     record_error = None
     run_status = None
+    log_bot_run = None
 
     try:
         status_mod = importlib.import_module("bots.status_report")
         record_error = getattr(status_mod, "record_bot_error", None)
         run_status = getattr(status_mod, "run_status_report", None)
+        log_bot_run = getattr(status_mod, "log_bot_run", None)
     except Exception as e:
         print("[main] ERROR importing bots.status_report:", e)
         status_mod = None
@@ -73,10 +77,9 @@ async def run_all_once():
     tasks = []
     names = []
 
-    # Dynamically import and schedule each bot
+    # 2) Import every bot and schedule its run_* coroutine
     for public_name, module_path, func_name in BOTS:
         try:
-            print(f"[main] scheduling bot '{public_name}' ({module_path}.{func_name})")
             mod = importlib.import_module(module_path)
             fn = getattr(mod, func_name, None)
             if fn is None:
@@ -85,7 +88,6 @@ async def run_all_once():
             coro = fn()
             tasks.append(coro)
             names.append(public_name)
-
         except Exception as e:
             # Import/config error for this bot → log + report, but do NOT crash the app
             print(f"[main] ERROR importing/initializing bot {public_name} ({module_path}.{func_name}): {e}")
@@ -95,7 +97,7 @@ async def run_all_once():
                 except Exception as inner:
                     print("[main] ERROR while recording bot import error:", inner)
 
-    # Add status_report as just another async task if available
+    # 3) Add status_report as just another async task if available
     if run_status is not None:
         try:
             print("[main] scheduling bot 'status_report' (bots.status_report.run_status_report)")
@@ -113,9 +115,10 @@ async def run_all_once():
         print("[main] No bot tasks scheduled in this cycle.")
         return
 
-    # Run all bots concurrently, but capture exceptions as results
+    # 4) Run all bots concurrently, but capture exceptions as results
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
+    # 5) Interpret results and forward to status_report
     for name, result in zip(names, results):
         if isinstance(result, Exception):
             # Bot raised an exception during execution
@@ -125,25 +128,29 @@ async def run_all_once():
                     record_error(name, result)
                 except Exception as inner:
                     print("[main] ERROR while recording bot runtime error:", inner)
+            if log_bot_run:
+                try:
+                    log_bot_run(name, "error")
+                except Exception as inner:
+                    print("[main] ERROR while logging bot run (error):", inner)
         else:
             # Successful completion (even if that bot just skipped due to time window / filters)
             print(f"[main] bot '{name}' completed cycle without crash")
-            from bots.shared import log_bot_run
+            if log_bot_run:
+                try:
+                    log_bot_run(name, "ok")
+                except Exception as inner:
+                    print("[main] ERROR while logging bot run (ok):", inner)
 
-try:
-    await coro()
-    print(f"[main] bot '{name}' completed cycle without crash")
-    log_bot_run(name, "ok")
-except Exception as e:
-    print(f"[main] bot '{name}' crashed: {e}")
-    log_bot_run(name, "error")
-    # plus your existing error logging to the status error buffer
 
 async def scheduler_loop(interval_seconds: int = 60):
-    """
-    Main scheduler loop:
-      - Runs run_all_once() every interval_seconds.
-      - Catches any unexpected error at the scheduler level so it never dies.
+    """Main scheduler loop.
+
+    Repeatedly:
+      • Logs the cycle number.
+      • Calls run_all_once().
+      • Sleeps for interval_seconds.
+    Any unexpected exceptions at the scheduler level are logged but do NOT stop the loop.
     """
     cycle = 0
     print(f"[main] MoneySignalAI scheduler starting at {now_est_str()}")
@@ -165,9 +172,10 @@ async def scheduler_loop(interval_seconds: int = 60):
 
 
 def _start_background_scheduler():
-    """
-    Starts the asyncio scheduler loop in a dedicated background thread so the
-    FastAPI app (and uvicorn) can still serve HTTP requests.
+    """Starts the asyncio scheduler loop in a dedicated background thread.
+
+    This allows FastAPI/uvicorn to serve HTTP requests while the scheduler runs
+    in the background.
     """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -176,8 +184,9 @@ def _start_background_scheduler():
 
 @app.on_event("startup")
 async def startup_event():
-    """
-    On FastAPI startup (Render boot/redeploy), spin up the background scheduler thread.
+    """FastAPI startup hook.
+
+    On app startup (Render boot/redeploy), spin up the background scheduler thread.
     """
     threading.Thread(target=_start_background_scheduler, daemon=True).start()
 
