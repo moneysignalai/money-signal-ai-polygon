@@ -14,48 +14,56 @@ from bots.shared import (
     MIN_RVOL_GLOBAL,
     MIN_VOLUME_GLOBAL,
     send_alert,
-    get_dynamic_top_volume_universe,
-    grade_equity_setup,
-    is_etf_blacklisted,
     chart_link,
+    grade_equity_setup,
+    get_dynamic_top_volume_universe,
+    is_etf_blacklisted,
     now_est,
 )
 
-_client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 eastern = pytz.timezone("US/Eastern")
 
-# ---- Config / thresholds ----
+MIN_PREMARKET_PRICE = float(os.getenv("MIN_PREMARKET_PRICE", "5"))
+MIN_PREMARKET_MOVE_PCT = float(os.getenv("MIN_PREMARKET_MOVE_PCT", "3"))
+MIN_PREMARKET_DOLLAR_VOL = float(os.getenv("MIN_PREMARKET_DOLLAR_VOL", "500000"))
+MIN_PREMARKET_RVOL = float(os.getenv("MIN_PREMARKET_RVOL", "1.5"))
 
-MIN_PREMARKET_PRICE = float(os.getenv("MIN_PREMARKET_PRICE", "2.0"))
-MIN_PREMARKET_MOVE_PCT = float(os.getenv("MIN_PREMARKET_MOVE_PCT", "6.0"))  # vs prior close
-MIN_PREMARKET_DOLLAR_VOL = float(os.getenv("MIN_PREMARKET_DOLLAR_VOL", "3000000"))  # $3M+
-MIN_PREMARKET_RVOL = float(os.getenv("MIN_PREMARKET_RVOL", "2.0"))
+PREMARKET_START_MIN = 4 * 60  # 04:00
+PREMARKET_END_MIN = 9 * 60 + 29  # 09:29
 
-# Premarket scan window 04:00–09:29 ET
-PREMARKET_START_MIN = 4 * 60
-PREMARKET_END_MIN = 9 * 60 + 29
+_CLIENT: Optional[RESTClient] = None
 
-# Per-day de-dupe
-_alerted_date: Optional[date] = None
-_alerted_syms: set[str] = set()
+_alert_date: Optional[date] = None
+_alerted: set[str] = set()
+
+
+def _get_client() -> Optional[RESTClient]:
+    global _CLIENT
+    if _CLIENT is not None:
+        return _CLIENT
+    if not POLYGON_KEY:
+        print("[premarket] POLYGON_KEY missing.")
+        return None
+    _CLIENT = RESTClient(POLYGON_KEY)
+    return _CLIENT
 
 
 def _reset_if_new_day() -> None:
-    global _alerted_date, _alerted_syms
+    global _alert_date, _alerted
     today = date.today()
-    if _alerted_date != today:
-        _alerted_date = today
-        _alerted_syms = set()
+    if _alert_date != today:
+        _alert_date = today
+        _alerted = set()
 
 
 def _already(sym: str) -> bool:
     _reset_if_new_day()
-    return sym in _alerted_syms
+    return sym in _alerted
 
 
 def _mark_alerted(sym: str) -> None:
     _reset_if_new_day()
-    _alerted_syms.add(sym)
+    _alerted.add(sym)
 
 
 def _in_premarket_window() -> bool:
@@ -76,9 +84,12 @@ def _get_universe() -> List[str]:
 def _get_prev_and_today(sym: str):
     today = date.today()
     today_s = today.isoformat()
+    client = _get_client()
+    if not client:
+        return None, None
     try:
         days = list(
-            _client.list_aggs(
+            client.list_aggs(
                 ticker=sym,
                 multiplier=1,
                 timespan="day",
@@ -117,23 +128,23 @@ def _get_bar_timestamp_et(bar: Any) -> Optional[datetime]:
 
 def _get_premarket_window_aggs(sym: str) -> Tuple[float, float, float, float]:
     """
-    Returns (pre_low, pre_high, pre_last, pre_volume) for 1m bars between 04:00–09:29.
-
-    IMPORTANT: Polygon complained about ISO datetimes in 'from'.
-    To keep it happy, we request the whole **day** using just YYYY-MM-DD and
-    then filter 04:00–09:29 ET in Python based on each bar's timestamp.
+    Return (pre_low, pre_high, last_px, pre_vol) for 04:00–09:29 ET.
     """
+    client = _get_client()
+    if not client:
+        return 0.0, 0.0, 0.0, 0.0
+
     today = date.today()
-    day_str = today.isoformat()
+    today_s = today.isoformat()
 
     try:
         bars = list(
-            _client.list_aggs(
+            client.list_aggs(
                 ticker=sym,
                 multiplier=1,
                 timespan="minute",
-                from_=day_str,  # YYYY-MM-DD (Polygon-friendly)
-                to=day_str,
+                from_=(today - timedelta(days=1)).isoformat(),
+                to=today_s,
                 limit=2000,
             )
         )
@@ -170,27 +181,26 @@ def _get_premarket_window_aggs(sym: str) -> Tuple[float, float, float, float]:
 
 async def run_premarket():
     """
-    Premarket Runner Bot:
+    Premarket gap/momentum bot.
 
-      • Runs only 04:00–09:29 ET.
-      • Universe: dynamic top-volume list (or TICKER_UNIVERSE if provided).
-      • Requirements:
-          - Price >= MIN_PREMARKET_PRICE
-          - |Move vs prior close| >= MIN_PREMARKET_MOVE_PCT
-          - Premarket dollar volume >= MIN_PREMARKET_DOLLAR_VOL
-          - Day RVOL (partial) >= max(MIN_PREMARKET_RVOL, MIN_RVOL_GLOBAL)
-          - Day volume so far >= MIN_VOLUME_GLOBAL
-      • Per symbol: only one alert per day.
+    Filters:
+      - Price >= MIN_PREMARKET_PRICE
+      - |Move vs prior close| >= MIN_PREMARKET_MOVE_PCT
+      - Premarket dollar volume >= MIN_PREMARKET_DOLLAR_VOL
+      - Day RVOL (partial) >= max(MIN_PREMARKET_RVOL, MIN_RVOL_GLOBAL)
+      - Day volume so far >= MIN_VOLUME_GLOBAL
     """
-    if not POLYGON_KEY or not _client:
-        print("[premarket] No POLYGON_KEY/client; skipping.")
+    if not POLYGON_KEY:
+        print("[premarket] POLYGON_KEY missing; skipping.")
+        return
+
+    client = _get_client()
+    if not client:
         return
 
     if not _in_premarket_window():
         print("[premarket] Outside premarket window; skipping.")
         return
-
-    _reset_if_new_day()
 
     universe = _get_universe()
     today = date.today()
@@ -206,12 +216,22 @@ async def run_premarket():
         if not prev_bar or not today_bar:
             continue
 
-        prev_close = float(prev_bar.close)
+        # Safely extract previous close; skip if missing or invalid
+        prev_close_raw = getattr(prev_bar, "close", None) or getattr(prev_bar, "c", None)
+        try:
+            prev_close = float(prev_close_raw) if prev_close_raw is not None else 0.0
+        except (TypeError, ValueError):
+            prev_close = 0.0
         if prev_close <= 0:
             continue
 
         # Day volume so far (partial, because it's still premarket)
-        todays_partial_vol = float(today_bar.volume)
+        try:
+            todays_partial_vol = float(
+                getattr(today_bar, "volume", None) or getattr(today_bar, "v", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            todays_partial_vol = 0.0
 
         # Premarket minute bars
         pre_low, pre_high, last_px, pre_vol = _get_premarket_window_aggs(sym)
@@ -221,7 +241,7 @@ async def run_premarket():
         if last_px < MIN_PREMARKET_PRICE:
             continue
 
-        move_pct = (last_px - prev_close) / prev_close * 100.0
+        move_pct = (last_px - prev_close) / prev_close * 100.0  # prev_close guarded above
         if abs(move_pct) < MIN_PREMARKET_MOVE_PCT:
             continue
 
@@ -232,7 +252,7 @@ async def run_premarket():
         # Day RVOL (partial)
         try:
             days = list(
-                _client.list_aggs(
+                client.list_aggs(
                     ticker=sym,
                     multiplier=1,
                     timespan="day",
@@ -268,7 +288,6 @@ async def run_premarket():
 
         dollar_vol_day_partial = last_px * todays_partial_vol
 
-        # Grade & bias
         gap_pct = move_pct
         grade = grade_equity_setup(abs(gap_pct), rvol, dollar_vol_day_partial)
 
@@ -283,11 +302,12 @@ async def run_premarket():
         body = (
             f"{emoji} Premarket move: {move_pct:.1f}% {direction} vs prior close\n"
             f"📈 Prev Close: ${prev_close:.2f} → Premarket Last: ${last_px:.2f}\n"
-            f"📏 Premarket Range: ${pre_low:.2f} – ${pre_high:.2f}\n"
-            f"📦 Premarket Volume: {int(pre_vol):,} (≈ ${pre_dollar_vol:,.0f})\n"
-            f"📊 Day RVOL (partial): {rvol:.1f}x · Day Vol (so far): {int(todays_partial_vol):,}\n"
-            f"🎯 Setup Grade: {grade}\n"
-            f"📌 Bias: {bias}\n"
+            f"📊 Premarket Range: ${pre_low:.2f} – ${pre_high:.2f}\n"
+            f"📦 Premarket Vol: {pre_vol:,.0f} (≈ ${pre_dollar_vol:,.0f})\n"
+            f"💰 Day Vol (partial): {todays_partial_vol:,.0f} (≈ ${dollar_vol_day_partial:,.0f})\n"
+            f"📊 RVOL (partial): {rvol:.1f}x\n"
+            f"🎯 Grade: {grade}\n"
+            f"🧠 Bias: {bias}\n"
             f"🔗 Chart: {chart_link(sym)}"
         )
 
