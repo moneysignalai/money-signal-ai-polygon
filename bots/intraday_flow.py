@@ -470,7 +470,7 @@ def _check_momentum_reversal(sym: str, stats: Dict[str, Any]) -> Optional[str]:
 
 #------------SCANNER FOR STATUS_REPORT.PY BOT-----------------
 record_bot_stats(
-    "trend_flow",
+    "intraday_flow",
     scanned=len(universe),
     matched=len(matches),
     alerts=alerts_sent,
