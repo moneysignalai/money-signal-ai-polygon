@@ -232,6 +232,15 @@ async def run_opening_range_break() -> None:
         if not bars:
             continue
 
+        #------------SCANNER FOR STATUS_REPORT.PY BOT-----------------
+record_bot_stats(
+    "trend_flow",
+    scanned=len(universe),
+    matched=len(matches),
+    alerts=alerts_sent,
+    runtime=run_seconds,
+)
+
         # Split bars into ORB window and all RTH bars for today
         orb_start = datetime(trading_day.year, trading_day.month, trading_day.day, 9, 30, tzinfo=eastern)
         orb_end = orb_start + timedelta(minutes=ORB_MINUTES)
