@@ -34,15 +34,22 @@ eastern = pytz.timezone("US/Eastern")
 
 # ---------------- TIME HELPERS ----------------
 
-
-def now_est() -> str:
+class _NowEstWrapper(str):
     """
-    Human-friendly time string in Eastern, e.g. '10:48 AM EST · Nov 20'.
-
-    NOTE: This returns a STRING, not a datetime. Callers should NOT do .strftime()
-    on the return value.
+    Small helper so now_est() can be used both as:
+        ts = now_est()                # string
+        ts2 = now_est().strftime(...) # still works
     """
-    return datetime.now(eastern).strftime("%I:%M %p EST · %b %d").lstrip("0")
+
+    def strftime(self, fmt: str) -> str:
+        # Always compute a fresh datetime in EST for formatting
+        return datetime.now(eastern).strftime(fmt)
+
+
+def now_est() -> _NowEstWrapper:
+    """Human-friendly time string in Eastern, e.g. '10:48 AM EST · Nov 20' (with strftime support)."""
+    base = datetime.now(eastern).strftime("%I:%M %p EST · %b %d").lstrip("0")
+    return _NowEstWrapper(base)
 
 
 def today_est_date() -> date:
@@ -131,6 +138,48 @@ def report_status_error(bot: str, message: str) -> None:
 
 # ---------------- DYNAMIC UNIVERSE ----------------
 
+# Big static fallback universe (liquid names) used if Polygon fails or returns too few.
+_FALLBACK_UNIVERSE: List[str] = [
+    "SPY","QQQ","IWM","DIA","VTI",
+    "XLK","XLF","XLE","XLY","XLI",
+    "AAPL","MSFT","NVDA","TSLA","META",
+    "GOOGL","AMZN","NFLX","AVGO","ADBE",
+    "SMCI","AMD","INTC","MU","ORCL",
+    "CRM","SHOP","PANW","ARM","CSCO",
+    "PLTR","SOFI","SNOW","UBER","LYFT",
+    "ABNB","COIN","HOOD","RIVN","LCID",
+    "NIO","F","GM","T","VZ",
+    "BAC","JPM","WFC","C","GS",
+    "XOM","CVX","OXY","SLB","COP",
+    "PFE","MRK","LLY","UNH","ABBV",
+    "TSM","BABA","JD","NKE","MCD",
+    "SBUX","WMT","COST","HD","LOW",
+    "DIS","PARA","WBD","TGT","SQ",
+    "PYPL","ROKU","ETSY","NOW","INTU",
+    "TXN","QCOM","LRCX","AMAT","LIN",
+    "CAT","DE","BA","LULU","GME",
+    "AMC","MARA","RIOT","CLSK","BITF",
+    "CIFR","HUT","BTBT","TSLY","SMH",
+]
+
+
+def _fallback_universe_from_env_or_static(max_tickers: int = 150) -> List[str]:
+    """
+    Fallback when Polygon grouped-aggs fails or returns too few names.
+    Priority:
+      1) TICKER_UNIVERSE env
+      2) Static liquid universe
+    """
+    env = os.getenv("TICKER_UNIVERSE")
+    if env:
+        tickers = [s.strip().upper() for s in env.split(",") if s.strip()]
+        if tickers:
+            print(f"[shared] using TICKER_UNIVERSE fallback with {len(tickers)} names.")
+            return tickers[:max_tickers]
+
+    print(f"[shared] using static fallback universe with {len(_FALLBACK_UNIVERSE)} names.")
+    return _FALLBACK_UNIVERSE[:max_tickers]
+
 
 def get_dynamic_top_volume_universe(
     max_tickers: int = 100,
@@ -139,11 +188,13 @@ def get_dynamic_top_volume_universe(
     """
     Use Polygon's previous day's most-active (by dollar volume) to build a liquid universe.
 
-    We try the v2 /aggs/grouped endpoint with sort by 'v' or 'otc' as needed.
+    If Polygon fails or returns too few names, we aggressively fall back to:
+      • TICKER_UNIVERSE env, or
+      • A large static universe.
     """
     if not POLYGON_KEY:
-        print("[shared] POLYGON_KEY missing; cannot build dynamic universe.")
-        return []
+        print("[shared] POLYGON_KEY missing; using fallback universe instead of dynamic.")
+        return _fallback_universe_from_env_or_static(max_tickers=max_tickers)
 
     today = today_est_date()
     prev = today - timedelta(days=1)
@@ -160,9 +211,13 @@ def get_dynamic_top_volume_universe(
         msg = f"[shared] error fetching dynamic universe: {e}"
         print(msg)
         report_status_error("shared:universe", msg)
-        return []
+        return _fallback_universe_from_env_or_static(max_tickers=max_tickers)
 
     results = data.get("results") or []
+    if not results:
+        print("[shared] dynamic universe came back empty; using fallback universe.")
+        return _fallback_universe_from_env_or_static(max_tickers=max_tickers)
+
     # each result: {T: 'AAPL', v: volume, vw: vwap, ...}
     enriched: List[Tuple[str, float, float]] = []
     for row in results:
@@ -173,6 +228,10 @@ def get_dynamic_top_volume_universe(
         if not sym or dollar_vol <= 0:
             continue
         enriched.append((sym, vol, dollar_vol))
+
+    if not enriched:
+        print("[shared] dynamic universe had no valid rows; using fallback universe.")
+        return _fallback_universe_from_env_or_static(max_tickers=max_tickers)
 
     enriched.sort(key=lambda x: x[2], reverse=True)
 
@@ -186,6 +245,14 @@ def get_dynamic_top_volume_universe(
             break
         if total_dollar > 0 and running / total_dollar >= volume_coverage:
             break
+
+    # If Polygon returned something tiny / weird, fall back to broader list
+    if len(universe) < max(10, max_tickers // 5):
+        print(
+            f"[shared] dynamic universe only produced {len(universe)} names; "
+            "topping up with fallback universe."
+        )
+        return _fallback_universe_from_env_or_static(max_tickers=max_tickers)
 
     print(f"[shared] dynamic universe: {len(universe)} names, covers ~{volume_coverage*100:.0f}% vol.")
     return universe
@@ -236,9 +303,9 @@ def get_last_trade_cached(symbol: str, ttl_seconds: int = 15) -> Tuple[Optional[
         return None, None
 
     key = symbol.upper()
-    now = time.time()
+    now_ts = time.time()
     entry = _LAST_TRADE_CACHE.get(key)
-    if entry and isinstance(entry.ts, (int, float)) and now - float(entry.ts) < ttl_seconds:
+    if entry and isinstance(entry.ts, (int, float)) and now_ts - float(entry.ts) < ttl_seconds:
         return entry.last, entry.dollar_vol
 
     # v2 last trade
@@ -268,9 +335,10 @@ def get_last_trade_cached(symbol: str, ttl_seconds: int = 15) -> Tuple[Optional[
         return None, None
 
     # approximate dollar volume from previous day's volume * last price
+    # (bots that need exact intraday RVOL will fetch their own aggs)
     dollar_vol = last_price * MIN_VOLUME_GLOBAL
 
-    _LAST_TRADE_CACHE[key] = LastTradeCacheEntry(ts=now, last=last_price, dollar_vol=dollar_vol)
+    _LAST_TRADE_CACHE[key] = LastTradeCacheEntry(ts=now_ts, last=last_price, dollar_vol=dollar_vol)
     return last_price, dollar_vol
 
 
@@ -302,12 +370,12 @@ def get_option_chain_cached(
         return None
 
     key = _cache_key("chain", underlying.upper())
-    now = time.time()
+    now_ts = time.time()
 
     entry = _OPTION_CACHE.get(key)
     # Be robust to any legacy / malformed cache entries
     if isinstance(entry, OptionCacheEntry) and isinstance(entry.ts, (int, float)):
-        if now - float(entry.ts) < ttl_seconds:
+        if now_ts - float(entry.ts) < ttl_seconds:
             return entry.data
 
     url = f"https://api.polygon.io/v3/snapshot/options/{underlying.upper()}"
@@ -323,7 +391,7 @@ def get_option_chain_cached(
         report_status_error("shared:option_chain", msg)
         return None
 
-    _OPTION_CACHE[key] = OptionCacheEntry(ts=now, data=data)
+    _OPTION_CACHE[key] = OptionCacheEntry(ts=now_ts, data=data)
     return data
 
 
@@ -331,26 +399,21 @@ def get_last_option_trades_cached(
     full_option_symbol: str,
     ttl_seconds: int = 30,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Fetches the last option trade for a specific contract (Polygon v3).
-
-    Uses the correct endpoint:
-      /v3/last/trade/options/{option_symbol}
-    """
+    """Fetches the last option trade for a specific contract (v3 last/trade)."""
     if not POLYGON_KEY:
         print("[shared] POLYGON_KEY missing; cannot fetch last option trades.")
         return None
 
     key = _cache_key("last_trade", full_option_symbol)
-    now = time.time()
+    now_ts = time.time()
 
     entry = _OPTION_CACHE.get(key)
     # Be robust to any legacy / malformed cache entries
     if isinstance(entry, OptionCacheEntry) and isinstance(entry.ts, (int, float)):
-        if now - float(entry.ts) < ttl_seconds:
+        if now_ts - float(entry.ts) < ttl_seconds:
             return entry.data
 
-    url = f"https://api.polygon.io/v3/last/trade/options/{full_option_symbol}"
+    url = f"https://api.polygon.io/v3/last/trade/{full_option_symbol}"
     params = {"apiKey": POLYGON_KEY}
 
     try:
@@ -358,7 +421,6 @@ def get_last_option_trades_cached(
         # Treat 404 (no data) as a normal, non-fatal condition
         if r.status_code == 404:
             # Benign: no last option trade exists yet for this contract.
-            # We skip logging here to avoid log spam.
             return None
 
         r.raise_for_status()
@@ -369,7 +431,7 @@ def get_last_option_trades_cached(
         report_status_error("shared:last_option_trade", msg)
         return None
 
-    _OPTION_CACHE[key] = OptionCacheEntry(ts=now, data=data)
+    _OPTION_CACHE[key] = OptionCacheEntry(ts=now_ts, data=data)
     return data
 
 
