@@ -18,9 +18,9 @@ MIN_RVOL_GLOBAL = float(os.getenv("MIN_RVOL_GLOBAL", "2.0"))
 MIN_VOLUME_GLOBAL = float(os.getenv("MIN_VOLUME_GLOBAL", "500000"))  # shares
 
 # Telegram routing (your env)
-# - TELEGRAM_CHAT_ALL = single private chat ID for everything
-# - TELEGRAM_TOKEN_ALERTS = all-in-one alerts bot for all trade signals
-# - TELEGRAM_TOKEN_STATUS = dedicated status/heartbeat bot
+# - TELEGRAM_CHAT_ALL      = single private chat ID for everything
+# - TELEGRAM_TOKEN_ALERTS  = all-in-one alerts bot for all trade signals
+# - TELEGRAM_TOKEN_STATUS  = dedicated status/heartbeat bot
 TELEGRAM_CHAT_ALL = os.getenv("TELEGRAM_CHAT_ALL")
 TELEGRAM_TOKEN_ALERTS = os.getenv("TELEGRAM_TOKEN_ALERTS")
 TELEGRAM_TOKEN_STATUS = os.getenv("TELEGRAM_TOKEN_STATUS")
@@ -147,7 +147,7 @@ def _http_get_json(
       • a few retries with exponential backoff
       • optional status reporting on final failure
 
-    This is used for ALL Polygon grouped/agg/snapshot GETs so that transient
+    This is used for Polygon grouped/agg/snapshot GETs so that transient
     slowness does not kill the bots or flood them with exceptions.
     """
     for attempt in range(retries + 1):
@@ -185,8 +185,10 @@ def get_dynamic_top_volume_universe(
     """
     Use Polygon's previous day's most-active (by dollar volume) to build a liquid universe.
 
+    Used by multiple scanners (equity_flow, intraday_flow, trend_flow, options_flow, etc.).
+
     Mode A (stable): we also allow env overrides to keep the universe size sane:
-      • DYNAMIC_MAX_TICKERS — global cap on tickers regardless of caller's request
+      • DYNAMIC_MAX_TICKERS    — global cap on tickers regardless of caller's request
       • DYNAMIC_VOLUME_COVERAGE — override coverage fraction (e.g. 0.95)
     """
     if not POLYGON_KEY:
@@ -291,10 +293,6 @@ def get_last_trade_cached(symbol: str, ttl_seconds: int = 15) -> Tuple[Optional[
     """
     Cached last / dollar volume for the underlying (equity/ETF).
     Uses v2 last trade + MIN_VOLUME_GLOBAL as a rough dollar-vol approximation.
-
-    Mode A tweaks:
-      • Uses shared HTTP helper with retries + longer timeout.
-      • Keeps TTL modest (15s) so rapidly moving names still refresh.
     """
     if not POLYGON_KEY:
         print("[shared] POLYGON_KEY missing; cannot fetch last trade.")
@@ -306,7 +304,6 @@ def get_last_trade_cached(symbol: str, ttl_seconds: int = 15) -> Tuple[Optional[
     if entry and isinstance(entry.ts, (int, float)) and now_ts - float(entry.ts) < ttl_seconds:
         return entry.last, entry.dollar_vol
 
-    # v2 last trade
     url = f"https://api.polygon.io/v2/last/trade/{symbol.upper()}"
     params = {"apiKey": POLYGON_KEY}
 
@@ -328,9 +325,7 @@ def get_last_trade_cached(symbol: str, ttl_seconds: int = 15) -> Tuple[Optional[
     if last_price is None or last_price <= 0:
         return None, None
 
-    # approximate dollar volume from previous day's volume * last price
     dollar_vol = last_price * MIN_VOLUME_GLOBAL
-
     _LAST_TRADE_CACHE[key] = LastTradeCacheEntry(ts=now_ts, last=last_price, dollar_vol=dollar_vol)
     return last_price, dollar_vol
 
@@ -356,11 +351,7 @@ def get_option_chain_cached(
 ) -> Optional[Dict[str, Any]]:
     """Fetches Polygon snapshot option chain via HTTP and caches it.
 
-    Used by cheap / unusual / whales, etc.
-
-    Mode A tweaks:
-      • Slightly longer TTL (default 90s) to reduce pressure on Polygon.
-      • Uses HTTP helper with retries + 20s timeout.
+    Used by options_flow and any options-related logic.
     """
     if not POLYGON_KEY:
         print("[shared] POLYGON_KEY missing; cannot fetch option chain.")
@@ -370,7 +361,6 @@ def get_option_chain_cached(
     now_ts = time.time()
 
     entry = _OPTION_CACHE.get(key)
-    # Be robust to any legacy / malformed cache entries
     if isinstance(entry, OptionCacheEntry) and isinstance(entry.ts, (int, float)):
         if now_ts - float(entry.ts) < ttl_seconds:
             return entry.data
@@ -390,9 +380,13 @@ def get_last_option_trades_cached(
     full_option_symbol: str,
     ttl_seconds: int = 45,
 ) -> Optional[Dict[str, Any]]:
-    """Fetches the last option trade for a specific contract (v3 last/trade).
+    """
+    Fetches the last option trade for a specific contract (v3 last/trade).
 
-    NOTE: 404s are treated as benign (no trade yet) and do NOT hit the status bot.
+    Improvements:
+      • Slightly longer timeout (default ~20s).
+      • One retry with backoff.
+      • 404 is treated as benign (no status spam).
     """
     if not POLYGON_KEY:
         print("[shared] POLYGON_KEY missing; cannot fetch last option trades.")
@@ -402,7 +396,6 @@ def get_last_option_trades_cached(
     now_ts = time.time()
 
     entry = _OPTION_CACHE.get(key)
-    # Be robust to any legacy / malformed cache entries
     if isinstance(entry, OptionCacheEntry) and isinstance(entry.ts, (int, float)):
         if now_ts - float(entry.ts) < ttl_seconds:
             return entry.data
@@ -410,21 +403,35 @@ def get_last_option_trades_cached(
     url = f"https://api.polygon.io/v3/last/trade/{full_option_symbol}"
     params = {"apiKey": POLYGON_KEY}
 
-    try:
-        resp = requests.get(url, params=params, timeout=15.0)
-        if resp.status_code == 404:
-            # Benign: no last option trade exists yet for this contract.
-            return None
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        msg = f"[shared] error fetching last option trade for {full_option_symbol}: {e}"
-        print(msg)
-        report_status_error("shared:last_option_trade", msg)
-        return None
+    timeout = 20.0
+    retries = 1
+    backoff_seconds = 2.5
 
-    _OPTION_CACHE[key] = OptionCacheEntry(ts=now_ts, data=data)
-    return data
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.get(url, params=params, timeout=timeout)
+            if resp.status_code == 404:
+                # Benign: no last option trade exists yet for this contract.
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+            _OPTION_CACHE[key] = OptionCacheEntry(ts=now_ts, data=data)
+            return data
+        except Exception as e:
+            if attempt < retries:
+                wait = backoff_seconds * (attempt + 1)
+                print(
+                    f"[shared:last_option_trade] HTTP error on attempt "
+                    f"{attempt+1}/{retries+1}: {e} — retrying in {wait:.1f}s"
+                )
+                time.sleep(wait)
+            else:
+                msg = f"[shared] error fetching last option trade for {full_option_symbol}: {e}"
+                print(msg)
+                report_status_error("shared:last_option_trade", msg)
+                return None
+
+    return None
 
 
 # Legacy camelCase aliases
