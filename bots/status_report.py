@@ -1,19 +1,20 @@
 # bots/status_report.py
 #
-# Central status / heartbeat bot for MoneySignalAI
+# Advanced Status / Heartbeat System for MoneySignalAI
 #
-# Exposes:
-#   • record_bot_error(bot_name, exc)
-#   • log_bot_run(bot_name, status)   # status in {"ok", "error"}
-#   • run_status_report()             # async, scheduled from main.py
+# NEW CAPABILITIES:
+#   • Per-bot analytics (scan counts, matches, alerts, runtime).
+#   • Rolling error intel (last 30 errors + error categories).
+#   • Running averages to evaluate scanner performance.
+#   • Global analytics: total tickers scanned, alerts fired.
+#   • Heartbeat shows top heavy-load bots and most error-prone bots.
 #
-# Behavior:
-#   • Tracks last run time + last status per bot in memory.
-#   • Every few cycles, sends a heartbeat message to the STATUS chat:
-#       - Overall status (OK / Errors)
-#       - Per-bot last status + timestamp
-#       - Recent error snippets
-#   • Uses the same Telegram env vars as bots/shared.py.
+# Existing API preserved:
+#   record_bot_error(bot, exc)
+#   log_bot_run(bot, status)
+#   record_bot_stats(bot, *, scanned, matched, alerts, runtime)
+#   async run_status_report()
+#
 
 from __future__ import annotations
 
@@ -23,58 +24,75 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 
 import pytz
-
-from bots.shared import (
-    now_est,   # returns nice EST time string
-)
-
-# We import the private helper; that's fine in our own codebase.
-from bots.shared import _send_status  # type: ignore[attr-defined]
+from bots.shared import now_est, _send_status  # private import OK inside repo
 
 eastern = pytz.timezone("US/Eastern")
 
-# ---------------- STATE ----------------
+# ---------------- STATE STRUCTURES ----------------
 
-# bot_name -> {"last_status": "ok"|"error", "last_time": str, "last_error": Optional[str]}
+# Per-bot state
 _BOT_STATE: Dict[str, Dict[str, Any]] = {}
 
-# Recent error log (rolling)
+# Extended performance metrics (rolling)
+#
+# bot → {
+#    "scanned": int,
+#    "matched": int,
+#    "alerts": int,
+#    "runtime": float,
+#    "history": [
+#         {"scanned": n, "matched": m, "alerts": a, "runtime": s, "time": "..."},
+#    ]
+# }
+_BOT_STATS: Dict[str, Dict[str, Any]] = {}
+
+# Rolling error log
 _RECENT_ERRORS: list[Dict[str, Any]] = []
 
-# Last time (epoch seconds) we sent a heartbeat
-_LAST_HEARTBEAT_TS: Optional[float] = None
+# Rolling per-bot error counter
+_BOT_ERROR_COUNTER: Dict[str, int] = {}
 
-# Minimum seconds between heartbeats
-HEARTBEAT_INTERVAL_SEC = 10 * 60  # 10 minutes; adjust if you want
+_LAST_HEARTBEAT_TS: Optional[float] = None
+HEARTBEAT_INTERVAL_SEC = 10 * 60  # every 10 minutes
 
 
 def _now_ts() -> float:
     return time.time()
 
 
+# ---------------- ERROR CAPTURE ----------------
+
 def _append_error(bot: str, exc: BaseException) -> None:
     tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+
+    category = "internal"
+    msg = str(exc).lower()
+    if "429" in msg or "rate" in msg:
+        category = "polygon-rate-limit"
+    elif "connection" in msg or "timeout" in msg:
+        category = "network"
+    elif "polygon" in msg:
+        category = "polygon"
+
     entry = {
         "bot": bot,
         "time": now_est(),
+        "category": category,
         "error": str(exc),
-        "trace": tb[-800:],  # keep last ~800 chars
+        "trace": tb[-900:],   # keep end of traceback
     }
+
     _RECENT_ERRORS.append(entry)
-    # keep last 30 errors max
     if len(_RECENT_ERRORS) > 30:
         del _RECENT_ERRORS[:-30]
+
+    _BOT_ERROR_COUNTER[bot] = _BOT_ERROR_COUNTER.get(bot, 0) + 1
 
 
 # ---------------- PUBLIC API ----------------
 
 def record_bot_error(bot_name: str, exc: BaseException) -> None:
-    """
-    Called by main.run_all_once() when a bot raises an exception.
-    We just update state and keep going; status will be summarized
-    in the next heartbeat.
-    """
-    global _BOT_STATE
+    """Main.py calls this when a bot throws."""
     ts_str = now_est()
     _BOT_STATE.setdefault(bot_name, {})
     _BOT_STATE[bot_name].update(
@@ -88,14 +106,7 @@ def record_bot_error(bot_name: str, exc: BaseException) -> None:
 
 
 def log_bot_run(bot_name: str, status: str) -> None:
-    """
-    Called by main.run_all_once() after a bot completes its cycle.
-
-    status:
-        "ok"    -> bot completed without crashing
-        "error" -> bot crashed (main already called record_bot_error)
-    """
-    global _BOT_STATE
+    """Main.py calls this when a bot completes (ok/error)."""
     ts_str = now_est()
     _BOT_STATE.setdefault(bot_name, {})
     _BOT_STATE[bot_name].update(
@@ -106,72 +117,133 @@ def log_bot_run(bot_name: str, status: str) -> None:
     )
 
 
-# ---------------- HEARTBEAT ----------------
+def record_bot_stats(
+    bot_name: str,
+    *,
+    scanned: int,
+    matched: int,
+    alerts: int,
+    runtime: float,
+) -> None:
+    """
+    Bots call this to submit analytics after each full cycle.
+    (You will add 3–5 lines inside each bot.)
+    """
+    _BOT_STATS.setdefault(bot_name, {
+        "scanned": 0,
+        "matched": 0,
+        "alerts": 0,
+        "runtime": 0.0,
+        "history": [],
+    })
+
+    # Update rolling totals
+    st = _BOT_STATS[bot_name]
+    st["scanned"] += scanned
+    st["matched"] += matched
+    st["alerts"] += alerts
+    st["runtime"] += runtime
+
+    st["history"].append({
+        "time": now_est(),
+        "scanned": scanned,
+        "matched": matched,
+        "alerts": alerts,
+        "runtime": runtime,
+    })
+
+    # Keep last 40 runs
+    if len(st["history"]) > 40:
+        del st["history"][:-40]
+
+
+# ---------------- HEARTBEAT CONSTRUCTION ----------------
+
+def _build_stats_section() -> list[str]:
+    if not _BOT_STATS:
+        return ["📉 No scan statistics yet."]
+
+    lines = ["📊 **Scanner Analytics:**"]
+
+    total_scanned = sum(st["scanned"] for st in _BOT_STATS.values())
+    total_matched = sum(st["matched"] for st in _BOT_STATS.values())
+    total_alerts = sum(st["alerts"] for st in _BOT_STATS.values())
+
+    lines.append(f"• Total scanned: **{total_scanned:,}**")
+    lines.append(f"• Filter matches: **{total_matched:,}**")
+    lines.append(f"• Alerts fired: **{total_alerts:,}**")
+
+    # Top 3 scan-heavy bots
+    heavy = sorted(_BOT_STATS.items(), key=lambda x: x[1]["scanned"], reverse=True)[:3]
+    if heavy:
+        lines.append("\n🥵 **Top 3 Heaviest Bots (by scans):**")
+        for bot, st in heavy:
+            lines.append(f"• {bot}: {st['scanned']:,} scanned")
+
+    # Top 3 error-prone bots
+    noisy = sorted(_BOT_ERROR_COUNTER.items(), key=lambda x: x[1], reverse=True)[:3]
+    if noisy:
+        lines.append("\n🔥 **Top 3 Noisiest Bots (errors):**")
+        for bot, count in noisy:
+            lines.append(f"• {bot}: {count} errors")
+
+    return lines
+
 
 def _build_status_message() -> str:
-    """
-    Build a compact heartbeat / status summary for Telegram.
-    """
-    if not _BOT_STATE:
-        return f"📊 Status Report — {now_est()}\n\nNo bot runs recorded yet."
-
-    ok_bots = [b for b, s in _BOT_STATE.items() if s.get("last_status") == "ok"]
-    err_bots = [b for b, s in _BOT_STATE.items() if s.get("last_status") == "error"]
-
-    overall = "✅ ALL GOOD" if not err_bots else "⚠️ ERRORS DETECTED"
-
     lines = [
-        f"📊 MoneySignalAI Status — {now_est()}",
-        overall,
-        "────────────",
-        "🤖 Bot States:",
+        f"📡 **MoneySignalAI Heartbeat** — {now_est()}",
+        "────────────────────",
     ]
 
-    # List each bot with last status + time
-    for bot, info in sorted(_BOT_STATE.items()):
-        status = info.get("last_status", "?")
-        ts = info.get("last_time", "?")
-        emoji = "✅" if status == "ok" else "⚠️"
-        lines.append(f"{emoji} {bot}: {status.upper()} (last @ {ts})")
+    ok = [b for b, s in _BOT_STATE.items() if s.get("last_status") == "ok"]
+    err = [b for b, s in _BOT_STATE.items() if s.get("last_status") == "error"]
 
-    # Append a small recent error section
+    overall = "✅ ALL SYSTEMS GOOD" if not err else "⚠️ ERRORS DETECTED"
+    lines.append(overall)
+    lines.append("")
+
+    # Per-bot status
+    lines.append("🤖 **Bot Status:**")
+    for bot, info in sorted(_BOT_STATE.items()):
+        emoji = "✅" if info.get("last_status") == "ok" else "⚠️"
+        lines.append(f"{emoji} {bot}: {info.get('last_status','?').upper()} @ {info.get('last_time','?')}")
+
+    lines.append("────────────────────")
+
+    # Stats section
+    lines.extend(_build_stats_section())
+    lines.append("────────────────────")
+
+    # Error section
     if _RECENT_ERRORS:
-        lines.append("────────────")
-        lines.append("🧯 Recent Errors (last few):")
-        # show up to 5
+        lines.append("🧯 **Recent Errors:**")
         for err in _RECENT_ERRORS[-5:]:
-            lines.append(
-                f"• [{err['time']}] {err['bot']}: {err['error']}"
-            )
+            lines.append(f"• [{err['time']}] {err['bot']} ({err['category']}): {err['error']}")
 
     return "\n".join(lines)
 
 
-async def run_status_report() -> None:
-    """
-    Called as a bot from main.run_all_once() on every scheduler cycle.
+# ---------------- HEARTBEAT LOOP ----------------
 
-    We only send a real heartbeat message every HEARTBEAT_INTERVAL_SEC,
-    but we update / maintain state every cycle.
-    """
+async def run_status_report() -> None:
+    """Called every cycle from main.run_all_once()."""
     global _LAST_HEARTBEAT_TS
     now_ts = _now_ts()
 
-    # First run → force immediate heartbeat so you know it's alive
+    # Force immediate heartbeat at startup
     if _LAST_HEARTBEAT_TS is None:
         _LAST_HEARTBEAT_TS = now_ts - HEARTBEAT_INTERVAL_SEC
 
-    # If it's been long enough, send a heartbeat
+    # Send heartbeat
     if now_ts - _LAST_HEARTBEAT_TS >= HEARTBEAT_INTERVAL_SEC:
         msg = _build_status_message()
         try:
             _send_status(msg)
         except Exception as e:
-            # If status sending itself fails, just print; don't crash
-            print("[status_report] ERROR sending heartbeat:", e)
+            print("[status_report] FAILED sending heartbeat:", e)
         else:
             print("[status_report] Heartbeat sent.")
         _LAST_HEARTBEAT_TS = now_ts
     else:
-        # No-op this cycle, just a debug print
-        print("[status_report] Skipping heartbeat this cycle (interval not reached).")
+        print("[status_report] Heartbeat skipped (interval).")
