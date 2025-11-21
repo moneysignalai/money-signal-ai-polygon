@@ -191,105 +191,148 @@ _UNIVERSE_CACHE: Dict[str, Any] = {
 }
 
 
-def get_dynamic_top_volume_universe(
-    max_tickers: int = 200,
-    volume_coverage: float = 0.97,
-) -> List[str]:
-    """Fetch a dynamic ticker universe based on top dollar-volume.
-
-    Uses Polygon's v2 snapshot endpoint:
-        /v2/snapshot/locale/us/markets/stocks/tickers
-
-    Cached for a few minutes to avoid hammering Polygon.
+def get_dynamic_top_volume_universe(max_tickers: int = 150, volume_coverage: float = 0.97) -> List[str]:
     """
-    if not POLYGON_KEY:
-        print("[shared] POLYGON_KEY missing; dynamic universe fallback = empty list.")
-        return []
+    Build a universe of high-volume US stocks using Polygon snapshots.
 
-    now = time.time()
-    ts = _UNIVERSE_CACHE.get("ts")
-    if ts and now - ts < 180:
-        return list(_UNIVERSE_CACHE.get("tickers", []))
+    Behaviour:
+      1) Try live Polygon snapshot data.
+      2) If the API fails OR produces no valid records:
+            - Prefer any existing cached universe (if non-empty)
+            - Else use TICKER_UNIVERSE env (if set)
+            - Else fall back to a hard-coded list of ~100 popular, liquid names.
+    """
+    global _UNIVERSE_CACHE
 
-    # ✅ Correct Polygon endpoint
-    url = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
-    params = {
-        "apiKey": POLYGON_KEY,
-        "limit": 1000,  # grab a big chunk, then sort by dollar volume
-    }
+    # 1) Return warm cache if still fresh
+    now_ts = time.time()
+    cache_ts = _UNIVERSE_CACHE.get("ts", 0)
+    if now_ts - cache_ts < 180:  # 3-minute TTL
+        cached = _UNIVERSE_CACHE.get("tickers") or []
+        if cached:
+            return cached[: max_tickers or len(cached)]
 
-    try:
-        r = requests.get(url, params=params, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        msg = f"[shared] error fetching dynamic universe: {e}"
-        print(msg)
-        report_status_error("shared:universe", msg)
-        # fall back to last good universe if we have one
-        return _UNIVERSE_CACHE.get("tickers", [])
+    # Prepare fallbacks
+    env_raw = os.getenv("TICKER_UNIVERSE", "")
+    env_list: List[str] = [x.strip().upper() for x in env_raw.split(",") if x.strip()]
 
-    results = data.get("tickers") or []
-    if not results:
-        msg = "[shared] no tickers in dynamic universe response."
-        print(msg)
-        report_status_error("shared:universe", msg)
-        return _UNIVERSE_CACHE.get("tickers", [])
+    # ~100 popular, liquid, options-heavy names
+    FALLBACK_STATIC_100: List[str] = [
+        "SPY", "QQQ", "IWM", "DIA",
+        "AAPL", "MSFT", "NVDA", "TSLA", "AMD", "META", "GOOGL", "AMZN", "NFLX", "AVGO", "SMCI",
+        "JPM", "BAC", "WFC", "C", "GS", "MS",
+        "XOM", "CVX", "OXY", "SLB", "COP",
+        "TSM", "BABA", "JD", "PDD", "NIO",
+        "PLTR", "COIN", "HOOD", "SOFI", "SQ", "SHOP",
+        "RIVN", "LCID", "F", "GM", "T", "VZ",
+        "PFE", "MRK", "LLY", "UNH", "ABBV",
+        "AI", "INTC", "MU", "ORCL", "CRM",
+        "SNAP", "UBER", "LYFT", "ABNB", "RBLX",
+        "MARA", "RIOT", "CLSK", "HUT", "BITF",
+        "ARKK", "SOXL", "SOXS", "TQQQ", "SQQQ",
+        "IBIT", "BITO", "HYG", "LQD", "SLV",
+        "SMH", "XLK", "XLF", "XLE", "XLV",
+        "UVXY", "VXX", "UVIX", "SVIX", "SPXU",
+        "GLD", "GDX", "SI", "SILJ",
+        "TLT", "SHY", "IEF", "SPXL", "SPXS",
+        "MSTR", "QQQM", "XLU", "XLP", "XLY", "XLI", "XLC", "XLRE",
+    ]
 
-    def _vol(rec: Dict[str, Any]) -> float:
-        try:
-            return float(rec.get("todaysVolume") or rec.get("day", {}).get("v") or 0.0)
-        except Exception:
-            return 0.0
+    def use_fallback(reason: str) -> List[str]:
+        """Choose the best available fallback universe and log why."""
+        existing = _UNIVERSE_CACHE.get("tickers") or []
+        if existing:
+            print(f"[shared] dynamic universe fallback using cached list; reason={reason}; size={len(existing)}")
+            return existing[: max_tickers or len(existing)]
 
-    def _dollar_vol(rec: Dict[str, Any]) -> float:
-        try:
-            c = float(rec.get("lastTrade", {}).get("p")
-                      or rec.get("day", {}).get("c")
-                      or 0.0)
-            v = float(rec.get("day", {}).get("v") or rec.get("todaysVolume") or 0.0)
-            return c * v
-        except Exception:
-            return 0.0
+        if env_list:
+            print(f"[shared] dynamic universe fallback using TICKER_UNIVERSE; reason={reason}; size={len(env_list)}")
+            _UNIVERSE_CACHE["ts"] = now_ts
+            _UNIVERSE_CACHE["tickers"] = env_list
+            return env_list[: max_tickers or len(env_list)]
 
-    records: List[TickerRecord] = []
-    for rec in results:
-        sym = rec.get("ticker")
-        if not sym:
-            continue
-        dv = _dollar_vol(rec)
-        if dv <= 0:
-            continue
-        records.append(
-            TickerRecord(
-                ticker=sym,
-                volume=_vol(rec),
-                dollar_volume=dv,
-            )
+        print(
+            f"[shared] dynamic universe fallback using static top-100; "
+            f"reason={reason}; size={len(FALLBACK_STATIC_100)}"
         )
+        _UNIVERSE_CACHE["ts"] = now_ts
+        _UNIVERSE_CACHE["tickers"] = FALLBACK_STATIC_100
+        return FALLBACK_STATIC_100[: max_tickers or len(FALLBACK_STATIC_100)]
 
-    if not records:
-        msg = "[shared] dynamic universe produced no valid records."
-        print(msg)
-        report_status_error("shared:universe", msg)
-        return _UNIVERSE_CACHE.get("tickers", [])
+    # 2) If no POLYGON_KEY at all, immediately use fallback
+    if not POLYGON_KEY:
+        return use_fallback("no_polygon_key")
 
-    records.sort(key=lambda r: r.dollar_volume, reverse=True)
+    # 3) Call Polygon snapshots
+    try:
+        import requests
 
-    total_dv = sum(r.dollar_volume for r in records)
+        url = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
+        params = {"apiKey": POLYGON_KEY, "limit": 1000}
+        resp = requests.get(url, params=params, timeout=5)
+        resp.raise_for_status()
+        data = resp.json() or {}
+        rows = data.get("tickers") or data.get("results") or []
+    except Exception as e:
+        print(f"[shared] error fetching dynamic universe: {e}")
+        return use_fallback("exception")
+
+    if not rows:
+        print("[shared] dynamic universe: Polygon snapshot returned 0 rows.")
+        return use_fallback("no_rows")
+
+    # 4) Build list of (symbol, dollar_volume)
+    records: List[tuple[str, float]] = []
+    total_dollar_vol = 0.0
+
+    for row in rows:
+        try:
+            sym = row.get("ticker") or row.get("T") or ""
+            # Skip weird symbols / non-equities
+            if not sym or ":" in sym or sym.endswith("^"):
+                continue
+
+            day = row.get("day") or row.get("todaysChanges") or row.get("today") or {}
+            close_px = float(day.get("c") or day.get("close") or row.get("last", 0.0) or 0.0)
+            volume = float(day.get("v") or day.get("volume") or 0.0)
+
+            if close_px <= 0 or volume <= 0:
+                continue
+
+            dollar_vol = close_px * volume
+            if dollar_vol <= 0:
+                continue
+
+            records.append((sym, dollar_vol))
+            total_dollar_vol += dollar_vol
+        except Exception:
+            continue
+
+    if not records or total_dollar_vol <= 0:
+        print("[shared] dynamic universe produced no valid records; falling back.")
+        return use_fallback("no_valid_records")
+
+    # 5) Sort by dollar volume desc and accumulate until coverage target or max_tickers
+    records.sort(key=lambda x: x[1], reverse=True)
+
+    picked: List[str] = []
     running = 0.0
-    chosen: List[str] = []
+    target_coverage = max(0.0, min(float(volume_coverage), 0.999))
 
-    for r in records:
-        chosen.append(r.ticker)
-        running += r.dollar_volume
-        if running / total_dv >= volume_coverage or len(chosen) >= max_tickers:
+    for sym, dv in records:
+        picked.append(sym)
+        running += dv
+        if len(picked) >= max_tickers:
+            break
+        if running / total_dollar_vol >= target_coverage:
             break
 
-    _UNIVERSE_CACHE["ts"] = now
-    _UNIVERSE_CACHE["tickers"] = chosen
-    print(f"[shared] dynamic universe size={len(chosen)} coverage≈{running/total_dv:.1%}")
-    return chosen
+    coverage = running / total_dollar_vol if total_dollar_vol > 0 else 0.0
+    _UNIVERSE_CACHE["ts"] = now_ts
+    _UNIVERSE_CACHE["tickers"] = picked
+
+    print(f"[shared] dynamic universe size={len(picked)} coverage≈{coverage*100:.1f}% (records={len(records)})")
+    return picked
 
 
 # ---------------- OPTION SNAPSHOT + LAST TRADE (CACHED) ----------------
