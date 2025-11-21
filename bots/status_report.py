@@ -26,6 +26,36 @@ eastern = pytz.timezone("US/Eastern")
 TELEGRAM_TOKEN_STATUS = os.getenv("TELEGRAM_TOKEN_STATUS")
 TELEGRAM_CHAT_ALL = os.getenv("TELEGRAM_CHAT_ALL")
 
+#------
+
+ somewhere near the top-level
+from datetime import datetime
+import pytz
+
+eastern = pytz.timezone("US/Eastern")
+
+_BOT_RUN_LOG: list[tuple[datetime, str, str]] = []  # (timestamp, bot_name, outcome)
+
+def log_bot_run(bot_name: str, outcome: str) -> None:
+    """
+    outcome in {"ok", "error"} (you can extend if needed).
+    """
+    now_et = datetime.now(eastern)
+    _BOT_RUN_LOG.append((now_et, bot_name, outcome))
+    # keep it small
+    if len(_BOT_RUN_LOG) > 500:
+        del _BOT_RUN_LOG[:-500]
+
+
+def consume_recent_bot_runs() -> list[tuple[datetime, str, str]]:
+    """
+    Pop and return all accumulated bot run entries since the last status cycle.
+    """
+    global _BOT_RUN_LOG
+    events = _BOT_RUN_LOG
+    _BOT_RUN_LOG = []
+    return events
+
 # --------------- INTERNAL STATE ---------------
 
 # Error events: list of dicts {time, source, message}
