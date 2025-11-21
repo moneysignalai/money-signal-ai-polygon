@@ -205,6 +205,14 @@ def _run_swing_pullback_for_symbol(sym: str, days: List[Any]):
     _pull_mark(sym)
     send_alert("swing_pullback", sym, last_price, rvol, extra=extra)
 
+        #------------SCANNER FOR STATUS_REPORT.PY BOT-----------------
+record_bot_stats(
+    "trend_flow",
+    scanned=len(universe),
+    matched=len(matches),
+    alerts=alerts_sent,
+    runtime=run_seconds,
+)
 
 # ------------------- TREND RIDER CORE -------------------
 
