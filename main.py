@@ -35,8 +35,10 @@ BOTS = [
     ("panic_flush", "bots.panic_flush", "run_panic_flush"),
     ("dark_pool_radar", "bots.dark_pool_radar", "run_dark_pool_radar"),
     ("iv_crush", "bots.iv_crush", "run_iv_crush"),
-]
 
+    # 🔍 Debug-only bot:
+    ("debug_ping", "bots.debug_ping", "run_debug_ping"),
+]
 
 @app.get("/")
 def root():
