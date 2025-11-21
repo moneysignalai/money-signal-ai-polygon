@@ -233,8 +233,20 @@ async def run_opening_range_break() -> None:
             continue
 
         #------------SCANNER FOR STATUS_REPORT.PY BOT-----------------
+from bots.status_report import record_bot_stats
+
+BOT_NAME = "opening_range_breakout"
+...
+start_ts = time.time()
+alerts_sent = 0
+matches = []
+
+# ... your scan logic ...
+
+run_seconds = time.time() - start_ts
+
 record_bot_stats(
-    "openingrangebreakout",
+    BOT_NAME,
     scanned=len(universe),
     matched=len(matches),
     alerts=alerts_sent,
