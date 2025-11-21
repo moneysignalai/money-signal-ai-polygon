@@ -204,13 +204,26 @@ async def run_earnings():
         )
 
         #------------SCANNER FOR STATUS_REPORT.PY BOT-----------------
+from bots.status_report import record_bot_stats
+
+BOT_NAME = "earnings"
+...
+start_ts = time.time()
+alerts_sent = 0
+matches = []
+
+# ... your scan logic ...
+
+run_seconds = time.time() - start_ts
+
 record_bot_stats(
-    "earnings",
+    BOT_NAME,
     scanned=len(universe),
     matched=len(matches),
     alerts=alerts_sent,
     runtime=run_seconds,
 )
+
 
         # --- Confirm actual earnings event + enrich with fundamentals ---
         earnings_rec = _fetch_earnings_for_symbol(sym, today)
