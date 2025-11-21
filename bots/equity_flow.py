@@ -302,6 +302,14 @@ def _sma(values: List[float], window: int) -> List[float]:
         out.append(sum(window_vals) / float(window))
     return out
 
+#------------SCANNER FOR STATUS_REPORT.PY BOT-----------------
+record_bot_stats(
+    "trend_flow",
+    scanned=len(universe),
+    matched=len(matches),
+    alerts=alerts_sent,
+    runtime=run_seconds,
+)
 
 # -------------------------------------------------------------------
 # STRATEGY LOGIC (uses shared stats so we only compute once)
