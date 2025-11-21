@@ -1,16 +1,14 @@
 # bots/trend_flow.py
 #
-# Unified Trend Scanner:
-#   • Momentum Reversal (oversold bounce / overbought fade)
-#   • Trend Rider (trend continuation)
-#   • Panic Flush (high-volume selloff)
+# Unified trend/swing bot:
+#   • Trend Rider (breakouts with strong trend)
+#   • Swing Pullback (dip buy in strong uptrend)
 #
-# Eliminates 3 separate files and combines ALL logic into ONE pass over the universe,
-# with shared daily data + Polygon client.
+# Uses daily candles only; runs during RTH but could be limited to 1–2x/day.
 
 import os
 from datetime import date, timedelta, datetime
-from typing import List, Optional, Tuple
+from typing import List
 
 import pytz
 
@@ -25,363 +23,335 @@ from bots.shared import (
     MIN_VOLUME_GLOBAL,
     send_alert,
     get_dynamic_top_volume_universe,
-    is_etf_blacklisted,
     grade_equity_setup,
+    is_etf_blacklisted,
     chart_link,
     now_est,
 )
 
-eastern = pytz.timezone("US/Eastern")
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
+eastern = pytz.timezone("US/Eastern")
 
-# ======================================================
-# CONFIG — Reuses ALL your existing env vars
-# ======================================================
+# ------------------- GLOBAL CONFIG -------------------
 
-# Momentum Reversal
-REV_MIN_PRICE = float(os.getenv("REV_MIN_PRICE", "4.0"))
-REV_MIN_RVOL = float(os.getenv("REV_MIN_RVOL", "1.8"))
-REV_MAX_RSI = float(os.getenv("REV_MAX_RSI", "35.0"))      # Oversold bounce
-REV_MIN_RSI_FADE = float(os.getenv("REV_MIN_RSI_FADE", "70.0"))  # Overbought fade
+TREND_MAX_UNIVERSE = int(os.getenv("TREND_MAX_UNIVERSE", "200"))
 
-# Trend Rider
-TR_MIN_PRICE = float(os.getenv("TR_MIN_PRICE", "5.0"))
-TR_MIN_RVOL = float(os.getenv("TR_MIN_RVOL", "1.5"))
-TR_USE_EMA9 = True
-TR_USE_EMA21 = True
-TR_USE_SMA50 = True
+def _trend_universe() -> List[str]:
+    env = os.getenv("TREND_TICKER_UNIVERSE")
+    if env:
+        return [x.strip().upper() for x in env.split(",") if x.strip()]
+    return get_dynamic_top_volume_universe(max_tickers=TREND_MAX_UNIVERSE, volume_coverage=0.97)
 
-# Panic Flush
-PF_MIN_PRICE = float(os.getenv("PF_MIN_PRICE", "3.0"))
-PF_MIN_RVOL = float(os.getenv("PF_MIN_RVOL", "2.0"))
-PF_DROP_MIN_PCT = float(os.getenv("PF_DROP_MIN_PCT", "5.0"))
-PF_MAX_RSI = float(os.getenv("PF_MAX_RSI", "30.0"))
-
-# Universe control
-TREND_FLOW_MAX_UNIVERSE = int(os.getenv("TREND_FLOW_MAX_UNIVERSE", "200"))
-TREND_FLOW_TICKER_UNIVERSE = os.getenv("TREND_FLOW_TICKER_UNIVERSE")
-
-# De-dupe
-_alert_date = None
-_alerted_rev = set()
-_alerted_trend = set()
-_alerted_flush = set()
-
-
-# ======================================================
-# DAY RESET
-# ======================================================
-
-def _reset_if_new_day():
-    global _alert_date, _alerted_rev, _alerted_trend, _alerted_flush
-    today = date.today()
-    if _alert_date != today:
-        _alert_date = today
-        _alerted_rev = set()
-        _alerted_trend = set()
-        _alerted_flush = set()
-
-
-def _format_now_est():
+def _time_str() -> str:
     try:
         ts = now_est()
         if isinstance(ts, str):
             return ts
         return ts.strftime("%I:%M %p EST · %b %d").lstrip("0")
-    except:
+    except Exception:
         return datetime.now(eastern).strftime("%I:%M %p EST · %b %d").lstrip("0")
 
-
-# ======================================================
-# HELPERS
-# ======================================================
-
-def _get_universe() -> List[str]:
-    if TREND_FLOW_TICKER_UNIVERSE:
-        return [s.strip().upper() for s in TREND_FLOW_TICKER_UNIVERSE.split(",") if s.strip()]
-
-    env = os.getenv("TICKER_UNIVERSE")
-    if env:
-        return [s.strip().upper() for s in env.split(",") if s.strip()]
-
-    return get_dynamic_top_volume_universe(
-        max_tickers=TREND_FLOW_MAX_UNIVERSE,
-        volume_coverage=0.95,
-    )
+def _in_rth() -> bool:
+    now = datetime.now(eastern)
+    mins = now.hour * 60 + now.minute
+    return 9 * 60 + 30 <= mins <= 16 * 60  # 09:30–16:00 ET
 
 
-def _fetch_daily(sym: str, trading_day: date) -> List:
-    if not _client:
+# ------------------- SWING PULLBACK CONFIG & STATE -------------------
+
+MIN_PRICE = float(os.getenv("PULLBACK_MIN_PRICE", "10.0"))
+MAX_PRICE = float(os.getenv("PULLBACK_MAX_PRICE", "200.0"))
+MIN_DOLLAR_VOL = float(os.getenv("PULLBACK_MIN_DOLLAR_VOL", "30000000"))  # $30M+
+MIN_RVOL = float(os.getenv("PULLBACK_MIN_RVOL", "2.0"))
+MAX_PULLBACK_PCT = float(os.getenv("PULLBACK_MAX_PULLBACK_PCT", "15.0"))
+MIN_PULLBACK_PCT = float(os.getenv("PULLBACK_MIN_PULLBACK_PCT", "3.0"))
+MAX_RED_DAYS = int(os.getenv("PULLBACK_MAX_RED_DAYS", "3"))
+LOOKBACK_DAYS = int(os.getenv("PULLBACK_LOOKBACK_DAYS", "60"))
+
+_pull_date: date | None = None
+_pull_alerted: set[str] = set()
+
+def _reset_pull():
+    global _pull_date, _pull_alerted
+    today = date.today()
+    if _pull_date != today:
+        _pull_date = today
+        _pull_alerted = set()
+
+def _pull_already(sym: str) -> bool:
+    return sym in _pull_alerted
+
+def _pull_mark(sym: str):
+    _pull_alerted.add(sym)
+
+
+# ------------------- TREND RIDER CONFIG & STATE -------------------
+
+TREND_MIN_PRICE = float(os.getenv("TREND_MIN_PRICE", "10.0"))
+TREND_MAX_PRICE = float(os.getenv("TREND_MAX_PRICE", "500.0"))
+TREND_MIN_DOLLAR_VOL = float(os.getenv("TREND_MIN_DOLLAR_VOL", "30000000"))
+TREND_MIN_RVOL = float(os.getenv("TREND_MIN_RVOL", "1.5"))
+TREND_BREAKOUT_LOOKBACK = int(os.getenv("TREND_BREAKOUT_LOOKBACK", "20"))  # 20-day high/low
+
+_trend_date: date | None = None
+_trend_alerted: set[str] = set()
+
+def _reset_trend():
+    global _trend_date, _trend_alerted
+    today = date.today()
+    if _trend_date != today:
+        _trend_date = today
+        _trend_alerted = set()
+
+def _trend_already(sym: str) -> bool:
+    return sym in _trend_alerted
+
+def _trend_mark(sym: str):
+    _trend_alerted.add(sym)
+
+
+# ------------------- HELPERS -------------------
+
+def _sma(values: List[float], window: int) -> List[float]:
+    if len(values) < window:
         return []
-    start = (trading_day - timedelta(days=120)).isoformat()
-    end = trading_day.isoformat()
+    out = []
+    for i in range(window - 1, len(values)):
+        window_vals = values[i - window + 1 : i + 1]
+        out.append(sum(window_vals) / float(window))
+    return out
+
+
+# ------------------- SWING PULLBACK CORE -------------------
+
+def _run_swing_pullback_for_symbol(sym: str, days: List[Any]):
+    if len(days) < 30:
+        return
+
+    today_bar = days[-1]
+    prev_bar = days[-2]
 
     try:
-        return list(
-            _client.list_aggs(
-                sym,
-                1,
-                "day",
-                start,
-                end,
-                limit=150,
-                sort="asc",
-            )
-        )
-    except Exception as e:
-        print(f"[trend_flow] daily error for {sym}: {e}")
-        return []
-
-
-def _compute_rsi(values: List[float], period: int = 14) -> Optional[float]:
-    if len(values) < period + 2:
-        return None
-
-    gains = []
-    losses = []
-    for i in range(1, period + 1):
-        diff = values[-i] - values[-i - 1]
-        if diff >= 0:
-            gains.append(diff)
-        else:
-            losses.append(abs(diff))
-
-    avg_gain = sum(gains) / period if gains else 0
-    avg_loss = sum(losses) / period if losses else 0
-    if avg_loss == 0:
-        return 100
-
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-
-def _ema(values: List[float], window: int) -> Optional[float]:
-    if len(values) < window:
-        return None
-    k = 2 / (window + 1)
-    ema = values[0]
-    for v in values[1:]:
-        ema = v * k + ema * (1 - k)
-    return ema
-
-
-# ======================================================
-# STRATEGIES
-# ======================================================
-
-def _maybe_momentum_reversal(sym: str, stats, closes: List[float]):
-    if sym in _alerted_rev:
+        last_price = float(today_bar.close)
+        prev_close = float(prev_bar.close)
+        day_vol = float(today_bar.volume or 0.0)
+    except Exception:
         return
 
-    last = stats["last"]
-    rvol = stats["rvol"]
-    if last < REV_MIN_PRICE:
-        return
-    if rvol < max(REV_MIN_RVOL, MIN_RVOL_GLOBAL):
+    if last_price < MIN_PRICE or last_price > MAX_PRICE:
         return
 
-    rsi = _compute_rsi(closes)
-    if not rsi:
+    dollar_vol = last_price * day_vol
+    if dollar_vol < max(MIN_DOLLAR_VOL, MIN_VOLUME_GLOBAL * last_price):
         return
 
-    move_pct = stats["move"]
-    dollar_vol = stats["dollar_vol"]
-
-    # ---- OVERSOLD BOUNCE ----
-    if rsi <= REV_MAX_RSI:
-        body = (
-            f"🔄 MOMENTUM REVERSAL (Oversold)\n"
-            f"📉 RSI: {rsi:.1f}\n"
-            f"📈 Move: {move_pct:.1f}%\n"
-            f"📦 Dollar Vol: ${dollar_vol:,.0f}\n"
-            f"🔗 Chart: {chart_link(sym)}"
-        )
-
-        ts = _format_now_est()
-        extra = (
-            f"📣 REVERSAL — {sym}\n"
-            f"🕒 {ts}\n"
-            f"💰 ${last:.2f} · RVOL {rvol:.1f}x\n"
-            "────────────\n"
-            f"{body}"
-        )
-        _alerted_rev.add(sym)
-        return send_alert("momentum_reversal", sym, last, rvol, extra=extra)
-
-    # ---- OVERBOUGHT FADE ----
-    if rsi >= REV_MIN_RSI_FADE:
-        body = (
-            f"🔄 MOMENTUM REVERSAL (Overbought Fade)\n"
-            f"📈 RSI: {rsi:.1f}\n"
-            f"📉 Move: {move_pct:.1f}%\n"
-            f"📦 Dollar Vol: ${dollar_vol:,.0f}\n"
-            f"🔗 Chart: {chart_link(sym)}"
-        )
-        ts = _format_now_est()
-        extra = (
-            f"📣 REVERSAL — {sym}\n"
-            f"🕒 {ts}\n"
-            f"💰 ${last:.2f} · RVOL {rvol:.1f}x\n"
-            "────────────\n"
-            f"{body}"
-        )
-        _alerted_rev.add(sym)
-        return send_alert("momentum_reversal", sym, last, rvol, extra=extra)
-
-
-def _maybe_trend_rider(sym: str, stats, closes: List[float]):
-    if sym in _alerted_trend:
+    vols = [float(d.volume or 0.0) for d in days[-21:-1]]
+    avg_vol = sum(vols) / max(len(vols), 1)
+    if avg_vol <= 0:
+        return
+    rvol = day_vol / avg_vol
+    if rvol < max(MIN_RVOL_GLOBAL, MIN_RVOL):
         return
 
-    last = stats["last"]
-    rvol = stats["rvol"]
-    if last < TR_MIN_PRICE:
-        return
-    if rvol < max(TR_MIN_RVOL, MIN_RVOL_GLOBAL):
-        return
-
-    ema9 = _ema(closes, 9)
-    ema21 = _ema(closes, 21)
-    sma50 = sum(closes[-50:]) / 50 if len(closes) >= 50 else None
-
-    if not ema9 or not ema21 or not sma50:
+    closes = [float(d.close) for d in days]
+    sma20_series = _sma(closes, 20)
+    sma50_series = _sma(closes, 50)
+    if not sma20_series or not sma50_series:
         return
 
-    if not (ema9 > ema21 > sma50):
+    sma20 = sma20_series[-1]
+    sma50 = sma50_series[-1]
+
+    if sma20 <= sma50:
         return
-    if not (last > ema9):
+    if last_price <= sma50:
         return
 
-    ts = _format_now_est()
-    body = (
-        f"📈 TREND RIDER (Continuation)\n"
-        f"EMA9: {ema9:.2f}, EMA21: {ema21:.2f}, SMA50: {sma50:.2f}\n"
-        f"RVOL: {rvol:.1f}x\n"
+    recent_closes = [float(d.close) for d in days[-(MAX_RED_DAYS + 5) :]]
+    red_days = 0
+    for i in range(1, len(recent_closes)):
+        if recent_closes[i] < recent_closes[i - 1]:
+            red_days += 1
+
+    if red_days == 0 or red_days > MAX_RED_DAYS:
+        return
+
+    recent_window = closes[-20:]
+    swing_high = max(recent_window)
+    if swing_high <= 0:
+        return
+
+    pullback_pct = (swing_high - last_price) / swing_high * 100.0
+    if pullback_pct < MIN_PULLBACK_PCT or pullback_pct > MAX_PULLBACK_PCT:
+        return
+
+    move_pct = (last_price / prev_close - 1.0) * 100.0 if prev_close > 0 else 0.0
+    grade = grade_equity_setup(move_pct, rvol, dollar_vol)
+
+    timestamp = _time_str()
+    extra = (
+        f"📈 SWING PULLBACK — {sym}\n"
+        f"🕒 {timestamp}\n"
+        f"💰 ${last_price:.2f} · RVOL {rvol:.1f}x\n"
+        "────────────\n"
+        f"📌 Strong uptrend: 20 SMA {sma20:.2f} > 50 SMA {sma50:.2f}\n"
+        f"📉 Recent pullback: {red_days} red days, ~{pullback_pct:.1f}% from high\n"
+        f"📊 Day Move: {move_pct:.1f}% · Volume: {int(day_vol):,}\n"
+        f"💵 Dollar Volume: ≈ ${dollar_vol:,.0f}\n"
+        f"🎯 Setup Grade: {grade} · Bias: LONG DIP-BUY\n"
         f"🔗 Chart: {chart_link(sym)}"
     )
-    extra = (
-        f"⚡ TREND — {sym}\n"
-        f"🕒 {ts}\n"
-        f"💰 ${last:.2f} · RVOL {rvol:.1f}x\n"
-        "────────────\n"
-        f"{body}"
-    )
-    _alerted_trend.add(sym)
-    send_alert("trend_rider", sym, last, rvol, extra=extra)
+
+    _pull_mark(sym)
+    send_alert("swing_pullback", sym, last_price, rvol, extra=extra)
 
 
-def _maybe_panic_flush(sym: str, stats, closes: List[float]):
-    if sym in _alerted_flush:
+# ------------------- TREND RIDER CORE -------------------
+
+def _run_trend_rider_for_symbol(sym: str, days: List[Any]):
+    if len(days) < 60:
         return
 
-    last = stats["last"]
-    rvol = stats["rvol"]
-    move_pct = stats["move"]
+    today_bar = days[-1]
+    prev_bar = days[-2]
 
-    if last < PF_MIN_PRICE:
-        return
-    if rvol < max(PF_MIN_RVOL, MIN_RVOL_GLOBAL):
-        return
-    if move_pct > -PF_DROP_MIN_PCT:
-        return
-
-    rsi = _compute_rsi(closes)
-    if not rsi or rsi > PF_MAX_RSI:
+    try:
+        last_price = float(today_bar.close)
+        prev_close = float(prev_bar.close)
+        day_vol = float(today_bar.volume or 0.0)
+        day_high = float(today_bar.high or 0.0)
+        day_low = float(today_bar.low or 0.0)
+    except Exception:
         return
 
-    ts = _format_now_est()
+    if last_price < TREND_MIN_PRICE or last_price > TREND_MAX_PRICE:
+        return
+
+    dollar_vol = last_price * day_vol
+    if dollar_vol < max(TREND_MIN_DOLLAR_VOL, MIN_VOLUME_GLOBAL * last_price):
+        return
+
+    vols = [float(d.volume or 0.0) for d in days[-21:-1]]
+    avg_vol = sum(vols) / max(len(vols), 1)
+    if avg_vol <= 0:
+        return
+    rvol = day_vol / avg_vol
+    if rvol < max(TREND_MIN_RVOL, MIN_RVOL_GLOBAL):
+        return
+
+    closes = [float(d.close) for d in days]
+    sma20_series = _sma(closes, 20)
+    sma50_series = _sma(closes, 50)
+    if not sma20_series or not sma50_series:
+        return
+
+    sma20 = sma20_series[-1]
+    sma50 = sma50_series[-1]
+    if sma20 <= sma50:
+        return
+
+    lookback = closes[-TREND_BREAKOUT_LOOKBACK - 1 : -1]
+    if not lookback:
+        return
+    prior_high = max(lookback)
+    prior_low = min(lookback)
+
+    breakout_up = last_price > prior_high
+    breakout_down = last_price < prior_low
+
+    if not (breakout_up or breakout_down):
+        return
+
+    move_pct = (last_price / prev_close - 1.0) * 100.0 if prev_close > 0 else 0.0
+    grade = grade_equity_setup(move_pct, rvol, dollar_vol)
+
+    direction = "UPTREND BREAKOUT" if breakout_up else "DOWNTREND BREAKDOWN"
+    emoji = "🚀" if breakout_up else "⚠️"
+
+    timestamp = _time_str()
     body = (
-        f"💥 PANIC FLUSH\n"
-        f"📉 Drop: {move_pct:.1f}%\n"
-        f"📉 RSI: {rsi:.1f}\n"
-        f"📊 RVOL: {rvol:.1f}\n"
+        f"{emoji} {direction}\n"
+        f"📈 20 SMA {sma20:.2f} > 50 SMA {sma50:.2f}\n"
+        f"📏 Prior {TREND_BREAKOUT_LOOKBACK}-day range: {prior_low:.2f} – {prior_high:.2f}\n"
+        f"📍 Today: Low {day_low:.2f} – High {day_high:.2f} – Close {last_price:.2f}\n"
+        f"📊 Day Move: {move_pct:.1f}% · RVOL {rvol:.1f}x\n"
+        f"💵 Dollar Volume: ≈ ${dollar_vol:,.0f}\n"
+        f"🎯 Setup Grade: {grade}\n"
         f"🔗 Chart: {chart_link(sym)}"
     )
 
     extra = (
-        f"🩸 FLUSH — {sym}\n"
-        f"🕒 {ts}\n"
-        f"💰 ${last:.2f} · RVOL {rvol:.1f}x\n"
+        f"📣 TREND RIDER — {sym}\n"
+        f"🕒 {timestamp}\n"
+        f"💰 ${last_price:.2f} · RVOL {rvol:.1f}x\n"
         "────────────\n"
         f"{body}"
     )
 
-    _alerted_flush.add(sym)
-    send_alert("panic_flush", sym, last, rvol, extra=extra)
+    _trend_mark(sym)
+    send_alert("trend_rider", sym, last_price, rvol, extra=extra)
 
 
-# ======================================================
-# MAIN
-# ======================================================
+# ------------------- MAIN ENTRYPOINT -------------------
 
 async def run_trend_flow():
     """
-    Unified Trend Scanner:
-      - Momentum Reversal
-      - Trend Rider
-      - Panic Flush
-    """
-    _reset_if_new_day()
+    Unified trend/swing engine:
 
+      • Trend Rider: breakout with strong trend
+      • Swing Pullback: dip in strong uptrend
+      • Universe: TREND_TICKER_UNIVERSE env OR dynamic top volume universe
+      • Runs during RTH; can be tuned by SCAN_INTERVAL_SECONDS in main.py.
+    """
     if not POLYGON_KEY or not _client:
-        print("[trend_flow] Missing API key or client.")
+        print("[trend_flow] Missing client/API key.")
+        return
+    if not _in_rth():
+        print("[trend_flow] Outside RTH; skipping.")
         return
 
-    universe = _get_universe()
+    _reset_pull()
+    _reset_trend()
+
+    universe = _trend_universe()
     if not universe:
-        print("[trend_flow] Empty universe.")
+        print("[trend_flow] empty universe; skipping.")
         return
 
     today = date.today()
-    print(f"[trend_flow] scanning {len(universe)} tickers…")
+    start = (today - timedelta(days=LOOKBACK_DAYS + 50)).isoformat()
+    end = today.isoformat()
+
+    print(f"[trend_flow] scanning {len(universe)} symbols at {_time_str()}")
 
     for sym in universe:
         if is_etf_blacklisted(sym):
             continue
 
-        daily = _fetch_daily(sym, today)
-        if len(daily) < 20:
+        try:
+            days = list(
+                _client.list_aggs(
+                    ticker=sym,
+                    multiplier=1,
+                    timespan="day",
+                    from_=start,
+                    to=end,
+                    limit=LOOKBACK_DAYS + 60,
+                )
+            )
+        except Exception as e:
+            print(f"[trend_flow] daily fetch failed for {sym}: {e}")
             continue
 
-        # Stats
-        today_bar = daily[-1]
-        prev_bar = daily[-2]
-
-        last = float(getattr(today_bar, "close", 0))
-        prev_close = float(getattr(prev_bar, "close", 0))
-        vol = float(getattr(today_bar, "volume", 0))
-
-        closes = [float(getattr(d, "close", 0)) for d in daily]
-
-        if prev_close <= 0:
+        if not days:
             continue
 
-        move_pct = (last - prev_close) / prev_close * 100
-        dollar_vol = last * vol
+        # Swing Pullback
+        if not _pull_already(sym):
+            _run_swing_pullback_for_symbol(sym, days)
 
-        # RVOL calc
-        hist_vols = [float(getattr(d, "volume", 0)) for d in daily[:-1]]
-        recent = hist_vols[-20:] if len(hist_vols) > 20 else hist_vols
-        avg_vol = sum(recent) / len(recent) if recent else vol
-        rvol = vol / avg_vol if avg_vol > 0 else 1.0
+        # Trend Rider
+        if not _trend_already(sym):
+            _run_trend_rider_for_symbol(sym, days)
 
-        stats = {
-            "last": last,
-            "prev_close": prev_close,
-            "move": move_pct,
-            "rvol": rvol,
-            "vol": vol,
-            "dollar_vol": dollar_vol,
-        }
-
-        # Fire all strategies
-        try: _maybe_momentum_reversal(sym, stats, closes)
-        except Exception as e: print(f"[trend_flow] rev error for {sym}: {e}")
-
-        try: _maybe_trend_rider(sym, stats, closes)
-        except Exception as e: print(f"[trend_flow] trend error for {sym}: {e}")
-
-        try: _maybe_panic_flush(sym, stats, closes)
-        except Exception as e: print(f"[trend_flow] flush error for {sym}: {e}")
-
-    print("[trend_flow] complete.")
+    print("[trend_flow] scan complete.")
