@@ -234,7 +234,7 @@ async def run_opening_range_break() -> None:
 
         #------------SCANNER FOR STATUS_REPORT.PY BOT-----------------
 record_bot_stats(
-    "trend_flow",
+    "openingrangebreakout",
     scanned=len(universe),
     matched=len(matches),
     alerts=alerts_sent,
