@@ -34,19 +34,21 @@ BOTS = [
     ("gap", "bots.gap", "run_gap"),
     ("orb", "bots.orb", "run_orb"),
     ("volume", "bots.volume", "run_volume"),
-    ("cheap", "bots.cheap", "run_cheap"),
-    ("unusual", "bots.unusual", "run_unusual"),
+    # OLD:
+    # ("cheap", "bots.cheap", "run_cheap"),
+    # ("unusual", "bots.unusual", "run_unusual"),
+    # ("whales", "bots.whales", "run_whales"),
+    # NEW unified options flow bot:
+    ("options_flow", "bots.options_flow", "run_options_flow"),
     ("squeeze", "bots.squeeze", "run_squeeze"),
     ("earnings", "bots.earnings", "run_earnings"),
     ("momentum_reversal", "bots.momentum_reversal", "run_momentum_reversal"),
-    ("whales", "bots.whales", "run_whales"),
     ("trend_rider", "bots.trend_rider", "run_trend_rider"),
     ("swing_pullback", "bots.swing_pullback", "run_swing_pullback"),
     ("panic_flush", "bots.panic_flush", "run_panic_flush"),
     ("dark_pool_radar", "bots.dark_pool_radar", "run_dark_pool_radar"),
     ("iv_crush", "bots.iv_crush", "run_iv_crush"),
 ]
-
 
 @app.get("/")
 def root():
