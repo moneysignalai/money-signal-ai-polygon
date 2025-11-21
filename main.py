@@ -128,7 +128,16 @@ async def run_all_once():
         else:
             # Successful completion (even if that bot just skipped due to time window / filters)
             print(f"[main] bot '{name}' completed cycle without crash")
+            from bots.shared import log_bot_run
 
+try:
+    await coro()
+    print(f"[main] bot '{name}' completed cycle without crash")
+    log_bot_run(name, "ok")
+except Exception as e:
+    print(f"[main] bot '{name}' crashed: {e}")
+    log_bot_run(name, "error")
+    # plus your existing error logging to the status error buffer
 
 async def scheduler_loop(interval_seconds: int = 60):
     """
