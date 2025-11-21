@@ -23,319 +23,255 @@ MIN_VOLUME_GLOBAL = float(os.getenv("MIN_VOLUME_GLOBAL", "500000"))  # shares
 # - TELEGRAM_TOKEN_ALERTS = all-in-one alerts bot for all trade signals
 # - TELEGRAM_TOKEN_STATUS = dedicated status/heartbeat bot
 TELEGRAM_CHAT_ALL = os.getenv("TELEGRAM_CHAT_ALL")
-
 TELEGRAM_TOKEN_ALERTS = os.getenv("TELEGRAM_TOKEN_ALERTS")
 TELEGRAM_TOKEN_STATUS = os.getenv("TELEGRAM_TOKEN_STATUS")
+
+# Some bots may want a separate status-only chat; if not set, fallback to CHAT_ALL
+TELEGRAM_CHAT_STATUS = os.getenv("TELEGRAM_CHAT_STATUS") or TELEGRAM_CHAT_ALL
 
 eastern = pytz.timezone("US/Eastern")
 
 
-def now_est() -> datetime:
-    return datetime.now(eastern)
+# ---------------- TIME HELPERS ----------------
 
 
-# ---------------- TELEGRAM LOW-LEVEL ----------------
+def now_est() -> str:
+    """Human-friendly time string in Eastern, e.g. '10:48 AM EST · Nov 20'."""
+    return datetime.now(eastern).strftime("%I:%M %p EST · %b %d").lstrip("0")
 
 
-def _send_telegram_raw(
-    token: Optional[str],
-    chat_id: Optional[str],
-    text: str,
-    parse_mode: Optional[str] = "Markdown",
-) -> None:
-    """Low-level Telegram sender used by alerts + status.
+def today_est_date() -> date:
+    return datetime.now(eastern).date()
 
-    Safe: prints errors but never raises, so one bad message cannot crash the app.
-    """
-    if not token or not chat_id:
-        print(f"[telegram] missing token/chat_id, skipping message: {text[:80]}")
-        return
 
+def iso_today() -> str:
+    return today_est_date().isoformat()
+
+
+def minutes_since_midnight_est() -> int:
+    now = datetime.now(eastern)
+    return now.hour * 60 + now.minute
+
+
+# ---------------- TELEGRAM CORE ----------------
+
+
+def _send_telegram_raw(token: str, chat_id: str, text: str, parse_mode: Optional[str] = None) -> None:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-    }
+    payload = {"chat_id": chat_id, "text": text}
     if parse_mode:
         payload["parse_mode"] = parse_mode
-
     try:
         r = requests.post(url, json=payload, timeout=10)
-        if not r.ok:
-            print(f"[telegram] send failed {r.status_code}: {r.text}")
+        r.raise_for_status()
     except Exception as e:
-        print(f"[telegram] exception while sending message: {e}")
-
-
-# ---------------- PUBLIC ALERT SENDER ----------------
+        # We deliberately do not raise; status bot might still be able to report.
+        print(f"[telegram] failed to send: {e} | text={text!r}")
 
 
 def send_alert(
     bot_name: str,
     symbol: str,
-    price: float,
-    rvol: float | None = None,
-    extra: str | None = None,
+    last_price: float,
+    rvol: float,
+    extra: Optional[str] = None,
 ) -> None:
-    """Main alert pipe for all trade bots.
-
-    Uses:
-      - TELEGRAM_TOKEN_ALERTS
-      - TELEGRAM_CHAT_ALL
+    """
+    Core alert sender used by all bots.
+    Sends a pretty Telegram message via TELEGRAM_TOKEN_ALERTS → TELEGRAM_CHAT_ALL.
     """
     token = TELEGRAM_TOKEN_ALERTS
     chat = TELEGRAM_CHAT_ALL
-
     if not token or not chat:
-        print(f"[alert:{bot_name}] (no TELEGRAM_TOKEN_ALERTS or TELEGRAM_CHAT_ALL) {symbol} {price}")
-        if extra:
-            print(extra)
+        print(f"[alert:{bot_name}] (no TELEGRAM_TOKEN_ALERTS or TELEGRAM_CHAT_ALL) {symbol} {extra}")
         return
 
-    # Basic header line; bots are expected to supply a fully formatted 'extra' body
-    header = f"[{bot_name.upper()}] {symbol} @ ${price:.2f}"
-    if rvol is not None:
-        header += f" · RVOL {rvol:.1f}x"
-
+    header = f"🧠 {bot_name.upper()} — {symbol}"
+    body_lines = [header]
+    if last_price:
+        body_lines.append(f"💰 Last: ${last_price:.2f}")
+    if rvol:
+        body_lines.append(f"📊 RVOL: {rvol:.1f}x")
     if extra:
-        msg = f"{extra}"
-    else:
-        msg = header
+        body_lines.append("────────────")
+        body_lines.append(extra)
 
-    _send_telegram_raw(token, chat, msg, parse_mode="Markdown")
+    text = "\n".join(body_lines)
+    _send_telegram_raw(token, chat, text, parse_mode=None)
 
 
-def send_status(message: str) -> None:
-    """Status / heartbeat / error digest messages.
+# ---------------- STATUS / ERROR REPORTING ----------------
 
-    Uses ONLY:
-      - TELEGRAM_TOKEN_STATUS (dedicated status bot)
-      - TELEGRAM_CHAT_ALL (same private chat as alerts)
-      - NO Markdown (plain text), so raw errors / stack traces cannot break it.
 
-    If TELEGRAM_TOKEN_STATUS or TELEGRAM_CHAT_ALL is missing,
-    we log the status line to stdout and skip Telegram.
-    """
-    token = TELEGRAM_TOKEN_STATUS
-    chat = TELEGRAM_CHAT_ALL
-
+def _send_status(text: str) -> None:
+    token = TELEGRAM_TOKEN_STATUS or TELEGRAM_TOKEN_ALERTS
+    chat = TELEGRAM_CHAT_STATUS or TELEGRAM_CHAT_ALL
     if not token or not chat:
-        print(f"[status] (no TELEGRAM_TOKEN_STATUS or TELEGRAM_CHAT_ALL) {message}")
+        print(f"[status] (no TELEGRAM_TOKEN_STATUS or TELEGRAM_CHAT_ALL) {text}")
         return
-
-    # Plain text: avoids 400 "can't parse entities" errors from Telegram
-    _send_telegram_raw(token, chat, message, parse_mode=None)
+    _send_telegram_raw(token, chat, text, parse_mode=None)
 
 
 def report_status_error(bot: str, message: str) -> None:
-    """Bridge helper so shared/bots can push errors into status_report.
-
-    This keeps status reporting centralized without creating an import cycle.
-    Called by shared helpers when a *soft* error happens (e.g. Polygon fails),
-    so it shows up in the Telegram error digest even if the bot doesn't crash.
     """
-    try:
-        from bots import status_report  # type: ignore
+    Soft error reporting to the status bot.
 
-        if hasattr(status_report, "record_bot_error"):
-            status_report.record_bot_error(bot, message)
+    Called by shared helpers when a non-fatal error happens (e.g. Polygon fails),
+    so it shows up in the Telegram error digest even if the main bot continues.
+    """
+    ts = now_est()
+    text = f"⚠️ [{bot}] {ts}\n{message}"
+    _send_status(text)
+
+
+# ---------------- DYNAMIC UNIVERSE ----------------
+
+
+def get_dynamic_top_volume_universe(
+    max_tickers: int = 100,
+    volume_coverage: float = 0.90,
+) -> List[str]:
+    """
+    Use Polygon's previous day's most-active (by dollar volume) to build a liquid universe.
+
+    We try the v2 /aggs/grouped endpoint with sort by 'v' or 'otc' as needed.
+    """
+    if not POLYGON_KEY:
+        print("[shared] POLYGON_KEY missing; cannot build dynamic universe.")
+        return []
+
+    today = today_est_date()
+    prev = today - timedelta(days=1)
+    from_ = prev.isoformat()
+    to_ = prev.isoformat()
+
+    url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{from_}"
+    params = {"adjusted": "true", "apiKey": POLYGON_KEY}
+
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
     except Exception as e:
-        # Never raise from here; last resort is just console logging
-        print(f"[shared] failed to forward error to status_report: {e}; original={message}")
+        msg = f"[shared] error fetching dynamic universe: {e}"
+        print(msg)
+        report_status_error("shared:universe", msg)
+        return []
+
+    results = data.get("results") or []
+    # each result: {T: 'AAPL', v: volume, vw: vwap, ...}
+    enriched: List[Tuple[str, float, float]] = []
+    for row in results:
+        sym = row.get("T")
+        vol = float(row.get("v") or 0.0)
+        vwap = float(row.get("vw") or 0.0)
+        dollar_vol = vol * vwap
+        if not sym or dollar_vol <= 0:
+            continue
+        enriched.append((sym, vol, dollar_vol))
+
+    enriched.sort(key=lambda x: x[2], reverse=True)
+
+    universe: List[str] = []
+    total_dollar = sum(row[2] for row in enriched)
+    running = 0.0
+    for sym, _v, dv in enriched:
+        universe.append(sym)
+        running += dv
+        if len(universe) >= max_tickers:
+            break
+        if total_dollar > 0 and running / total_dollar >= volume_coverage:
+            break
+
+    print(f"[shared] dynamic universe: {len(universe)} names, covers ~{volume_coverage*100:.0f}% vol.")
+    return universe
 
 
 # ---------------- ETF BLACKLIST ----------------
 
-# Basic ETF blacklist; can be extended via ENV if you want
-_DEFAULT_ETF_BLACKLIST = {
-    "UVXY",
-    "SVXY",
+ETF_BLACKLIST = {
+    "DIA",
+    "VTI",
     "XLK",
     "XLF",
     "XLE",
-    "XLP",
-    "XLV",
     "XLY",
     "XLI",
+    "XLV",
+    "XLP",
     "XLB",
     "XLU",
-    "ARKK",
+    "XOP",
+    "XRT",
 }
-
-_ETF_EXTRA = set(
-    x.strip().upper()
-    for x in os.getenv("ETF_BLACKLIST_EXTRA", "").split(",")
-    if x.strip()
-)
-
-ETF_BLACKLIST = _DEFAULT_ETF_BLACKLIST | _ETF_EXTRA
 
 
 def is_etf_blacklisted(symbol: str) -> bool:
     return symbol.upper() in ETF_BLACKLIST
 
 
-# ---------------- DYNAMIC UNIVERSE (TOP VOLUME) ----------------
-
+# ---------------- CACHED UNDERLYING LAST ----------------
 
 @dataclass
-class TickerRecord:
-    ticker: str
-    volume: float
-    dollar_volume: float
+class LastTradeCacheEntry:
+    ts: float
+    last: float
+    dollar_vol: float
 
 
-_UNIVERSE_CACHE: Dict[str, Any] = {
-    "ts": None,
-    "tickers": [],
-}
+_LAST_TRADE_CACHE: Dict[str, LastTradeCacheEntry] = {}
 
 
-def get_dynamic_top_volume_universe(max_tickers: int = 150, volume_coverage: float = 0.97) -> List[str]:
+def get_last_trade_cached(symbol: str, ttl_seconds: int = 15) -> Tuple[Optional[float], Optional[float]]:
     """
-    Build a universe of high-volume US stocks using Polygon snapshots.
-
-    Behaviour:
-      1) Try live Polygon snapshot data.
-      2) If the API fails OR produces no valid records:
-            - Prefer any existing cached universe (if non-empty)
-            - Else use TICKER_UNIVERSE env (if set)
-            - Else fall back to a hard-coded list of ~100 popular, liquid names.
+    Cached last / dollar volume for the underlying (equity/ETF).
+    Uses v2 last trade + previous day's volume as an approximation.
     """
-    global _UNIVERSE_CACHE
-
-    # 1) Return warm cache if still fresh
-    now_ts = time.time()
-    cache_ts = _UNIVERSE_CACHE.get("ts", 0)
-    if now_ts - cache_ts < 180:  # 3-minute TTL
-        cached = _UNIVERSE_CACHE.get("tickers") or []
-        if cached:
-            return cached[: max_tickers or len(cached)]
-
-    # Prepare fallbacks
-    env_raw = os.getenv("TICKER_UNIVERSE", "")
-    env_list: List[str] = [x.strip().upper() for x in env_raw.split(",") if x.strip()]
-
-    # ~100 popular, liquid, options-heavy names
-    FALLBACK_STATIC_100: List[str] = [
-        "SPY", "QQQ", "IWM", "DIA",
-        "AAPL", "MSFT", "NVDA", "TSLA", "AMD", "META", "GOOGL", "AMZN", "NFLX", "AVGO", "SMCI",
-        "JPM", "BAC", "WFC", "C", "GS", "MS",
-        "XOM", "CVX", "OXY", "SLB", "COP",
-        "TSM", "BABA", "JD", "PDD", "NIO",
-        "PLTR", "COIN", "HOOD", "SOFI", "SQ", "SHOP",
-        "RIVN", "LCID", "F", "GM", "T", "VZ",
-        "PFE", "MRK", "LLY", "UNH", "ABBV",
-        "AI", "INTC", "MU", "ORCL", "CRM",
-        "SNAP", "UBER", "LYFT", "ABNB", "RBLX",
-        "MARA", "RIOT", "CLSK", "HUT", "BITF",
-        "ARKK", "SOXL", "SOXS", "TQQQ", "SQQQ",
-        "IBIT", "BITO", "HYG", "LQD", "SLV",
-        "SMH", "XLK", "XLF", "XLE", "XLV",
-        "UVXY", "VXX", "UVIX", "SVIX", "SPXU",
-        "GLD", "GDX", "SI", "SILJ",
-        "TLT", "SHY", "IEF", "SPXL", "SPXS",
-        "MSTR", "QQQM", "XLU", "XLP", "XLY", "XLI", "XLC", "XLRE",
-    ]
-
-    def use_fallback(reason: str) -> List[str]:
-        """Choose the best available fallback universe and log why."""
-        existing = _UNIVERSE_CACHE.get("tickers") or []
-        if existing:
-            print(f"[shared] dynamic universe fallback using cached list; reason={reason}; size={len(existing)}")
-            return existing[: max_tickers or len(existing)]
-
-        if env_list:
-            print(f"[shared] dynamic universe fallback using TICKER_UNIVERSE; reason={reason}; size={len(env_list)}")
-            _UNIVERSE_CACHE["ts"] = now_ts
-            _UNIVERSE_CACHE["tickers"] = env_list
-            return env_list[: max_tickers or len(env_list)]
-
-        print(
-            f"[shared] dynamic universe fallback using static top-100; "
-            f"reason={reason}; size={len(FALLBACK_STATIC_100)}"
-        )
-        _UNIVERSE_CACHE["ts"] = now_ts
-        _UNIVERSE_CACHE["tickers"] = FALLBACK_STATIC_100
-        return FALLBACK_STATIC_100[: max_tickers or len(FALLBACK_STATIC_100)]
-
-    # 2) If no POLYGON_KEY at all, immediately use fallback
     if not POLYGON_KEY:
-        return use_fallback("no_polygon_key")
+        print("[shared] POLYGON_KEY missing; cannot fetch last trade.")
+        return None, None
 
-    # 3) Call Polygon snapshots
+    key = symbol.upper()
+    now = time.time()
+    entry = _LAST_TRADE_CACHE.get(key)
+    if entry and isinstance(entry.ts, (int, float)) and now - float(entry.ts) < ttl_seconds:
+        return entry.last, entry.dollar_vol
+
+    # v2 last trade
+    url = f"https://api.polygon.io/v2/last/trade/{symbol.upper()}"
+    params = {"apiKey": POLYGON_KEY}
     try:
-        import requests
-
-        url = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
-        params = {"apiKey": POLYGON_KEY, "limit": 1000}
-        resp = requests.get(url, params=params, timeout=5)
-        resp.raise_for_status()
-        data = resp.json() or {}
-        rows = data.get("tickers") or data.get("results") or []
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
     except Exception as e:
-        print(f"[shared] error fetching dynamic universe: {e}")
-        return use_fallback("exception")
+        msg = f"[shared] error fetching last trade for {symbol}: {e}"
+        print(msg)
+        report_status_error("shared:last_trade", msg)
+        return None, None
 
-    if not rows:
-        print("[shared] dynamic universe: Polygon snapshot returned 0 rows.")
-        return use_fallback("no_rows")
+    last_raw = (
+        (data.get("results") or {}).get("p")
+        if isinstance(data.get("results"), dict)
+        else None
+    )
+    try:
+        last_price = float(last_raw) if last_raw is not None else None
+    except (TypeError, ValueError):
+        last_price = None
 
-    # 4) Build list of (symbol, dollar_volume)
-    records: List[tuple[str, float]] = []
-    total_dollar_vol = 0.0
+    if last_price is None or last_price <= 0:
+        return None, None
 
-    for row in rows:
-        try:
-            sym = row.get("ticker") or row.get("T") or ""
-            # Skip weird symbols / non-equities
-            if not sym or ":" in sym or sym.endswith("^"):
-                continue
+    # approximate dollar volume from previous day's volume * last price
+    # (bots that need exact intraday RVOL will fetch their own aggs)
+    dollar_vol = last_price * MIN_VOLUME_GLOBAL
 
-            day = row.get("day") or row.get("todaysChanges") or row.get("today") or {}
-            close_px = float(day.get("c") or day.get("close") or row.get("last", 0.0) or 0.0)
-            volume = float(day.get("v") or day.get("volume") or 0.0)
-
-            if close_px <= 0 or volume <= 0:
-                continue
-
-            dollar_vol = close_px * volume
-            if dollar_vol <= 0:
-                continue
-
-            records.append((sym, dollar_vol))
-            total_dollar_vol += dollar_vol
-        except Exception:
-            continue
-
-    if not records or total_dollar_vol <= 0:
-        print("[shared] dynamic universe produced no valid records; falling back.")
-        return use_fallback("no_valid_records")
-
-    # 5) Sort by dollar volume desc and accumulate until coverage target or max_tickers
-    records.sort(key=lambda x: x[1], reverse=True)
-
-    picked: List[str] = []
-    running = 0.0
-    target_coverage = max(0.0, min(float(volume_coverage), 0.999))
-
-    for sym, dv in records:
-        picked.append(sym)
-        running += dv
-        if len(picked) >= max_tickers:
-            break
-        if running / total_dollar_vol >= target_coverage:
-            break
-
-    coverage = running / total_dollar_vol if total_dollar_vol > 0 else 0.0
-    _UNIVERSE_CACHE["ts"] = now_ts
-    _UNIVERSE_CACHE["tickers"] = picked
-
-    print(f"[shared] dynamic universe size={len(picked)} coverage≈{coverage*100:.1f}% (records={len(records)})")
-    return picked
+    _LAST_TRADE_CACHE[key] = LastTradeCacheEntry(ts=now, last=last_price, dollar_vol=dollar_vol)
+    return last_price, dollar_vol
 
 
-# ---------------- OPTION SNAPSHOT + LAST TRADE (CACHED) ----------------
+# ---------------- OPTION CACHES ----------------
 
 @dataclass
 class OptionCacheEntry:
@@ -366,8 +302,10 @@ def get_option_chain_cached(
     now = time.time()
 
     entry = _OPTION_CACHE.get(key)
-    if entry and now - entry.ts < ttl_seconds:
-        return entry.data
+    # Be robust to any legacy / malformed cache entries
+    if isinstance(entry, OptionCacheEntry) and isinstance(entry.ts, (int, float)):
+        if now - float(entry.ts) < ttl_seconds:
+            return entry.data
 
     url = f"https://api.polygon.io/v3/snapshot/options/{underlying.upper()}"
     params = {"apiKey": POLYGON_KEY}
@@ -399,8 +337,10 @@ def get_last_option_trades_cached(
     now = time.time()
 
     entry = _OPTION_CACHE.get(key)
-    if entry and now - entry.ts < ttl_seconds:
-        return entry.data
+    # Be robust to any legacy / malformed cache entries
+    if isinstance(entry, OptionCacheEntry) and isinstance(entry.ts, (int, float)):
+        if now - float(entry.ts) < ttl_seconds:
+            return entry.data
 
     url = f"https://api.polygon.io/v3/last/trade/{full_option_symbol}"
     params = {"apiKey": POLYGON_KEY}
@@ -426,15 +366,12 @@ def get_last_option_trades_cached(
     return data
 
 
-# ---- Backwards-compat function names (old bots) ----
-
+# Legacy camelCase aliases
 def getOptionChainCached(underlying: str, ttl_seconds: int = 60):
-    """Legacy camelCase alias used by older bots."""
     return get_option_chain_cached(underlying, ttl_seconds=ttl_seconds)
 
 
 def getLastOptionTradesCached(full_option_symbol: str, ttl_seconds: int = 30):
-    """Legacy camelCase alias used by older bots."""
     return get_last_option_trades_cached(full_option_symbol, ttl_seconds=ttl_seconds)
 
 
@@ -445,7 +382,7 @@ def chart_link(symbol: str) -> str:
     return f"https://www.tradingview.com/chart/?symbol={symbol.upper()}"
 
 
-# ---------------- GRADING HELPERS ----------------
+# ---------------- GRADING ----------------
 
 
 def grade_equity_setup(
@@ -477,7 +414,7 @@ def is_between_times(
     start_m: int,
     end_h: int,
     end_m: int,
-    tz=eastern,
+    tz: pytz.timezone,
 ) -> bool:
     now = datetime.now(tz)
     mins = now.hour * 60 + now.minute
