@@ -468,6 +468,14 @@ def _check_momentum_reversal(sym: str, stats: Dict[str, Any]) -> Optional[str]:
     send_alert("intraday_momentum_reversal", sym, last_price, rvol, extra=body)
     return "momentum_reversal"
 
+#------------SCANNER FOR STATUS_REPORT.PY BOT-----------------
+record_bot_stats(
+    "trend_flow",
+    scanned=len(universe),
+    matched=len(matches),
+    alerts=alerts_sent,
+    runtime=run_seconds,
+)
 
 # ---------------- MAIN ENTRY ----------------
 
