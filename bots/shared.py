@@ -349,9 +349,10 @@ def get_last_option_trades_cached(
         r = requests.get(url, params=params, timeout=10)
         # Treat 404 (no data) as a normal, non-fatal condition
         if r.status_code == 404:
-            msg_404 = f"[shared] no last option trade for {full_option_symbol} (404)."
-            print(msg_404)
-            # 404 is benign; we do not spam status bot with it
+            # Benign: no last option trade exists yet for this contract.
+            # Commented out to avoid log spam.
+            # msg_404 = f"[shared] no last option trade for {full_option_symbol} (404)."
+            # print(msg_404)
             return None
 
         r.raise_for_status()
