@@ -242,6 +242,14 @@ def _compute_partial_rvol(sym: str, trading_day: date, today_bar: Any, days: Lis
 
     return 1.0
 
+        #------------SCANNER FOR STATUS_REPORT.PY BOT-----------------
+record_bot_stats(
+    "premarket",
+    scanned=len(universe),
+    matched=len(matches),
+    alerts=alerts_sent,
+    runtime=run_seconds,
+)
 
 # ---------------- MAIN BOT ----------------
 
