@@ -224,6 +224,15 @@ def _format_time() -> str:
         return ts.strftime("%I:%M %p EST · %b %d").lstrip("0")
     except Exception:
         return datetime.now(eastern).strftime("%I:%M %p EST · %b %d").lstrip("0")
+        
+        #------------SCANNER FOR STATUS_REPORT.PY BOT-----------------
+record_bot_stats(
+    "squeeze",
+    scanned=len(universe),
+    matched=len(matches),
+    alerts=alerts_sent,
+    runtime=run_seconds,
+)
 
 
 # ---------------- MAIN BOT ----------------
