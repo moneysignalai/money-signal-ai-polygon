@@ -205,7 +205,7 @@ async def run_earnings():
 
         #------------SCANNER FOR STATUS_REPORT.PY BOT-----------------
 record_bot_stats(
-    "trend_flow",
+    "earnings",
     scanned=len(universe),
     matched=len(matches),
     alerts=alerts_sent,
