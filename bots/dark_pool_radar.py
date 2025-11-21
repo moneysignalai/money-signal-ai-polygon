@@ -202,7 +202,7 @@ async def run_dark_pool_radar():
             
             #------------SCANNER FOR STATUS_REPORT.PY BOT-----------------
 record_bot_stats(
-    "trend_flow",
+    "dark_pool_radar",
     scanned=len(universe),
     matched=len(matches),
     alerts=alerts_sent,
