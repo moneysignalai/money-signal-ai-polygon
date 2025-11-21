@@ -1,150 +1,232 @@
-# bots/squeeze.py
-#
-# STOCK-BASED SQUEEZE BOT
-# Looks for high-RVOL + strong % move + strong dollar volume breakouts.
-#
-# No options. This is strictly an EQUITY momentum bot.
+# bots/squeeze.py — Options SQUEEZE flow bot
 
 import os
-from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
+from datetime import datetime, date
+from typing import List, Dict, Any, Optional
+
+import pytz
 
 from bots.shared import (
     POLYGON_KEY,
-    get_last_trade_cached,
+    send_alert,
+    chart_link,
     get_dynamic_top_volume_universe,
     is_etf_blacklisted,
-    chart_link,
-    send_alert,
-    now_est,
-    is_rth,
-    MIN_RVOL_GLOBAL,
+    get_option_chain_cached,
+    get_last_option_trades_cached,
+    today_est_date,
+    minutes_since_midnight_est,
+    now_est,  # human-readable EST time string
 )
 
-import requests
+eastern = pytz.timezone("US/Eastern")
+
+# ------------- CONFIG -------------
+
+# Only scan during RTH (09:30–16:00 ET)
+RTH_START_MIN = 9 * 60 + 30
+RTH_END_MIN = 16 * 60
+
+# Squeeze-style contract thresholds (tweak via env if you want more/less aggressive)
+SQUEEZE_MIN_PREMIUM = float(os.getenv("SQUEEZE_MIN_PREMIUM", "0.50"))      # min option price
+SQUEEZE_MAX_PREMIUM = float(os.getenv("SQUEEZE_MAX_PREMIUM", "15.00"))     # cap to avoid bad prints
+SQUEEZE_MIN_SIZE = int(os.getenv("SQUEEZE_MIN_SIZE", "200"))               # min contracts
+SQUEEZE_MIN_NOTIONAL = float(os.getenv("SQUEEZE_MIN_NOTIONAL", "150000"))  # min notional $
+
+# Max number of underlyings to scan per cycle
+MAX_UNIVERSE = int(os.getenv("SQUEEZE_MAX_UNIVERSE", "60"))
+
+# Per-day de-dupe
+_alert_date: Optional[date] = None
+_alerted_contracts: set[str] = set()
 
 
-# ---------------- CONFIG ----------------
+# ---------------- STATE ----------------
 
-# More aggressive defaults, but editable via env
-MIN_RVOL = float(os.getenv("SQUEEZE_MIN_RVOL", "2.0"))
-MIN_MOVE_PCT = float(os.getenv("SQUEEZE_MIN_MOVE", "4.0"))
-MIN_DOLLAR_VOL = float(os.getenv("SQUEEZE_MIN_DOLLAR_VOL", "10000000"))   # $10M
-
-MAX_UNIVERSE = int(os.getenv("SQUEEZE_MAX_UNIVERSE", "120"))
-
-# Polygon endpoint for intraday 1-min bars
-AGG_URL = "https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/minute/{from}/{to}"
+def _reset_day() -> None:
+    global _alert_date, _alerted_contracts
+    today = date.today()
+    if _alert_date != today:
+        _alert_date = today
+        _alerted_contracts = set()
 
 
-def _safe_float(x):
+def _already_alerted(contract: str) -> bool:
+    return contract in _alerted_contracts
+
+
+def _mark(contract: str) -> None:
+    _alerted_contracts.add(contract)
+
+
+def _in_rth_window() -> bool:
+    mins = minutes_since_midnight_est()
+    return RTH_START_MIN <= mins <= RTH_END_MIN
+
+
+# ---------------- HELPERS ----------------
+
+def _safe_float(x: Any) -> Optional[float]:
     try:
+        if x is None:
+            return None
         return float(x)
-    except:
+    except (TypeError, ValueError):
         return None
 
 
-def fetch_intraday(sym: str) -> Optional[Dict[str, Any]]:
-    """Fetch today's intraday 1-min bars for RVOL & move calculations."""
-    if not POLYGON_KEY:
-        print("[squeeze] missing POLYGON_KEY")
-        return None
-
-    today = datetime.utcnow().date()
-    from_ = f"{today}T09:30:00Z"
-    to_ = f"{today}T16:00:00Z"
-
-    url = AGG_URL.format(sym=sym.upper(), from=from_, to=to_)
-    params = {"apiKey": POLYGON_KEY}
-
+def _safe_int(x: Any) -> Optional[int]:
     try:
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        if data.get("results"):
-            return data
-    except Exception as e:
-        print(f"[squeeze] intraday error for {sym}: {e}")
-
-    return None
+        if x is None:
+            return None
+        return int(x)
+    except (TypeError, ValueError):
+        return None
 
 
-def compute_rvol(intraday_data: Dict[str, Any]) -> float:
-    """Compute RVOL using today's volume vs average volume from bars."""
-    results = intraday_data.get("results") or []
-    if len(results) < 20:
-        return 0.0
+def _compute_dte(expiration_str: Optional[str]) -> Optional[int]:
+    if not expiration_str:
+        return None
+    try:
+        exp_date = datetime.strptime(expiration_str, "%Y-%m-%d").date()
+        today: date = today_est_date()
+        return (exp_date - today).days
+    except Exception:
+        return None
 
-    todays_vol = sum(x.get("v", 0) for x in results)
-    avg_bar_vol = sum(x.get("v", 0) for x in results[-20:]) / 20
 
-    if avg_bar_vol <= 0:
-        return 0.0
-
-    return todays_vol / (avg_bar_vol * len(results))
-
+# ---------------- MAIN BOT ----------------
 
 async def run_squeeze() -> None:
-    """Main STOCK squeeze scanner."""
-    print("[squeeze] starting stock squeeze scan")
+    """
+    SQUEEZE options flow bot.
 
-    if not is_rth():
-        print("[squeeze] outside RTH, skipping")
+    Looks for relatively high-premium, high-size CALL sweeps that can signal
+    short/gamma squeeze behavior.
+
+    Logic:
+      • Only run during RTH (09:30–16:00 ET).
+      • Universe:
+            - SQUEEZE_TICKER_UNIVERSE env (if set)
+            - else TICKER_UNIVERSE env
+            - else dynamic top-volume universe (MAX_UNIVERSE names).
+      • For each underlying:
+          - Skip ETFs.
+          - Get Polygon snapshot option chain.
+          - For each option:
+              • CALLs only
+              • SQUEEZE_MIN_PREMIUM <= option price <= SQUEEZE_MAX_PREMIUM
+              • size >= SQUEEZE_MIN_SIZE
+              • notional >= SQUEEZE_MIN_NOTIONAL
+              • DTE between 0 and 60 days
+          - One alert per contract per day.
+    """
+    _reset_day()
+
+    if not POLYGON_KEY:
+        print("[squeeze] POLYGON_KEY missing; skipping.")
         return
 
-    universe = get_dynamic_top_volume_universe(max_tickers=MAX_UNIVERSE)
+    if not _in_rth_window():
+        print("[squeeze] outside RTH; skipping.")
+        return
+
+    # Build universe
+    env = os.getenv("SQUEEZE_TICKER_UNIVERSE") or os.getenv("TICKER_UNIVERSE")
+    if env:
+        universe = [t.strip().upper() for t in env.split(",") if t.strip()]
+    else:
+        universe = get_dynamic_top_volume_universe(
+            max_tickers=MAX_UNIVERSE,
+            volume_coverage=0.90,
+        )
+
     if not universe:
-        print("[squeeze] universe empty")
+        print("[squeeze] empty universe; skipping.")
         return
+
+    now_str = now_est()  # already like "10:48 AM EST · Nov 20"
 
     for sym in universe:
         if is_etf_blacklisted(sym):
             continue
 
-        last, approx_dollar_vol = get_last_trade_cached(sym)
-        if not last or approx_dollar_vol is None:
+        chain = get_option_chain_cached(sym)
+        if not chain:
             continue
 
-        intraday = fetch_intraday(sym)
-        if not intraday:
+        results = chain.get("results") or []
+        if not isinstance(results, list):
             continue
 
-        bars = intraday.get("results") or []
-        if not bars:
-            continue
+        for opt in results:
+            details: Dict[str, Any] = opt.get("details") or {}
+            contract = details.get("ticker")
+            if not contract:
+                continue
+            if _already_alerted(contract):
+                continue
 
-        # % move from open
-        open_price = _safe_float(bars[0].get("o"))
-        if not open_price or open_price <= 0:
-            continue
+            contract_type = (details.get("contract_type") or "").upper()
+            if contract_type != "CALL":
+                continue
 
-        move_pct = ((last - open_price) / open_price) * 100
+            exp_str = details.get("expiration_date")
+            dte = _compute_dte(exp_str)
+            if dte is None or dte < 0 or dte > 60:
+                # focus on short- to mid-dated contracts
+                continue
 
-        # RVOL
-        rvol = compute_rvol(intraday)
+            # Last trade for this contract
+            trade = get_last_option_trades_cached(contract)
+            if not trade:
+                continue
 
-        # Dollar volume threshold
-        if approx_dollar_vol < MIN_DOLLAR_VOL:
-            continue
+            t_res = trade.get("results") or {}
+            if isinstance(t_res, list):
+                if not t_res:
+                    continue
+                last = t_res[0]
+            elif isinstance(t_res, dict):
+                last = t_res
+            else:
+                continue
 
-        # Screening
-        if rvol < MIN_RVOL:
-            continue
-        if move_pct < MIN_MOVE_PCT:
-            continue
+            last_price = _safe_float(last.get("p") or last.get("price"))
+            size = _safe_int(last.get("s") or last.get("size"))
 
-        # Alert formatting
-        extra = (
-            f"🔥 STOCK SQUEEZE\n"
-            f"🕒 {now_est()}\n"
-            "────────────\n"
-            f"📈 Move: {move_pct:.1f}%\n"
-            f"📊 RVOL: {rvol:.1f}x\n"
-            f"💵 Dollar Vol: ${approx_dollar_vol:,.0f}\n"
-            "────────────\n"
-            f"🔗 Chart: {chart_link(sym)}"
-        )
+            if last_price is None or size is None:
+                continue
+            if last_price <= 0 or size <= 0:
+                continue
+            if last_price < SQUEEZE_MIN_PREMIUM or last_price > SQUEEZE_MAX_PREMIUM:
+                continue
 
-        send_alert("squeeze", sym, last, rvol, extra=extra)
+            notional = last_price * size * 100  # standard option multiplier
+            if notional < SQUEEZE_MIN_NOTIONAL or size < SQUEEZE_MIN_SIZE:
+                continue
 
-    print("[squeeze] scan complete")
+            notional_rounded = round(notional)
+
+            extra_lines = [
+                f"🧨 SQUEEZE — {sym}",
+                f"🕒 {now_str}",
+                f"💰 Trade Price: ${last_price:.2f}",
+                "────────────",
+                "🧲 High-Notional CALL Sweep (possible squeeze)",
+                f"📌 Contract: {contract}",
+                f"📦 Size: {size}",
+                f"💰 Notional: ≈ ${notional_rounded:,.0f}",
+            ]
+            if dte is not None:
+                extra_lines.append(f"🗓️ DTE: {dte}")
+
+            extra_lines.append(f"🔗 Chart: {chart_link(sym)}")
+
+            extra_text = "\n".join(extra_lines)
+
+            # rvol not computed here; we care about flow, so pass 0.0
+            send_alert("squeeze", sym, last_price, 0.0, extra=extra_text)
+            _mark(contract)
+
+    print("[squeeze] scan complete.")
