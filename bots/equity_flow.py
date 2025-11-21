@@ -304,7 +304,7 @@ def _sma(values: List[float], window: int) -> List[float]:
 
 #------------SCANNER FOR STATUS_REPORT.PY BOT-----------------
 record_bot_stats(
-    "trend_flow",
+    "equity_flow",
     scanned=len(universe),
     matched=len(matches),
     alerts=alerts_sent,
