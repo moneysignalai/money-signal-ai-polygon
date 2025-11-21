@@ -36,8 +36,9 @@ BOTS = [
     ("dark_pool_radar", "bots.dark_pool_radar", "run_dark_pool_radar"),
     ("iv_crush", "bots.iv_crush", "run_iv_crush"),
 
-    # 🔍 Debug-only bot:
+    # 🔍 Debug bots
     ("debug_ping", "bots.debug_ping", "run_debug_ping"),
+    ("debug_status_ping", "bots.debug_status_ping", "run_debug_status_ping"),
 ]
 
 @app.get("/")
