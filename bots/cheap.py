@@ -5,6 +5,7 @@
 # Looks for relatively low-premium call sweeps with decent size / notional.
 # Designed to be robust against missing data from Polygon (no float/NoneType math).
 
+import os
 from datetime import datetime, date
 from typing import List, Dict, Any, Optional
 
@@ -27,13 +28,13 @@ from bots.shared import (
 RTH_START_MIN = 9 * 60 + 30
 RTH_END_MIN = 16 * 60
 
-# Cheap contract definition
-CHEAP_MAX_PREMIUM = 0.35        # max price per contract (option price, not underlying)
-CHEAP_MIN_SIZE = 100            # minimum contracts in trade
-CHEAP_MIN_NOTIONAL = 10_000     # min notional in dollars (premium * contracts * 100)
+# Cheap contract definition (more aggressive defaults, env-tunable)
+CHEAP_MAX_PREMIUM = float(os.getenv("CHEAP_MAX_PREMIUM", "0.55"))        # max price per contract
+CHEAP_MIN_SIZE = int(os.getenv("CHEAP_MIN_SIZE", "50"))                  # min contracts
+CHEAP_MIN_NOTIONAL = float(os.getenv("CHEAP_MIN_NOTIONAL", "5000"))      # min notional dollars
 
 # Max number of underlyings to scan per cycle
-MAX_UNIVERSE = 60
+MAX_UNIVERSE = int(os.getenv("CHEAP_MAX_UNIVERSE", "80"))
 
 
 def _in_rth_window() -> bool:
@@ -96,13 +97,7 @@ async def run_cheap() -> None:
         return
 
     # Build universe
-    env = None
-    try:
-        import os
-        env = os.getenv("TICKER_UNIVERSE")
-    except Exception:
-        env = None
-
+    env = os.getenv("TICKER_UNIVERSE")
     if env:
         universe = [t.strip().upper() for t in env.split(",") if t.strip()]
     else:
@@ -146,6 +141,13 @@ async def run_cheap() -> None:
                 continue
 
             t_res = trade.get("results") or {}
+            if isinstance(t_res, list):
+                if not t_res:
+                    continue
+                t_res = t_res[0]
+            elif not isinstance(t_res, dict):
+                continue
+
             last_price = _safe_float(t_res.get("p") or t_res.get("price"))
             size = _safe_int(t_res.get("s") or t_res.get("size"))
 
