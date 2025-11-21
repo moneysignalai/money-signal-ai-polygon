@@ -330,6 +330,15 @@ def _maybe_iv_crush(
     send_alert("iv_crush", sym, last_price_for_bot, 0.0, extra=extra_text)
     _seen_ivcrush.add(contract)
 
+        #------------SCANNER FOR STATUS_REPORT.PY BOT-----------------
+record_bot_stats(
+    "options_flow",
+    scanned=len(universe),
+    matched=len(matches),
+    alerts=alerts_sent,
+    runtime=run_seconds,
+)
+
 
 # ---------------- MAIN BOT ----------------
 
