@@ -1,4 +1,4 @@
-# bots/OpeningRangeBreak.py
+# bots/openingrangebreakout.py
 #
 # Opening Range Breakout (ORB) bot — STOCKS ONLY
 #
@@ -39,7 +39,7 @@ _client: Optional[RESTClient] = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY e
 # ORB window (minutes after 09:30 open)
 ORB_MINUTES = int(os.getenv("ORB_MINUTES", "15"))  # 15-min ORB
 
-# ORB scan time window (est)
+# ORB scan time window (ET)
 ORB_SCAN_START_MIN = 9 * 60 + 35   # start scanning slightly after 09:35
 ORB_SCAN_END_MIN   = 11 * 60       # stop by 11:00
 
@@ -124,7 +124,7 @@ def _fetch_intraday(sym: str, trading_day: date) -> List[Any]:
         )
         bars = list(aggs)
     except Exception as e:
-        print(f"[OpeningRangeBreak] intraday agg error for {sym}: {e}")
+        print(f"[opening_range_breakout] intraday agg error for {sym}: {e}")
         return []
 
     filtered = []
@@ -165,7 +165,7 @@ def _compute_rvol(sym: str, trading_day: date, day_vol: float) -> float:
             )
         )
     except Exception as e:
-        print(f"[OpeningRangeBreak] daily agg error for {sym}: {e}")
+        print(f"[opening_range_breakout] daily agg error for {sym}: {e}")
         return 1.0
 
     if not daily:
@@ -199,7 +199,7 @@ def _format_time() -> str:
 
 # ---------------- MAIN BOT ----------------
 
-async def run_opening_range_break() -> None:
+async def run_opening_range_breakout() -> None:
     """
     Opening Range Breakout bot.
 
@@ -210,11 +210,11 @@ async def run_opening_range_break() -> None:
     _reset_day()
 
     if not POLYGON_KEY or not _client:
-        print("[OpeningRangeBreak] missing POLYGON_KEY or client; skipping.")
+        print("[opening_range_breakout] missing POLYGON_KEY or client; skipping.")
         return
 
     if not _in_orb_window():
-        print("[OpeningRangeBreak] outside ORB scan window; skipping.")
+        print("[opening_range_breakout] outside ORB scan window; skipping.")
         return
 
     BOT_NAME = "opening_range_breakout"
@@ -224,11 +224,11 @@ async def run_opening_range_break() -> None:
 
     universe = _get_universe()
     if not universe:
-        print("[OpeningRangeBreak] empty universe; skipping.")
+        print("[opening_range_breakout] empty universe; skipping.")
         return
 
     trading_day = date.today()
-    print(f"[OpeningRangeBreak] scanning {len(universe)} symbols")
+    print(f"[opening_range_breakout] scanning {len(universe)} symbols")
 
     for sym in universe:
         if is_etf_blacklisted(sym):
@@ -242,14 +242,18 @@ async def run_opening_range_break() -> None:
 
         # Split bars into ORB window and all RTH bars for today
         orb_start = datetime(
-            trading_day.year, trading_day.month, trading_day.day,
-            9, 30, tzinfo=eastern
+            trading_day.year,
+            trading_day.month,
+            trading_day.day,
+            9,
+            30,
+            tzinfo=eastern,
         )
         orb_end = orb_start + timedelta(minutes=ORB_MINUTES)
 
-        orb_high = None
-        orb_low = None
-        last_price = None
+        orb_high: Optional[float] = None
+        orb_low: Optional[float] = None
+        last_price: Optional[float] = None
         day_vol = 0.0
 
         for b in bars:
@@ -327,7 +331,7 @@ async def run_opening_range_break() -> None:
 
         extra_text = "\n".join(body_lines)
 
-        send_alert("opening_range_break", sym, last_price, rvol, extra=extra_text)
+        send_alert("opening_range_breakout", sym, last_price, rvol, extra=extra_text)
         _mark(sym)
 
         # stats tracking
@@ -344,6 +348,6 @@ async def run_opening_range_break() -> None:
             runtime=run_seconds,
         )
     except Exception as e:
-        print(f"[OpeningRangeBreak] record_bot_stats error: {e}")
+        print(f"[opening_range_breakout] record_bot_stats error: {e}")
 
-    print("[OpeningRangeBreak] scan complete.")
+    print("[opening_range_breakout] scan complete.")
