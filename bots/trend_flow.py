@@ -29,6 +29,7 @@ from bots.shared import (
     chart_link,
     now_est,
 )
+from bots.status_report import record_bot_stats
 
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 eastern = pytz.timezone("US/Eastern")
@@ -37,11 +38,13 @@ eastern = pytz.timezone("US/Eastern")
 
 TREND_MAX_UNIVERSE = int(os.getenv("TREND_MAX_UNIVERSE", "200"))
 
+
 def _trend_universe() -> List[str]:
     env = os.getenv("TREND_TICKER_UNIVERSE")
     if env:
         return [x.strip().upper() for x in env.split(",") if x.strip()]
     return get_dynamic_top_volume_universe(max_tickers=TREND_MAX_UNIVERSE, volume_coverage=0.97)
+
 
 def _time_str() -> str:
     try:
@@ -51,6 +54,7 @@ def _time_str() -> str:
         return ts.strftime("%I:%M %p EST · %b %d").lstrip("0")
     except Exception:
         return datetime.now(eastern).strftime("%I:%M %p EST · %b %d").lstrip("0")
+
 
 def _in_rth() -> bool:
     now = datetime.now(eastern)
@@ -72,6 +76,7 @@ LOOKBACK_DAYS = int(os.getenv("PULLBACK_LOOKBACK_DAYS", "60"))
 _pull_date: date | None = None
 _pull_alerted: set[str] = set()
 
+
 def _reset_pull():
     global _pull_date, _pull_alerted
     today = date.today()
@@ -79,8 +84,10 @@ def _reset_pull():
         _pull_date = today
         _pull_alerted = set()
 
+
 def _pull_already(sym: str) -> bool:
     return sym in _pull_alerted
+
 
 def _pull_mark(sym: str):
     _pull_alerted.add(sym)
@@ -97,6 +104,7 @@ TREND_BREAKOUT_LOOKBACK = int(os.getenv("TREND_BREAKOUT_LOOKBACK", "20"))  # 20-
 _trend_date: date | None = None
 _trend_alerted: set[str] = set()
 
+
 def _reset_trend():
     global _trend_date, _trend_alerted
     today = date.today()
@@ -104,8 +112,10 @@ def _reset_trend():
         _trend_date = today
         _trend_alerted = set()
 
+
 def _trend_already(sym: str) -> bool:
     return sym in _trend_alerted
+
 
 def _trend_mark(sym: str):
     _trend_alerted.add(sym)
@@ -125,9 +135,12 @@ def _sma(values: List[float], window: int) -> List[float]:
 
 # ------------------- SWING PULLBACK CORE -------------------
 
-def _run_swing_pullback_for_symbol(sym: str, days: List[Any]):
+def _run_swing_pullback_for_symbol(sym: str, days: List[Any]) -> bool:
+    """
+    Returns True if a Swing Pullback alert fired for this symbol.
+    """
     if len(days) < 30:
-        return
+        return False
 
     today_bar = days[-1]
     prev_bar = days[-2]
@@ -137,37 +150,39 @@ def _run_swing_pullback_for_symbol(sym: str, days: List[Any]):
         prev_close = float(prev_bar.close)
         day_vol = float(today_bar.volume or 0.0)
     except Exception:
-        return
+        return False
 
     if last_price < MIN_PRICE or last_price > MAX_PRICE:
-        return
+        return False
 
     dollar_vol = last_price * day_vol
     if dollar_vol < max(MIN_DOLLAR_VOL, MIN_VOLUME_GLOBAL * last_price):
-        return
+        return False
 
     vols = [float(d.volume or 0.0) for d in days[-21:-1]]
     avg_vol = sum(vols) / max(len(vols), 1)
     if avg_vol <= 0:
-        return
+        return False
     rvol = day_vol / avg_vol
     if rvol < max(MIN_RVOL_GLOBAL, MIN_RVOL):
-        return
+        return False
 
     closes = [float(d.close) for d in days]
     sma20_series = _sma(closes, 20)
     sma50_series = _sma(closes, 50)
     if not sma20_series or not sma50_series:
-        return
+        return False
 
     sma20 = sma20_series[-1]
     sma50 = sma50_series[-1]
 
+    # Strong uptrend filter
     if sma20 <= sma50:
-        return
+        return False
     if last_price <= sma50:
-        return
+        return False
 
+    # Count recent red days
     recent_closes = [float(d.close) for d in days[-(MAX_RED_DAYS + 5) :]]
     red_days = 0
     for i in range(1, len(recent_closes)):
@@ -175,16 +190,16 @@ def _run_swing_pullback_for_symbol(sym: str, days: List[Any]):
             red_days += 1
 
     if red_days == 0 or red_days > MAX_RED_DAYS:
-        return
+        return False
 
     recent_window = closes[-20:]
     swing_high = max(recent_window)
     if swing_high <= 0:
-        return
+        return False
 
     pullback_pct = (swing_high - last_price) / swing_high * 100.0
     if pullback_pct < MIN_PULLBACK_PCT or pullback_pct > MAX_PULLBACK_PCT:
-        return
+        return False
 
     move_pct = (last_price / prev_close - 1.0) * 100.0 if prev_close > 0 else 0.0
     grade = grade_equity_setup(move_pct, rvol, dollar_vol)
@@ -205,32 +220,17 @@ def _run_swing_pullback_for_symbol(sym: str, days: List[Any]):
 
     _pull_mark(sym)
     send_alert("swing_pullback", sym, last_price, rvol, extra=extra)
+    return True
 
-        #------------SCANNER FOR STATUS_REPORT.PY BOT-----------------
-from bots.status_report import record_bot_stats
 
-BOT_NAME = "trend_flow"
-...
-start_ts = time.time()
-alerts_sent = 0
-matches = []
-
-# ... your scan logic ...
-
-run_seconds = time.time() - start_ts
-
-record_bot_stats(
-    BOT_NAME,
-    scanned=len(universe),
-    matched=len(matches),
-    alerts=alerts_sent,
-    runtime=run_seconds,
-)
 # ------------------- TREND RIDER CORE -------------------
 
-def _run_trend_rider_for_symbol(sym: str, days: List[Any]):
+def _run_trend_rider_for_symbol(sym: str, days: List[Any]) -> bool:
+    """
+    Returns True if a Trend Rider alert fired for this symbol.
+    """
     if len(days) < 60:
-        return
+        return False
 
     today_bar = days[-1]
     prev_bar = days[-2]
@@ -242,37 +242,37 @@ def _run_trend_rider_for_symbol(sym: str, days: List[Any]):
         day_high = float(today_bar.high or 0.0)
         day_low = float(today_bar.low or 0.0)
     except Exception:
-        return
+        return False
 
     if last_price < TREND_MIN_PRICE or last_price > TREND_MAX_PRICE:
-        return
+        return False
 
     dollar_vol = last_price * day_vol
     if dollar_vol < max(TREND_MIN_DOLLAR_VOL, MIN_VOLUME_GLOBAL * last_price):
-        return
+        return False
 
     vols = [float(d.volume or 0.0) for d in days[-21:-1]]
     avg_vol = sum(vols) / max(len(vols), 1)
     if avg_vol <= 0:
-        return
+        return False
     rvol = day_vol / avg_vol
     if rvol < max(TREND_MIN_RVOL, MIN_RVOL_GLOBAL):
-        return
+        return False
 
     closes = [float(d.close) for d in days]
     sma20_series = _sma(closes, 20)
     sma50_series = _sma(closes, 50)
     if not sma20_series or not sma50_series:
-        return
+        return False
 
     sma20 = sma20_series[-1]
     sma50 = sma50_series[-1]
     if sma20 <= sma50:
-        return
+        return False
 
     lookback = closes[-TREND_BREAKOUT_LOOKBACK - 1 : -1]
     if not lookback:
-        return
+        return False
     prior_high = max(lookback)
     prior_low = min(lookback)
 
@@ -280,7 +280,7 @@ def _run_trend_rider_for_symbol(sym: str, days: List[Any]):
     breakout_down = last_price < prior_low
 
     if not (breakout_up or breakout_down):
-        return
+        return False
 
     move_pct = (last_price / prev_close - 1.0) * 100.0 if prev_close > 0 else 0.0
     grade = grade_equity_setup(move_pct, rvol, dollar_vol)
@@ -310,6 +310,7 @@ def _run_trend_rider_for_symbol(sym: str, days: List[Any]):
 
     _trend_mark(sym)
     send_alert("trend_rider", sym, last_price, rvol, extra=extra)
+    return True
 
 
 # ------------------- MAIN ENTRYPOINT -------------------
@@ -329,6 +330,11 @@ async def run_trend_flow():
     if not _in_rth():
         print("[trend_flow] Outside RTH; skipping.")
         return
+
+    BOT_NAME = "trend_flow"
+    start_ts = time.time()
+    alerts_sent = 0
+    matched_symbols: set[str] = set()
 
     _reset_pull()
     _reset_trend()
@@ -366,12 +372,38 @@ async def run_trend_flow():
         if not days:
             continue
 
+        fired_pull = False
+        fired_trend = False
+
         # Swing Pullback
         if not _pull_already(sym):
-            _run_swing_pullback_for_symbol(sym, days)
+            fired_pull = _run_swing_pullback_for_symbol(sym, days)
+            if fired_pull:
+                matched_symbols.add(sym)
+                alerts_sent += 1
 
         # Trend Rider
         if not _trend_already(sym):
-            _run_trend_rider_for_symbol(sym, days)
+            fired_trend = _run_trend_rider_for_symbol(sym, days)
+            if fired_trend:
+                matched_symbols.add(sym)
+                alerts_sent += 1
 
-    print("[trend_flow] scan complete.")
+    run_seconds = time.time() - start_ts
+
+    try:
+        record_bot_stats(
+            BOT_NAME,
+            scanned=len(universe),
+            matched=len(matched_symbols),
+            alerts=alerts_sent,
+            runtime=run_seconds,
+        )
+    except Exception as e:
+        print(f"[trend_flow] record_bot_stats error: {e}")
+
+    print(
+        f"[trend_flow] scan complete: scanned={len(universe)} "
+        f"matches={len(matched_symbols)} alerts={alerts_sent} "
+        f"runtime={run_seconds:.2f}s"
+    )
