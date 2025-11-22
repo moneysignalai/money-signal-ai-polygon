@@ -148,9 +148,9 @@ async def run_dark_pool_radar():
         try:
             today_bar = days[-1]
             prev_bar = days[-2]
-            last_price = float(today_bar.close or 0.0)
-            prev_close = float(prev_bar.close or 0.0)
-            day_vol = float(today_bar.volume or 0.0)
+            last_price = float(getattr(today_bar, "close", getattr(today_bar, "c", 0.0)))
+            prev_close = float(getattr(prev_bar, "close", getattr(prev_bar, "c", 0.0)))
+            day_vol = float(getattr(today_bar, "volume", getattr(today_bar, "v", 0.0)))
         except Exception:
             continue
 
@@ -163,7 +163,7 @@ async def run_dark_pool_radar():
             continue
 
         # ---- RVOL filter ----
-        vols = [float(d.volume or 0.0) for d in days[-21:-1]]
+        vols = [float(getattr(d, "volume", getattr(d, "v", 0.0))) for d in days[-21:-1]]
         avg_vol = sum(vols) / max(len(vols), 1)
         if avg_vol <= 0:
             continue
@@ -221,12 +221,11 @@ async def run_dark_pool_radar():
 
         now_str = now_et.strftime("%I:%M %p EST · %b %d").lstrip("0")
 
+        # Body only – header (emoji + DARK POOL — TICKER) comes from send_alert
         extra = (
-            f"📡 DARK POOL RADAR — {sym}\n"
             f"🕒 {now_str}\n"
-            f"💰 ${last_price:.2f} · RVOL {rvol:.1f}x\n"
-            f"────────────\n"
             f"📡 Dark pool prints (last {DARK_LOOKBACK_MIN} min)\n"
+            f"────────────\n"
             f"📦 Prints: {trade_count:,}\n"
             f"💰 Total Notional: ≈ ${total_dark_notional:,.0f}\n"
             f"🏦 Largest Print: ≈ ${largest_dark_print:,.0f}\n"
@@ -240,13 +239,16 @@ async def run_dark_pool_radar():
     # ---------------- STATS REPORTING ----------------
     run_seconds = time.time() - scan_start_ts
 
-    record_bot_stats(
-        BOT_NAME,
-        scanned=len(universe),
-        matched=len(matches),
-        alerts=alerts_sent,
-        runtime=run_seconds,
-    )
+    try:
+        record_bot_stats(
+            BOT_NAME,
+            scanned=len(universe),
+            matched=len(matches),
+            alerts=alerts_sent,
+            runtime=run_seconds,
+        )
+    except Exception as e:
+        print(f"[dark_pool] record_bot_stats error: {e}")
 
     print(
         f"[dark_pool] scan complete: scanned={len(universe)} "
