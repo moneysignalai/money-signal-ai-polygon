@@ -2,14 +2,14 @@
 #
 # Advanced Status / Heartbeat System for MoneySignalAI
 #
-# NEW CAPABILITIES:
+# CAPABILITIES:
 #   • Per-bot analytics (scan counts, matches, alerts, runtime).
 #   • Rolling error intel (last 30 errors + error categories).
-#   • Running averages to evaluate scanner performance.
+#   • Running totals to evaluate scanner performance.
 #   • Global analytics: total tickers scanned, alerts fired.
-#   • Heartbeat shows top heavy-load bots and most error-prone bots.
+#   • Heartbeat shows heavy-load bots and most error-prone bots.
 #
-# Existing API preserved:
+# Public API:
 #   record_bot_error(bot, exc)
 #   log_bot_run(bot, status)
 #   record_bot_stats(bot, *, scanned, matched, alerts, runtime)
@@ -127,7 +127,7 @@ def record_bot_stats(
 ) -> None:
     """
     Bots call this to submit analytics after each full cycle.
-    (You will add 3–5 lines inside each bot.)
+    (You add 3–5 lines inside each bot.)
     """
     _BOT_STATS.setdefault(bot_name, {
         "scanned": 0,
@@ -159,11 +159,29 @@ def record_bot_stats(
 
 # ---------------- HEARTBEAT CONSTRUCTION ----------------
 
-def _build_stats_section() -> list[str]:
-    if not _BOT_STATS:
-        return ["📉 No scan statistics yet."]
+def _format_now_for_header() -> str:
+    """
+    Format a clean time string for the header line, e.g.:
+    '8:24 PM EST · Nov 21'
+    """
+    try:
+        ts = now_est()
+        if isinstance(ts, str):
+            return ts
+        return ts.strftime("%I:%M %p EST · %b %d").lstrip("0")
+    except Exception:
+        return datetime.now(eastern).strftime("%I:%M %p EST · %b %d").lstrip("0")
 
-    lines = ["📊 **Scanner Analytics:**"]
+
+def _build_stats_section() -> list[str]:
+    lines: list[str] = []
+
+    if not _BOT_STATS:
+        lines.append("📊 Scanner Analytics:")
+        lines.append("• No scan statistics yet.")
+        return lines
+
+    lines.append("📊 Scanner Analytics:")
 
     total_scanned = sum(st["scanned"] for st in _BOT_STATS.values())
     total_matched = sum(st["matched"] for st in _BOT_STATS.values())
@@ -176,14 +194,16 @@ def _build_stats_section() -> list[str]:
     # Top 3 scan-heavy bots
     heavy = sorted(_BOT_STATS.items(), key=lambda x: x[1]["scanned"], reverse=True)[:3]
     if heavy:
-        lines.append("\n🥵 **Top 3 Heaviest Bots (by scans):**")
+        lines.append("")
+        lines.append("🥵 Top 3 Heaviest Bots (by scans):")
         for bot, st in heavy:
             lines.append(f"• {bot}: {st['scanned']:,} scanned")
 
     # Top 3 error-prone bots
     noisy = sorted(_BOT_ERROR_COUNTER.items(), key=lambda x: x[1], reverse=True)[:3]
     if noisy:
-        lines.append("\n🔥 **Top 3 Noisiest Bots (errors):**")
+        lines.append("")
+        lines.append("🔥 Top 3 Noisiest Bots (errors):")
         for bot, count in noisy:
             lines.append(f"• {bot}: {count} errors")
 
@@ -191,35 +211,41 @@ def _build_stats_section() -> list[str]:
 
 
 def _build_status_message() -> str:
-    lines = [
-        f"📡 **MoneySignalAI Heartbeat** — {now_est()}",
-        "────────────────────",
+    header_time = _format_now_for_header()
+
+    lines: list[str] = [
+        "📡 MoneySignalAI Heartbeat ❤️",
+        f"⏰ {header_time}",
+        "────────────────",
     ]
 
-    ok = [b for b, s in _BOT_STATE.items() if s.get("last_status") == "ok"]
-    err = [b for b, s in _BOT_STATE.items() if s.get("last_status") == "error"]
-
-    overall = "✅ ALL SYSTEMS GOOD" if not err else "⚠️ ERRORS DETECTED"
+    # Overall status
+    err_bots = [b for b, s in _BOT_STATE.items() if s.get("last_status") == "error"]
+    overall = "✅ ALL SYSTEMS GOOD" if not err_bots else "⚠️ ERRORS DETECTED"
     lines.append(overall)
     lines.append("")
 
-    # Per-bot status
-    lines.append("🤖 **Bot Status:**")
-    for bot, info in sorted(_BOT_STATE.items()):
-        emoji = "✅" if info.get("last_status") == "ok" else "⚠️"
-        lines.append(f"{emoji} {bot}: {info.get('last_status','?').upper()} @ {info.get('last_time','?')}")
-
-    lines.append("────────────────────")
+    # Per-bot status (if any bots have reported)
+    if _BOT_STATE:
+        lines.append("🤖 Bot Status:")
+        for bot, info in sorted(_BOT_STATE.items()):
+            status = info.get("last_status", "?").upper()
+            emoji = "✅" if info.get("last_status") == "ok" else "⚠️"
+            ts_str = info.get("last_time", "?")
+            lines.append(f"• {emoji} {bot}: {status} @ {ts_str}")
+        lines.append("────────────────")
 
     # Stats section
     lines.extend(_build_stats_section())
-    lines.append("────────────────────")
+    lines.append("────────────────")
 
-    # Error section
+    # Error section (only if we actually have errors)
     if _RECENT_ERRORS:
-        lines.append("🧯 **Recent Errors:**")
+        lines.append("🧯 Recent Errors:")
         for err in _RECENT_ERRORS[-5:]:
-            lines.append(f"• [{err['time']}] {err['bot']} ({err['category']}): {err['error']}")
+            lines.append(
+                f"• [{err['time']}] {err['bot']} ({err['category']}): {err['error']}"
+            )
 
     return "\n".join(lines)
 
