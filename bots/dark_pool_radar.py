@@ -22,25 +22,27 @@ from bots.shared import (
     is_etf_blacklisted,
 )
 
+from bots.status_report import record_bot_stats
+
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 eastern = pytz.timezone("US/Eastern")
 
-# ------------------- LOOSENED CONFIG -------------------
+# ------------------- CONFIG -------------------
 
-# More exchanges considered dark / ATS-like
+# Exchanges considered "dark" / ATS-like
 DARK_EXCHANGES = {
     8, 9, 80, 81, 82, 84, 87, 88, 201, 202
 }
 
-# Larger lookback = more detections
+# Lookback window (minutes) for dark pool prints
 DARK_LOOKBACK_MIN = int(os.getenv("DARK_LOOKBACK_MIN", "45"))
 
-# LOWER thresholds — more alerts
+# Notional / count thresholds
 MIN_DARK_TOTAL_NOTIONAL = float(os.getenv("DARK_MIN_TOTAL_NOTIONAL", "1000000"))
 MIN_DARK_SINGLE_NOTIONAL = float(os.getenv("DARK_MIN_SINGLE_NOTIONAL", "500000"))
 MIN_DARK_PRINT_COUNT = int(os.getenv("DARK_MIN_PRINT_COUNT", "1"))
 
-# Lower required dollar-vol + RVOL
+# Looser day filters for more names
 MIN_DARK_DOLLAR_VOL = float(os.getenv("DARK_MIN_DOLLAR_VOL", "10000000"))
 MIN_DARK_RVOL = float(os.getenv("DARK_MIN_RVOL", "1.0"))
 
@@ -81,7 +83,7 @@ def _universe() -> List[str]:
     env = os.getenv("TICKER_UNIVERSE")
     if env:
         return [x.strip().upper() for x in env.split(",") if x.strip()]
-    # Expand universe = more symbols scanned
+    # Expand universe for more coverage
     return get_dynamic_top_volume_universe(max_tickers=200, volume_coverage=0.97)
 
 
@@ -90,6 +92,7 @@ def _safe(o: Any, name: str, default=None):
         return getattr(o, name, default)
     except Exception:
         return default
+
 
 # ------------------- MAIN BOT -------------------
 
@@ -101,8 +104,14 @@ async def run_dark_pool_radar():
         print("[dark_pool] Outside dark-pool window; skipping.")
         return
 
+    BOT_NAME = "dark_pool_radar"
+    scan_start_ts = time.time()
+
     _reset_if_new_day()
     universe = _universe()
+
+    matches: list[str] = []
+    alerts_sent = 0
 
     now_et = datetime.now(eastern)
     end_ts = now_et
@@ -129,7 +138,8 @@ async def run_dark_pool_radar():
                     limit=60,
                 )
             )
-        except Exception:
+        except Exception as e:
+            print(f"[dark_pool] daily fetch failed for {sym}: {e}")
             continue
 
         if len(days) < 5:
@@ -144,12 +154,15 @@ async def run_dark_pool_radar():
         except Exception:
             continue
 
-        # ---- Dollar volume filter (loosened) ----
+        if last_price <= 0 or day_vol <= 0:
+            continue
+
+        # ---- Dollar volume filter ----
         dollar_vol = last_price * day_vol
         if dollar_vol < MIN_DARK_DOLLAR_VOL:
             continue
 
-        # ---- RVOL filter (loosened) ----
+        # ---- RVOL filter ----
         vols = [float(d.volume or 0.0) for d in days[-21:-1]]
         avg_vol = sum(vols) / max(len(vols), 1)
         if avg_vol <= 0:
@@ -172,7 +185,8 @@ async def run_dark_pool_radar():
                 timestamp_lte=int(end_ts.timestamp() * 1_000_000_000),
                 limit=5000,
             )
-        except Exception:
+        except Exception as e:
+            print(f"[dark_pool] trades fetch failed for {sym}: {e}")
             continue
 
         for t in trades:
@@ -191,7 +205,7 @@ async def run_dark_pool_radar():
             if notional > largest_dark_print:
                 largest_dark_print = notional
 
-        # ---- Loosened Alert Triggers ----
+        # ---- Alert Triggers ----
         if trade_count < MIN_DARK_PRINT_COUNT:
             continue
 
@@ -200,30 +214,11 @@ async def run_dark_pool_radar():
             and largest_dark_print < MIN_DARK_SINGLE_NOTIONAL
         ):
             continue
-            
-            #------------SCANNER FOR STATUS_REPORT.PY BOT-----------------
-from bots.status_report import record_bot_stats
 
-BOT_NAME = "dark_pool_radar"
-...
-start_ts = time.time()
-alerts_sent = 0
-matches = []
+        # At this point, sym is a "match"
+        matches.append(sym)
+        alerts_sent += 1
 
-# ... your scan logic ...
-
-run_seconds = time.time() - start_ts
-
-record_bot_stats(
-    BOT_NAME,
-    scanned=len(universe),
-    matched=len(matches),
-    alerts=alerts_sent,
-    runtime=run_seconds,
-)
-
-
-        # ---- Send Alert ----
         now_str = now_et.strftime("%I:%M %p EST · %b %d").lstrip("0")
 
         extra = (
@@ -241,3 +236,20 @@ record_bot_stats(
 
         _mark(sym)
         send_alert("dark_pool", sym, last_price, rvol, extra=extra)
+
+    # ---------------- STATS REPORTING ----------------
+    run_seconds = time.time() - scan_start_ts
+
+    record_bot_stats(
+        BOT_NAME,
+        scanned=len(universe),
+        matched=len(matches),
+        alerts=alerts_sent,
+        runtime=run_seconds,
+    )
+
+    print(
+        f"[dark_pool] scan complete: scanned={len(universe)} "
+        f"matches={len(matches)} alerts={alerts_sent} "
+        f"runtime={run_seconds:.2f}s"
+    )
