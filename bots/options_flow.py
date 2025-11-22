@@ -29,6 +29,7 @@ from bots.shared import (
     is_etf_blacklisted,
     minutes_since_midnight_est,
 )
+from bots.status_report import record_bot_stats  # ✅ status-report integration
 
 eastern = pytz.timezone("US/Eastern")
 
@@ -331,27 +332,6 @@ def _maybe_iv_crush(
     send_alert("iv_crush", sym, last_price_for_bot, 0.0, extra=extra_text)
     _seen_ivcrush.add(contract)
 
-        #------------SCANNER FOR STATUS_REPORT.PY BOT-----------------
-from bots.status_report import record_bot_stats
-
-BOT_NAME = "options_flow"
-...
-start_ts = time.time()
-alerts_sent = 0
-matches = []
-
-# ... your scan logic ...
-
-run_seconds = time.time() - start_ts
-
-record_bot_stats(
-    BOT_NAME,
-    scanned=len(universe),
-    matched=len(matches),
-    alerts=alerts_sent,
-    runtime=run_seconds,
-)
-
 
 # ---------------- MAIN BOT ----------------
 
@@ -382,6 +362,11 @@ async def run_options_flow():
 
     _reset_if_new_day()
     _load_iv_cache()  # initialize cache from disk if present
+
+    BOT_NAME = "options_flow"
+    start_ts = time.time()
+    alerts_sent = 0
+    matched_contracts: set[str] = set()
 
     universe = _resolve_universe()
     if not universe:
@@ -490,9 +475,9 @@ async def run_options_flow():
             dte_str = f"{dte} days" if dte is not None else "N/A"
             cp_letter = "C" if cp == "CALL" else "P" if cp == "PUT" else "?"
 
-            # Base contract line
+            # Base contract line (not currently used, but left for future)
             exp_str = expiry.strftime('%b %d %Y') if expiry else 'N/A'
-            contract_line = f"{under} {exp_str} {cp_letter}"
+            contract_line = f"{under} {exp_str} {cp_letter}"  # noqa: F841
 
             # Build category-specific header & description
             if category == "whale":
@@ -540,7 +525,22 @@ async def run_options_flow():
             else:
                 _seen_cheap.add(contract)
 
+            matched_contracts.add(contract)
+            alerts_sent += 1
+
     # Persist IV cache at end of scan
     _save_iv_cache()
+
+    run_seconds = time.time() - start_ts
+    try:
+        record_bot_stats(
+            BOT_NAME,
+            scanned=len(universe),
+            matched=len(matched_contracts),
+            alerts=alerts_sent,
+            runtime=run_seconds,
+        )
+    except Exception as e:
+        print(f"[options_flow] record_bot_stats error: {e}")
 
     print("[options_flow] scan complete.")
