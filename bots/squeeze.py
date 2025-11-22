@@ -22,6 +22,7 @@ from bots.shared import (
     is_etf_blacklisted,
     now_est,
 )
+from bots.status_report import record_bot_stats
 
 eastern = pytz.timezone("US/Eastern")
 _client: Optional[RESTClient] = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
@@ -39,17 +40,17 @@ SQUEEZE_MIN_PRICE        = float(os.getenv("SQUEEZE_MIN_PRICE", "3.0"))
 SQUEEZE_MAX_PRICE        = float(os.getenv("SQUEEZE_MAX_PRICE", "200.0"))
 
 # Move filters (vs prior close + from today’s open)
-SQUEEZE_MIN_MOVE_PCT     = float(os.getenv("SQUEEZE_MIN_MOVE_PCT", "15.0"))  # vs yesterday close
-SQUEEZE_MIN_INTRADAY_PCT = float(os.getenv("SQUEEZE_MIN_INTRADAY_PCT", "8.0"))   # from today open
+SQUEEZE_MIN_MOVE_PCT     = float(os.getenv("SQUEEZE_MIN_MOVE_PCT", "15.0"))       # vs yesterday close
+SQUEEZE_MIN_INTRADAY_PCT = float(os.getenv("SQUEEZE_MIN_INTRADAY_PCT", "8.0"))    # from today open
 
 # Volume / RVOL filters
-SQUEEZE_MIN_RVOL         = float(os.getenv("SQUEEZE_MIN_RVOL", "3.0"))      # day RVOL vs 20d avg
-SQUEEZE_MIN_DOLLAR_VOL   = float(os.getenv("SQUEEZE_MIN_DOLLAR_VOL", "20000000"))  # $20M+
-SQUEEZE_LOOKBACK_DAYS    = int(os.getenv("SQUEEZE_LOOKBACK_DAYS", "40"))    # daily history window
+SQUEEZE_MIN_RVOL         = float(os.getenv("SQUEEZE_MIN_RVOL", "3.0"))            # day RVOL vs 20d avg
+SQUEEZE_MIN_DOLLAR_VOL   = float(os.getenv("SQUEEZE_MIN_DOLLAR_VOL", "20000000")) # $20M+
+SQUEEZE_LOOKBACK_DAYS    = int(os.getenv("SQUEEZE_LOOKBACK_DAYS", "40"))          # daily history window
 
 # Breakout context: require price near recent range highs
-SQUEEZE_RECENT_WINDOW    = int(os.getenv("SQUEEZE_RECENT_WINDOW", "20"))    # days for recent high
-SQUEEZE_NEAR_HIGH_PCT    = float(os.getenv("SQUEEZE_NEAR_HIGH_PCT", "10.0"))  # within 10% of recent high
+SQUEEZE_RECENT_WINDOW    = int(os.getenv("SQUEEZE_RECENT_WINDOW", "20"))          # days for recent high
+SQUEEZE_NEAR_HIGH_PCT    = float(os.getenv("SQUEEZE_NEAR_HIGH_PCT", "10.0"))      # within 10% of recent high
 
 # Universe size
 SQUEEZE_MAX_UNIVERSE     = int(os.getenv("SQUEEZE_MAX_UNIVERSE", "80"))
@@ -225,27 +226,6 @@ def _format_time() -> str:
         return ts.strftime("%I:%M %p EST · %b %d").lstrip("0")
     except Exception:
         return datetime.now(eastern).strftime("%I:%M %p EST · %b %d").lstrip("0")
-        
-        #------------SCANNER FOR STATUS_REPORT.PY BOT-----------------
-from bots.status_report import record_bot_stats
-
-BOT_NAME = "squeeze"
-...
-start_ts = time.time()
-alerts_sent = 0
-matches = []
-
-# ... your scan logic ...
-
-run_seconds = time.time() - start_ts
-
-record_bot_stats(
-    BOT_NAME,
-    scanned=len(universe),
-    matched=len(matches),
-    alerts=alerts_sent,
-    runtime=run_seconds,
-)
 
 
 # ---------------- MAIN BOT ----------------
@@ -272,6 +252,11 @@ async def run_squeeze() -> None:
         print("[squeeze] outside RTH; skipping.")
         return
 
+    BOT_NAME = "squeeze"
+    start_ts = time.time()
+    alerts_sent = 0
+    matched_symbols: set[str] = set()
+
     # Resolve universe
     env = os.getenv("SQUEEZE_TICKER_UNIVERSE") or os.getenv("TICKER_UNIVERSE")
     if env:
@@ -289,7 +274,6 @@ async def run_squeeze() -> None:
     print(f"[squeeze] scanning {len(universe)} symbols for squeeze-style moves")
 
     trading_day = date.today()
-    time_str = _format_time()
 
     for sym in universe:
         if is_etf_blacklisted(sym):
@@ -336,7 +320,6 @@ async def run_squeeze() -> None:
             continue
 
         # Breakout context: price near recent highs (not just dead-cat bounces)
-        # Require last_price within SQUEEZE_NEAR_HIGH_PCT of recent_high
         if recent_high > 0:
             distance_from_high_pct = (recent_high - last_price) / recent_high * 100.0
         else:
@@ -347,7 +330,7 @@ async def run_squeeze() -> None:
             continue
 
         # If we reach here: strong squeeze-style profile
-        # Build alert body
+        time_str = _format_time()
         emoji = "🧨"
         rocket = "🚀"
         divider = "────────────"
@@ -370,8 +353,22 @@ async def run_squeeze() -> None:
 
         extra_text = "\n".join(body_lines)
 
-        # rvol passed into send_alert so it shows in the header if needed
         send_alert("squeeze", sym, last_price, rvol, extra=extra_text)
         _mark(sym)
+
+        matched_symbols.add(sym)
+        alerts_sent += 1
+
+    run_seconds = time.time() - start_ts
+    try:
+        record_bot_stats(
+            BOT_NAME,
+            scanned=len(universe),
+            matched=len(matched_symbols),
+            alerts=alerts_sent,
+            runtime=run_seconds,
+        )
+    except Exception as e:
+        print(f"[squeeze] record_bot_stats error: {e}")
 
     print("[squeeze] scan complete.")
