@@ -14,6 +14,7 @@
 # hammering Polygon 3x for the same tickers.
 
 import os
+import time
 from datetime import date, timedelta, datetime
 from typing import List, Tuple, Optional
 
