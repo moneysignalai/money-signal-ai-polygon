@@ -30,6 +30,7 @@ from bots.shared import (
     chart_link,
     now_est,
 )
+from bots.status_report import record_bot_stats
 
 eastern = pytz.timezone("US/Eastern")
 _client: Optional[RESTClient] = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
@@ -109,7 +110,10 @@ def _get_universe() -> List[str]:
     env = os.getenv("INTRADAY_FLOW_TICKER_UNIVERSE") or os.getenv("TICKER_UNIVERSE")
     if env:
         return [s.strip().upper() for s in env.split(",") if s.strip()]
-    return get_dynamic_top_volume_universe(max_tickers=INTRADAY_MAX_UNIVERSE, volume_coverage=0.95)
+    return get_dynamic_top_volume_universe(
+        max_tickers=INTRADAY_MAX_UNIVERSE,
+        volume_coverage=0.95,
+    )
 
 
 def _fetch_intraday(sym: str, trading_day: date) -> List[Any]:
@@ -269,6 +273,7 @@ def _check_volume_monster(sym: str, stats: Dict[str, Any], bars: List[Any]) -> O
       - RVOL >= VM_MIN_VOLUME_RVOL (and MIN_RVOL_GLOBAL)
       - Day volume & dollar volume big
       - At least one 1-min bar with huge shares and dollar volume
+    Returns the signal name if triggered, else None.
     """
     if sym in _seen_vm:
         return None
@@ -337,6 +342,7 @@ def _check_panic_flush(sym: str, stats: Dict[str, Any]) -> Optional[str]:
       - Huge down move vs prior close (<= -PF_MIN_DROP_PCT)
       - Near 52w low
       - Very high RVOL + dollar volume
+    Returns the signal name if triggered, else None.
     """
     if sym in _seen_pf:
         return None
@@ -400,6 +406,7 @@ def _check_momentum_reversal(sym: str, stats: Dict[str, Any]) -> Optional[str]:
         • Blow-off top: big up move vs prior close, last price retracing hard from day high.
         • Flush reversal: big down move vs prior close, last price bouncing hard off day low.
       Only scanned after MR_SCAN_START_MIN (late morning / afternoon).
+      Returns the signal name if triggered, else None.
     """
     if sym in _seen_mr:
         return None
@@ -469,27 +476,6 @@ def _check_momentum_reversal(sym: str, stats: Dict[str, Any]) -> Optional[str]:
     send_alert("intraday_momentum_reversal", sym, last_price, rvol, extra=body)
     return "momentum_reversal"
 
-#------------SCANNER FOR STATUS_REPORT.PY BOT-----------------
-from bots.status_report import record_bot_stats
-
-BOT_NAME = "intraday_flow"
-...
-start_ts = time.time()
-alerts_sent = 0
-matches = []
-
-# ... your scan logic ...
-
-run_seconds = time.time() - start_ts
-
-record_bot_stats(
-    BOT_NAME,
-    scanned=len(universe),
-    matched=len(matches),
-    alerts=alerts_sent,
-    runtime=run_seconds,
-)
-
 
 # ---------------- MAIN ENTRY ----------------
 
@@ -516,6 +502,11 @@ async def run_intraday_flow() -> None:
         print("[intraday_flow] outside intraday window; skipping.")
         return
 
+    BOT_NAME = "intraday_flow"
+    start_ts = time.time()
+    alerts_sent = 0
+    matched_symbols: set[str] = set()
+
     universe = _get_universe()
     if not universe:
         print("[intraday_flow] empty universe; skipping.")
@@ -535,8 +526,41 @@ async def run_intraday_flow() -> None:
         # Volume Monster & Panic Flush only need daily stats
         bars = _fetch_intraday(sym, trading_day)
 
-        _check_volume_monster(sym, stats, bars)
-        _check_panic_flush(sym, stats)
-        _check_momentum_reversal(sym, stats)
+        try:
+            sig_vm = _check_volume_monster(sym, stats, bars)
+        except Exception as e:
+            print(f"[intraday_flow] volume_monster error for {sym}: {e}")
+            sig_vm = None
+
+        try:
+            sig_pf = _check_panic_flush(sym, stats)
+        except Exception as e:
+            print(f"[intraday_flow] panic_flush error for {sym}: {e}")
+            sig_pf = None
+
+        try:
+            sig_mr = _check_momentum_reversal(sym, stats)
+        except Exception as e:
+            print(f"[intraday_flow] momentum_reversal error for {sym}: {e}")
+            sig_mr = None
+
+        # Stats tracking
+        fired = [s for s in (sig_vm, sig_pf, sig_mr) if s is not None]
+        if fired:
+            matched_symbols.add(sym)
+            alerts_sent += len(fired)
+
+    run_seconds = time.time() - start_ts
+
+    try:
+        record_bot_stats(
+            BOT_NAME,
+            scanned=len(universe),
+            matched=len(matched_symbols),
+            alerts=alerts_sent,
+            runtime=run_seconds,
+        )
+    except Exception as e:
+        print(f"[intraday_flow] record_bot_stats error: {e}")
 
     print("[intraday_flow] scan complete.")
