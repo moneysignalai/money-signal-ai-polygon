@@ -9,6 +9,7 @@
 #   • Avoids ETFs + de-dupes per symbol per day
 
 import os
+import time
 from datetime import date, timedelta, datetime
 from typing import List, Tuple, Optional, Any
 
