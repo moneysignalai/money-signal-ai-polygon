@@ -7,6 +7,7 @@
 # Uses daily candles only; runs during RTH but could be limited to 1–2x/day.
 
 import os
+import time
 from datetime import date, timedelta, datetime
 from typing import List
 
