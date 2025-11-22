@@ -498,19 +498,20 @@ async def run_options_flow():
             else:
                 under_line = "💰 Underlying price N/A"
 
-            extra_lines = [
-                header,
-                f"🕒 {time_str}",
-                under_line,
-                "────────────",
-                desc,
-                f"📌 Contract: {contract}",
-                f"📦 Size: {size:,}",
-                f"💵 Option Price: ${price:.2f}",
-                f"💰 Notional: ≈ ${notional_rounded:,.0f}",
-                f"🗓️ DTE: {dte_str}",
-                f"🔗 Chart: {chart_link(sym)}",
-            ]
+         extra_lines = [
+            header,
+            f"🕒 {time_str}",
+            under_line,
+            "────────────",
+            desc,
+            # Pretty contract line + raw Polygon symbol
+            f"📌 Contract: {contract_line} ({contract})",
+            f"📦 Size: {size:,}",
+            f"💵 Option Price: ${price:.2f}",
+            f"💰 Notional: ≈ ${notional_rounded:,.0f}",
+            f"🗓️ DTE: {dte_str}",
+            f"🔗 Chart: {chart_link(sym)}",
+        ]
 
             extra_text = "\n".join(extra_lines)
 
