@@ -8,6 +8,7 @@
 # All share the same Polygon data pull per symbol to keep it efficient.
 
 import os
+import time
 from datetime import datetime, date, timedelta
 from typing import Any, Dict, List, Optional
 
