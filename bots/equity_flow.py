@@ -16,7 +16,7 @@
 import os
 import time
 from datetime import date, timedelta, datetime
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
 
 import pytz
 
@@ -36,6 +36,7 @@ from bots.shared import (
     chart_link,
     now_est,
 )
+from bots.status_report import record_bot_stats
 
 eastern = pytz.timezone("US/Eastern")
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
@@ -303,35 +304,17 @@ def _sma(values: List[float], window: int) -> List[float]:
         out.append(sum(window_vals) / float(window))
     return out
 
-#------------SCANNER FOR STATUS_REPORT.PY BOT-----------------
-from bots.status_report import record_bot_stats
-
-BOT_NAME = "equity_flow"
-...
-start_ts = time.time()
-alerts_sent = 0
-matches = []
-
-# ... your scan logic ...
-
-run_seconds = time.time() - start_ts
-
-record_bot_stats(
-    BOT_NAME,
-    scanned=len(universe),
-    matched=len(matches),
-    alerts=alerts_sent,
-    runtime=run_seconds,
-)
-
 
 # -------------------------------------------------------------------
 # STRATEGY LOGIC (uses shared stats so we only compute once)
 # -------------------------------------------------------------------
 
-def _maybe_alert_volume(sym: str, stats: dict, intraday_bars: List) -> None:
+def _maybe_alert_volume(sym: str, stats: dict, intraday_bars: List) -> bool:
+    """
+    Returns True if a volume alert was sent, else False.
+    """
     if sym in _alerted_volume:
-        return
+        return False
 
     last_price = stats["last_price"]
     rvol = stats["rvol"]
@@ -339,22 +322,22 @@ def _maybe_alert_volume(sym: str, stats: dict, intraday_bars: List) -> None:
     dollar_vol = stats["dollar_vol"]
 
     if last_price < MIN_MONSTER_PRICE:
-        return
+        return False
 
     # RVOL gate for volume bot: use per-bot MIN_VOLUME_RVOL but also respect global MIN_RVOL_GLOBAL
     if rvol < max(MIN_VOLUME_RVOL, MIN_RVOL_GLOBAL):
-        return
+        return False
     if day_vol < MIN_VOLUME_GLOBAL:
-        return
+        return False
     if dollar_vol < MIN_MONSTER_DOLLAR_VOL:
-        return
+        return False
 
     if not intraday_bars:
-        return
+        return False
 
     found, monster_bar_vol = _find_monster_bar(intraday_bars, last_price)
     if not found:
-        return
+        return False
 
     prev_close = stats["prev_close"]
     move_pct = (last_price - prev_close) / prev_close * 100.0
@@ -384,13 +367,17 @@ def _maybe_alert_volume(sym: str, stats: dict, intraday_bars: List) -> None:
 
     _alerted_volume.add(sym)
     send_alert("volume", sym, last_price, rvol, extra=extra)
+    return True
 
 
-def _maybe_alert_gap(sym: str, stats: dict) -> None:
+def _maybe_alert_gap(sym: str, stats: dict) -> bool:
+    """
+    Returns True if a gap alert was sent, else False.
+    """
     if sym in _alerted_gap:
-        return
+        return False
     if not _in_gap_window():
-        return
+        return False
 
     last_price = stats["last_price"]
     prev_close = stats["prev_close"]
@@ -402,24 +389,24 @@ def _maybe_alert_gap(sym: str, stats: dict) -> None:
     dollar_vol = stats["dollar_vol"]
 
     if last_price < MIN_GAP_PRICE:
-        return
+        return False
 
     gap_pct = (open_today - prev_close) / prev_close * 100.0
     if abs(gap_pct) < MIN_GAP_PCT:
-        return
+        return False
 
     intraday_pct = (last_price - open_today) / open_today * 100.0
     total_move_pct = (last_price - prev_close) / prev_close * 100.0
 
     # RVOL gate for gaps: max of bot-specific and global
     if rvol < max(MIN_GAP_RVOL, MIN_RVOL_GLOBAL):
-        return
+        return False
 
     if vol_today < MIN_VOLUME_GLOBAL:
-        return
+        return False
 
     if dollar_vol < MIN_GAP_DOLLAR_VOL:
-        return
+        return False
 
     direction = "Gap Up" if gap_pct > 0 else "Gap Down"
     emoji = "🚀" if gap_pct > 0 else "🩸"
@@ -462,11 +449,15 @@ def _maybe_alert_gap(sym: str, stats: dict) -> None:
 
     _alerted_gap.add(sym)
     send_alert("gap", sym, last_price, rvol, extra=extra)
+    return True
 
 
-def _maybe_alert_pullback(sym: str, stats: dict, daily: List) -> None:
+def _maybe_alert_pullback(sym: str, stats: dict, daily: List) -> bool:
+    """
+    Returns True if a swing pullback alert was sent, else False.
+    """
     if sym in _alerted_pullback:
-        return
+        return False
 
     last_price = stats["last_price"]
     prev_close = stats["prev_close"]
@@ -477,30 +468,30 @@ def _maybe_alert_pullback(sym: str, stats: dict, daily: List) -> None:
 
     # Basic price and liquidity filters
     if last_price < MIN_PRICE or last_price > MAX_PRICE:
-        return
+        return False
 
     # Liquidity: either explicit pullback dollar-vol threshold OR scaled by MIN_VOLUME_GLOBAL
     min_dol = max(MIN_DOLLAR_VOL_PULLBACK, MIN_VOLUME_GLOBAL * last_price)
     if dollar_vol < min_dol:
-        return
+        return False
 
     # RVOL gate for pullback: respect global + per-bot
     if rvol < max(MIN_RVOL_GLOBAL, MIN_RVOL_PULLBACK):
-        return
+        return False
 
     # Trend: 20 SMA > 50 SMA, price above 50SMA
     sma20_series = _sma(closes, 20)
     sma50_series = _sma(closes, 50)
     if not sma20_series or not sma50_series:
-        return
+        return False
 
     sma20 = sma20_series[-1]
     sma50 = sma50_series[-1]
 
     if sma20 <= sma50:
-        return
+        return False
     if last_price <= sma50:
-        return
+        return False
 
     # Recent red days count (using last 1..N closes)
     recent_closes = closes[-(MAX_RED_DAYS + 5) :]
@@ -510,20 +501,20 @@ def _maybe_alert_pullback(sym: str, stats: dict, daily: List) -> None:
             red_days += 1
 
     if red_days == 0 or red_days > MAX_RED_DAYS:
-        return
+        return False
 
     # Pullback from recent swing high
     recent_window = closes[-20:]
     if not recent_window:
-        return
+        return False
 
     swing_high = max(recent_window)
     if swing_high <= 0:
-        return
+        return False
 
     pullback_pct = (swing_high - last_price) / swing_high * 100.0
     if pullback_pct < MIN_PULLBACK_PCT or pullback_pct > MAX_PULLBACK_PCT:
-        return
+        return False
 
     move_pct = (last_price / prev_close - 1.0) * 100.0 if prev_close > 0 else 0.0
     grade = grade_equity_setup(move_pct, rvol, dollar_vol)
@@ -544,6 +535,7 @@ def _maybe_alert_pullback(sym: str, stats: dict, daily: List) -> None:
 
     _alerted_pullback.add(sym)
     send_alert("swing_pullback", sym, last_price, rvol, extra=extra)
+    return True
 
 
 # -------------------------------------------------------------------
@@ -567,6 +559,11 @@ async def run_equity_flow() -> None:
     if not _in_rth_window():
         print("[equity_flow] outside RTH; skipping.")
         return
+
+    BOT_NAME = "equity_flow"
+    start_ts = time.time()
+    alerts_sent = 0
+    matched_symbols: set[str] = set()
 
     universe = _get_universe()
     if not universe:
@@ -592,20 +589,41 @@ async def run_equity_flow() -> None:
         # Intraday only if we MIGHT trigger volume-pings
         intraday = _fetch_intraday(sym, trading_day)
 
-        # Try each strategy; any/all may fire
         try:
-            _maybe_alert_volume(sym, stats, intraday)
+            hit_vol = _maybe_alert_volume(sym, stats, intraday)
         except Exception as e:
             print(f"[equity_flow] volume-logic error for {sym}: {e}")
+            hit_vol = False
 
         try:
-            _maybe_alert_gap(sym, stats)
+            hit_gap = _maybe_alert_gap(sym, stats)
         except Exception as e:
             print(f"[equity_flow] gap-logic error for {sym}: {e}")
+            hit_gap = False
 
         try:
-            _maybe_alert_pullback(sym, stats, daily)
+            hit_pull = _maybe_alert_pullback(sym, stats, daily)
         except Exception as e:
             print(f"[equity_flow] pullback-logic error for {sym}: {e}")
+            hit_pull = False
+
+        # Track stats
+        if hit_vol or hit_gap or hit_pull:
+            matched_symbols.add(sym)
+        alerts_sent += int(hit_vol) + int(hit_gap) + int(hit_pull)
+
+    run_seconds = time.time() - start_ts
+
+    # Feed into status_report analytics
+    try:
+        record_bot_stats(
+            BOT_NAME,
+            scanned=len(universe),
+            matched=len(matched_symbols),
+            alerts=alerts_sent,
+            runtime=run_seconds,
+        )
+    except Exception as e:
+        print(f"[equity_flow] record_bot_stats error: {e}")
 
     print("[equity_flow] scan complete.")
