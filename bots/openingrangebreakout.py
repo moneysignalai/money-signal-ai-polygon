@@ -8,6 +8,7 @@
 # - Single alert per symbol per day.
 
 import os
+import time
 from datetime import datetime, date, timedelta
 from typing import Any, List, Optional
 
