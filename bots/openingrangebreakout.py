@@ -29,6 +29,7 @@ from bots.shared import (
     now_est,
     is_etf_blacklisted,
 )
+from bots.status_report import record_bot_stats
 
 eastern = pytz.timezone("US/Eastern")
 _client: Optional[RESTClient] = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
@@ -98,7 +99,10 @@ def _get_universe() -> List[str]:
     env = os.getenv("ORB_TICKER_UNIVERSE") or os.getenv("TICKER_UNIVERSE")
     if env:
         return [s.strip().upper() for s in env.split(",") if s.strip()]
-    return get_dynamic_top_volume_universe(max_tickers=ORB_MAX_UNIVERSE, volume_coverage=0.90)
+    return get_dynamic_top_volume_universe(
+        max_tickers=ORB_MAX_UNIVERSE,
+        volume_coverage=0.90,
+    )
 
 
 def _fetch_intraday(sym: str, trading_day: date) -> List[Any]:
@@ -213,14 +217,17 @@ async def run_opening_range_break() -> None:
         print("[OpeningRangeBreak] outside ORB scan window; skipping.")
         return
 
+    BOT_NAME = "opening_range_breakout"
+    start_ts = time.time()
+    alerts_sent = 0
+    matched_symbols: set[str] = set()
+
     universe = _get_universe()
     if not universe:
         print("[OpeningRangeBreak] empty universe; skipping.")
         return
 
     trading_day = date.today()
-    time_str = _format_time()
-
     print(f"[OpeningRangeBreak] scanning {len(universe)} symbols")
 
     for sym in universe:
@@ -233,29 +240,11 @@ async def run_opening_range_break() -> None:
         if not bars:
             continue
 
-        #------------SCANNER FOR STATUS_REPORT.PY BOT-----------------
-from bots.status_report import record_bot_stats
-
-BOT_NAME = "opening_range_breakout"
-...
-start_ts = time.time()
-alerts_sent = 0
-matches = []
-
-# ... your scan logic ...
-
-run_seconds = time.time() - start_ts
-
-record_bot_stats(
-    BOT_NAME,
-    scanned=len(universe),
-    matched=len(matches),
-    alerts=alerts_sent,
-    runtime=run_seconds,
-)
-
         # Split bars into ORB window and all RTH bars for today
-        orb_start = datetime(trading_day.year, trading_day.month, trading_day.day, 9, 30, tzinfo=eastern)
+        orb_start = datetime(
+            trading_day.year, trading_day.month, trading_day.day,
+            9, 30, tzinfo=eastern
+        )
         orb_end = orb_start + timedelta(minutes=ORB_MINUTES)
 
         orb_high = None
@@ -319,8 +308,12 @@ record_bot_stats(
         if not direction:
             continue
 
-        range_pct = (orb_high - orb_low) / orb_low * 100.0 if orb_low > 0 else 0.0
+        range_pct = (
+            (orb_high - orb_low) / orb_low * 100.0
+            if orb_low > 0 else 0.0
+        )
 
+        time_str = _format_time()
         body_lines = [
             f"{emoji} ORB — {sym}",
             f"🕒 {time_str}",
@@ -336,5 +329,21 @@ record_bot_stats(
 
         send_alert("opening_range_break", sym, last_price, rvol, extra=extra_text)
         _mark(sym)
+
+        # stats tracking
+        matched_symbols.add(sym)
+        alerts_sent += 1
+
+    run_seconds = time.time() - start_ts
+    try:
+        record_bot_stats(
+            BOT_NAME,
+            scanned=len(universe),
+            matched=len(matched_symbols),
+            alerts=alerts_sent,
+            runtime=run_seconds,
+        )
+    except Exception as e:
+        print(f"[OpeningRangeBreak] record_bot_stats error: {e}")
 
     print("[OpeningRangeBreak] scan complete.")
