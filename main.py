@@ -33,6 +33,7 @@ BOTS = [
     ("intraday_flow", "bots.intraday_flow", "run_intraday_flow"),
     ("opening_range_breakout", "bots.openingrangebreakout", "run_opening_range_breakout"),
     ("options_flow", "bots.options_flow", "run_options_flow"),
+    ("options_indicator", "bots.options_indicator", "run_options_indicator"),
     ("squeeze", "bots.squeeze", "run_squeeze"),
     ("earnings", "bots.earnings", "run_earnings"),
     ("trend_flow", "bots.trend_flow", "run_trend_flow"),
@@ -176,7 +177,8 @@ async def scheduler_loop(interval_seconds: int = SCAN_INTERVAL_SECONDS):
         print(
             f"[main] SCANNING CYCLE #{cycle} — "
             "Premarket, EquityFlow, IntradayFlow, OpeningRangeBreakout, "
-            "OptionsFlow, Squeeze, Earnings, TrendFlow, DarkPool, Status"
+            "OptionsFlow, OptionsIndicator, Squeeze, Earnings, TrendFlow, "
+            "DarkPool, Status"
         )
         try:
             await run_all_once()
