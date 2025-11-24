@@ -175,25 +175,6 @@ def _http_get_json(
     return None
 
 
-# ---------------- FALLBACK UNIVERSE HELPER ----------------
-
-
-def _get_fallback_universe() -> List[str]:
-    """
-    Parse FALLBACK_TICKER_UNIVERSE from env and return a list of symbols,
-    e.g. FALLBACK_TICKER_UNIVERSE=SPY,QQQ,TSLA,NVDA,AAPL,MSFT,META,AMZN
-    """
-    fallback_env = os.getenv("FALLBACK_TICKER_UNIVERSE")
-    if not fallback_env:
-        return []
-    tickers = [t.strip().upper() for t in fallback_env.split(",") if t.strip()]
-    if tickers:
-        print(f"[shared] USING FALLBACK universe: {len(tickers)} names")
-    else:
-        print("[shared] FALLBACK_TICKER_UNIVERSE is set but parsed to 0 symbols.")
-    return tickers
-
-
 # ---------------- DYNAMIC UNIVERSE ----------------
 
 
@@ -204,20 +185,20 @@ def get_dynamic_top_volume_universe(
     """
     Use Polygon's previous day's most-active (by dollar volume) to build a liquid universe.
 
-    Used by multiple scanners (equity_flow, intraday_flow, trend_flow, options_flow, etc.).
-
-    Mode A (stable): we also allow env overrides to keep the universe size sane:
-      • DYNAMIC_MAX_TICKERS     — global cap on tickers regardless of caller's request
-      • DYNAMIC_VOLUME_COVERAGE — override coverage fraction (e.g. 0.95)
-      • FALLBACK_TICKER_UNIVERSE — used when Polygon data is empty/unavailable
+    If Polygon returns 0 names (weekend / holiday / outage),
+    fall back to FALLBACK_TICKER_UNIVERSE from ENV.
     """
+
+    # If no Polygon key, go straight to fallback
     if not POLYGON_KEY:
-        print("[shared] POLYGON_KEY missing; cannot build dynamic universe.")
-        # Try fallback if Polygon is not usable
-        fallback = _get_fallback_universe()
-        if fallback:
-            return fallback
-        return []
+        print("[shared] POLYGON_KEY missing; using FALLBACK_TICKER_UNIVERSE")
+        env = os.getenv("FALLBACK_TICKER_UNIVERSE", "")
+        tickers = [t.strip().upper() for t in env.replace('"', "").split(",") if t.strip()]
+        if not tickers:
+            print("[shared] FALLBACK_TICKER_UNIVERSE empty; returning [].")
+        else:
+            print(f"[shared] fallback universe: {len(tickers)} names (no POLYGON_KEY)")
+        return tickers[:max_tickers]
 
     # Apply global caps from env for safety
     try:
@@ -241,13 +222,18 @@ def get_dynamic_top_volume_universe(
     params = {"adjusted": "true", "apiKey": POLYGON_KEY}
 
     data = _http_get_json(url, params, tag="shared:universe", timeout=20.0, retries=2)
-    if not data:
-        # Error already reported by _http_get_json — try fallback
-        print("[shared] dynamic universe: no data from Polygon, attempting FALLBACK_TICKER_UNIVERSE.")
-        fallback = _get_fallback_universe()
-        if fallback:
-            return fallback
-        return []
+
+    # ---------- FALLBACK IF POLYGON RETURNS NOTHING ----------
+    if not data or not data.get("results"):
+        print("[shared] Polygon returned EMPTY universe — using FALLBACK_TICKER_UNIVERSE")
+        env = os.getenv("FALLBACK_TICKER_UNIVERSE", "")
+        tickers = [t.strip().upper() for t in env.replace('"', "").split(",") if t.strip()]
+        if not tickers:
+            print("[shared] FALLBACK_TICKER_UNIVERSE empty; returning [].")
+            return []
+        print(f"[shared] fallback universe: {len(tickers)} names")
+        return tickers[:max_tickers]
+    # ----------------------------------------------------------
 
     results = data.get("results") or []
     # each result: {T: 'AAPL', v: volume, vw: vwap, ...}
@@ -262,13 +248,14 @@ def get_dynamic_top_volume_universe(
         enriched.append((sym, vol, dollar_vol))
 
     if not enriched:
-        print("[shared] dynamic universe: 0 names after filtering.")
-        # Try fallback universe
-        fallback = _get_fallback_universe()
-        if fallback:
-            return fallback
-        print("[shared] NO FALLBACK universe defined — returning empty.")
-        return []
+        print("[shared] dynamic universe: 0 names after filtering — using fallback.")
+        env = os.getenv("FALLBACK_TICKER_UNIVERSE", "")
+        tickers = [t.strip().upper() for t in env.replace('"', "").split(",") if t.strip()]
+        if not tickers:
+            print("[shared] FALLBACK_TICKER_UNIVERSE empty; returning [].")
+            return []
+        print(f"[shared] fallback universe: {len(tickers)} names")
+        return tickers[:max_tickers]
 
     enriched.sort(key=lambda x: x[2], reverse=True)
 
