@@ -175,6 +175,25 @@ def _http_get_json(
     return None
 
 
+# ---------------- FALLBACK UNIVERSE HELPER ----------------
+
+
+def _get_fallback_universe() -> List[str]:
+    """
+    Parse FALLBACK_TICKER_UNIVERSE from env and return a list of symbols,
+    e.g. FALLBACK_TICKER_UNIVERSE=SPY,QQQ,TSLA,NVDA,AAPL,MSFT,META,AMZN
+    """
+    fallback_env = os.getenv("FALLBACK_TICKER_UNIVERSE")
+    if not fallback_env:
+        return []
+    tickers = [t.strip().upper() for t in fallback_env.split(",") if t.strip()]
+    if tickers:
+        print(f"[shared] USING FALLBACK universe: {len(tickers)} names")
+    else:
+        print("[shared] FALLBACK_TICKER_UNIVERSE is set but parsed to 0 symbols.")
+    return tickers
+
+
 # ---------------- DYNAMIC UNIVERSE ----------------
 
 
@@ -188,13 +207,16 @@ def get_dynamic_top_volume_universe(
     Used by multiple scanners (equity_flow, intraday_flow, trend_flow, options_flow, etc.).
 
     Mode A (stable): we also allow env overrides to keep the universe size sane:
-      • DYNAMIC_MAX_TICKERS       — global cap on tickers regardless of caller's request
-      • DYNAMIC_VOLUME_COVERAGE   — override coverage fraction (e.g. 0.95)
-      • DYNAMIC_MAX_LOOKBACK_DAYS — how many days back we walk if a day is "dead"
-      • FALLBACK_TICKER_UNIVERSE  — comma list of tickers if Polygon returns nothing usable
+      • DYNAMIC_MAX_TICKERS     — global cap on tickers regardless of caller's request
+      • DYNAMIC_VOLUME_COVERAGE — override coverage fraction (e.g. 0.95)
+      • FALLBACK_TICKER_UNIVERSE — used when Polygon data is empty/unavailable
     """
     if not POLYGON_KEY:
         print("[shared] POLYGON_KEY missing; cannot build dynamic universe.")
+        # Try fallback if Polygon is not usable
+        fallback = _get_fallback_universe()
+        if fallback:
+            return fallback
         return []
 
     # Apply global caps from env for safety
@@ -211,72 +233,43 @@ def get_dynamic_top_volume_universe(
     except Exception:
         pass
 
-    max_lookback_days = 0
-    try:
-        max_lookback_days = int(os.getenv("DYNAMIC_MAX_LOOKBACK_DAYS", "5"))
-    except Exception:
-        max_lookback_days = 5
-    max_lookback_days = max(1, min(max_lookback_days, 10))
-
     today = today_est_date()
+    prev = today - timedelta(days=1)
+    from_ = prev.isoformat()
 
+    url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{from_}"
+    params = {"adjusted": "true", "apiKey": POLYGON_KEY}
+
+    data = _http_get_json(url, params, tag="shared:universe", timeout=20.0, retries=2)
+    if not data:
+        # Error already reported by _http_get_json — try fallback
+        print("[shared] dynamic universe: no data from Polygon, attempting FALLBACK_TICKER_UNIVERSE.")
+        fallback = _get_fallback_universe()
+        if fallback:
+            return fallback
+        return []
+
+    results = data.get("results") or []
+    # each result: {T: 'AAPL', v: volume, vw: vwap, ...}
     enriched: List[Tuple[str, float, float]] = []
-    used_from_date: Optional[str] = None
-
-    # Walk back up to N days until we find a day with real dollar volume
-    for days_back in range(1, max_lookback_days + 1):
-        prev = today - timedelta(days=days_back)
-        from_ = prev.isoformat()
-
-        url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{from_}"
-        params = {"adjusted": "true", "apiKey": POLYGON_KEY}
-
-        data = _http_get_json(url, params, tag="shared:universe", timeout=20.0, retries=2)
-        if not data:
-            # error already reported inside _http_get_json; try the previous day
+    for row in results:
+        sym = row.get("T")
+        vol = float(row.get("v") or 0.0)
+        vwap = float(row.get("vw") or 0.0)
+        dollar_vol = vol * max(vwap, 0.0)
+        if not sym or dollar_vol <= 0:
             continue
+        enriched.append((sym, vol, dollar_vol))
 
-        results = data.get("results") or []
-        tmp_enriched: List[Tuple[str, float, float]] = []
-        for row in results:
-            sym = row.get("T")
-            vol = float(row.get("v") or 0.0)
-            vwap = float(row.get("vw") or 0.0)
-            dollar_vol = vol * max(vwap, 0.0)
-            if not sym or dollar_vol <= 0:
-                continue
-            tmp_enriched.append((sym, vol, dollar_vol))
-
-        if tmp_enriched:
-            enriched = tmp_enriched
-            used_from_date = from_
-            break
-        else:
-            print(f"[shared] dynamic universe: 0 names for {from_}; trying prior day...")
-
-    # If we still have nothing after walking back, use a fallback universe
     if not enriched:
-        fallback_env = os.getenv("FALLBACK_TICKER_UNIVERSE")
-        if fallback_env:
-            universe = [t.strip().upper() for t in fallback_env.split(",") if t.strip()]
-            if universe:
-                universe = universe[:max_tickers]
-                print(
-                    f"[shared] dynamic universe empty across lookback; "
-                    f"using FALLBACK_TICKER_UNIVERSE with {len(universe)} names."
-                )
-                return universe
+        print("[shared] dynamic universe: 0 names after filtering.")
+        # Try fallback universe
+        fallback = _get_fallback_universe()
+        if fallback:
+            return fallback
+        print("[shared] NO FALLBACK universe defined — returning empty.")
+        return []
 
-        # Hard-coded ultra-liquid fallback if everything else fails
-        fallback = ["SPY", "QQQ", "IWM", "TSLA", "NVDA", "AAPL", "MSFT", "META", "AMZN"]
-        universe = fallback[:max_tickers]
-        print(
-            "[shared] dynamic universe empty across lookback; "
-            "using static fallback universe (top ETFs/megacaps)."
-        )
-        return universe
-
-    # Normal path: sort by dollar volume and take top names until coverage/max_tickers
     enriched.sort(key=lambda x: x[2], reverse=True)
 
     universe: List[str] = []
@@ -290,11 +283,7 @@ def get_dynamic_top_volume_universe(
         if total_dollar > 0 and running / total_dollar >= volume_coverage:
             break
 
-    date_str = used_from_date or "unknown"
-    print(
-        f"[shared] dynamic universe (from {date_str}): "
-        f"{len(universe)} names, covers ~{volume_coverage*100:.0f}% vol."
-    )
+    print(f"[shared] dynamic universe: {len(universe)} names, covers ~{volume_coverage*100:.0f}% vol.")
     return universe
 
 
