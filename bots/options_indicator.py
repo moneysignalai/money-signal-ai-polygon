@@ -63,11 +63,11 @@ MIN_UNDERLYING_RVOL = float(os.getenv("OPTIONS_INDICATOR_MIN_RVOL", "1.5"))
 
 # IV "rank" thresholds (intra-chain)
 HIGH_IV_RANK = float(os.getenv("OPTIONS_INDICATOR_HIGH_IV_RANK", "70.0"))
-LOW_IV_RANK  = float(os.getenv("OPTIONS_INDICATOR_LOW_IV_RANK", "30.0"))
+LOW_IV_RANK = float(os.getenv("OPTIONS_INDICATOR_LOW_IV_RANK", "30.0"))
 
 # RSI thresholds
 RSI_OB_OVERBOUGHT = float(os.getenv("OPTIONS_INDICATOR_RSI_OVERBOUGHT", "70.0"))
-RSI_OB_OVERSOLD   = float(os.getenv("OPTIONS_INDICATOR_RSI_OVERSOLD", "30.0"))
+RSI_OB_OVERSOLD = float(os.getenv("OPTIONS_INDICATOR_RSI_OVERSOLD", "30.0"))
 
 # MACD config
 MACD_FAST = int(os.getenv("OPTIONS_INDICATOR_MACD_FAST", "12"))
@@ -476,10 +476,7 @@ async def run_options_indicator() -> None:
     trading_day = date.today()
     start_ts = time.time()
     alerts_sent = 0
-    matches = []
-
-    start = (trading_day - timedelta(days=LOOKBACK_DAYS)).isoformat()
-    end = trading_day.isoformat()
+    matches: List[str] = []
 
     print(f"[options_indicator] scanning {len(universe)} symbols @ {now_est()}")
 
