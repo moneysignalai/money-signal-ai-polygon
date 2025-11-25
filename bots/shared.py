@@ -420,7 +420,8 @@ def get_last_option_trades_cached(
         if now_ts - float(entry.ts) < ttl_seconds:
             return entry.data
 
-    url = f"https://api.polygon.io/v3/last/trade/{full_option_symbol}"
+    # 🔧 FIXED: correct options last-trade endpoint
+    url = f"https://api.polygon.io/v3/last/trade/options/{full_option_symbol}"
     params = {"apiKey": POLYGON_KEY}
 
     timeout = 20.0
