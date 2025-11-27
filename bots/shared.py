@@ -175,7 +175,9 @@ def _http_get_json(
     return None
 
 
-# ---------------- DYNAMIC UNIVERSE ----------------
+# ---------------- DYNAMIC UNIVERSE (OPTIMIZED) ----------------
+
+_UNIVERSE_CACHE: Dict[str, Any] = {"ts": 0.0, "data": []}
 
 
 def get_dynamic_top_volume_universe(
@@ -185,9 +187,17 @@ def get_dynamic_top_volume_universe(
     """
     Use Polygon's previous day's most-active (by dollar volume) to build a liquid universe.
 
-    If Polygon returns 0 names (weekend / holiday / outage),
-    fall back to FALLBACK_TICKER_UNIVERSE from ENV.
+    Optimizations:
+      • 60s in-process cache to avoid hammering Polygon
+      • Faster timeouts (7s) + 1 retry instead of 2
+      • Clean fallback to FALLBACK_TICKER_UNIVERSE when Polygon is slow/empty
     """
+    now_ts = time.time()
+
+    # 60-second cache to avoid repeated heavy calls
+    if _UNIVERSE_CACHE["data"] and now_ts - float(_UNIVERSE_CACHE["ts"]) < 60.0:
+        data: List[str] = _UNIVERSE_CACHE["data"]
+        return data[:max_tickers]
 
     # If no Polygon key, go straight to fallback
     if not POLYGON_KEY:
@@ -196,8 +206,12 @@ def get_dynamic_top_volume_universe(
         tickers = [t.strip().upper() for t in env.replace('"', "").split(",") if t.strip()]
         if not tickers:
             print("[shared] FALLBACK_TICKER_UNIVERSE empty; returning [].")
-        else:
-            print(f"[shared] fallback universe: {len(tickers)} names (no POLYGON_KEY)")
+            _UNIVERSE_CACHE["ts"] = now_ts
+            _UNIVERSE_CACHE["data"] = []
+            return []
+        print(f"[shared] fallback universe: {len(tickers)} names (no POLYGON_KEY)")
+        _UNIVERSE_CACHE["ts"] = now_ts
+        _UNIVERSE_CACHE["data"] = tickers[:max_tickers]
         return tickers[:max_tickers]
 
     # Apply global caps from env for safety
@@ -221,23 +235,34 @@ def get_dynamic_top_volume_universe(
     url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{from_}"
     params = {"adjusted": "true", "apiKey": POLYGON_KEY}
 
-    data = _http_get_json(url, params, tag="shared:universe", timeout=20.0, retries=2)
+    # Slightly tighter timeout + fewer retries for responsiveness
+    data = _http_get_json(
+        url,
+        params,
+        tag="shared:universe",
+        timeout=7.0,
+        retries=1,
+        backoff_seconds=2.0,
+    )
 
     # ---------- FALLBACK IF POLYGON RETURNS NOTHING ----------
-    if not data or not data.get("results"):
-        print("[shared] Polygon returned EMPTY universe — using FALLBACK_TICKER_UNIVERSE")
+    results = data.get("results") if data else None
+    if not results:
+        print("[shared] Polygon universe empty/slow — using FALLBACK_TICKER_UNIVERSE")
         env = os.getenv("FALLBACK_TICKER_UNIVERSE", "")
         tickers = [t.strip().upper() for t in env.replace('"', "").split(",") if t.strip()]
         if not tickers:
             print("[shared] FALLBACK_TICKER_UNIVERSE empty; returning [].")
+            _UNIVERSE_CACHE["ts"] = now_ts
+            _UNIVERSE_CACHE["data"] = []
             return []
         print(f"[shared] fallback universe: {len(tickers)} names")
+        _UNIVERSE_CACHE["ts"] = now_ts
+        _UNIVERSE_CACHE["data"] = tickers[:max_tickers]
         return tickers[:max_tickers]
     # ----------------------------------------------------------
 
-    results = data.get("results") or []
-    # each result: {T: 'AAPL', v: volume, vw: vwap, ...}
-    enriched: List[Tuple[str, float, float]] = []
+    enriched: List[Tuple[str, float]] = []
     for row in results:
         sym = row.get("T")
         vol = float(row.get("v") or 0.0)
@@ -245,7 +270,7 @@ def get_dynamic_top_volume_universe(
         dollar_vol = vol * max(vwap, 0.0)
         if not sym or dollar_vol <= 0:
             continue
-        enriched.append((sym, vol, dollar_vol))
+        enriched.append((sym, dollar_vol))
 
     if not enriched:
         print("[shared] dynamic universe: 0 names after filtering — using fallback.")
@@ -253,16 +278,20 @@ def get_dynamic_top_volume_universe(
         tickers = [t.strip().upper() for t in env.replace('"', "").split(",") if t.strip()]
         if not tickers:
             print("[shared] FALLBACK_TICKER_UNIVERSE empty; returning [].")
+            _UNIVERSE_CACHE["ts"] = now_ts
+            _UNIVERSE_CACHE["data"] = []
             return []
         print(f"[shared] fallback universe: {len(tickers)} names")
+        _UNIVERSE_CACHE["ts"] = now_ts
+        _UNIVERSE_CACHE["data"] = tickers[:max_tickers]
         return tickers[:max_tickers]
 
-    enriched.sort(key=lambda x: x[2], reverse=True)
+    enriched.sort(key=lambda x: x[1], reverse=True)
 
     universe: List[str] = []
-    total_dollar = sum(row[2] for row in enriched)
+    total_dollar = sum(row[1] for row in enriched)
     running = 0.0
-    for sym, _v, dv in enriched:
+    for sym, dv in enriched:
         universe.append(sym)
         running += dv
         if len(universe) >= max_tickers:
@@ -271,6 +300,8 @@ def get_dynamic_top_volume_universe(
             break
 
     print(f"[shared] dynamic universe: {len(universe)} names, covers ~{volume_coverage*100:.0f}% vol.")
+    _UNIVERSE_CACHE["ts"] = now_ts
+    _UNIVERSE_CACHE["data"] = universe
     return universe
 
 
@@ -420,7 +451,7 @@ def get_last_option_trades_cached(
         if now_ts - float(entry.ts) < ttl_seconds:
             return entry.data
 
-    # 🔧 FIXED: correct options last-trade endpoint
+    # ✅ Correct Polygon options last-trade endpoint
     url = f"https://api.polygon.io/v3/last/trade/options/{full_option_symbol}"
     params = {"apiKey": POLYGON_KEY}
 
