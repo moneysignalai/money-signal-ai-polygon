@@ -1,556 +1,231 @@
-# bots/shared.py
-import os
-import time
-import math
-from dataclasses import dataclass
-from datetime import datetime, date, timedelta
-from typing import Dict, Any, List, Optional, Tuple
+# bots/status_report.py
 
-import pytz
+import os
+import json
+import time
+from dataclasses import dataclass, asdict
+from typing import Dict, Any
+
+from bots.shared import now_est  # reuse your EST timestamp helper
+
 import requests
 
-# ---------------- BASIC CONFIG ----------------
+# Where we persist per-bot stats between scans
+STATS_PATH = os.getenv("STATUS_STATS_PATH", "/tmp/moneysignal_stats.json")
 
-POLYGON_KEY = os.getenv("POLYGON_KEY") or os.getenv("POLYGON_API_KEY")
+# Heartbeat minimum interval (minutes)
+HEARTBEAT_INTERVAL_MIN = float(os.getenv("STATUS_HEARTBEAT_INTERVAL_MIN", "5"))
 
-# Global RVOL / volume floors that other bots can reference
-MIN_RVOL_GLOBAL = float(os.getenv("MIN_RVOL_GLOBAL", "2.0"))
-MIN_VOLUME_GLOBAL = float(os.getenv("MIN_VOLUME_GLOBAL", "500000"))  # shares
-
-# Telegram routing (your env)
-# - TELEGRAM_CHAT_ALL      = single private chat ID for everything
-# - TELEGRAM_TOKEN_ALERTS  = all-in-one alerts bot for all trade signals
-# - TELEGRAM_TOKEN_STATUS  = dedicated status/heartbeat bot
+# Telegram routing (reuse same envs you already use)
 TELEGRAM_CHAT_ALL = os.getenv("TELEGRAM_CHAT_ALL")
-TELEGRAM_TOKEN_ALERTS = os.getenv("TELEGRAM_TOKEN_ALERTS")
 TELEGRAM_TOKEN_STATUS = os.getenv("TELEGRAM_TOKEN_STATUS")
+TELEGRAM_TOKEN_ALERTS = os.getenv("TELEGRAM_TOKEN_ALERTS")
 
-# Some bots may want a separate status-only chat; if not set, fallback to CHAT_ALL
-TELEGRAM_CHAT_STATUS = os.getenv("TELEGRAM_CHAT_STATUS") or TELEGRAM_CHAT_ALL
-
-eastern = pytz.timezone("US/Eastern")
-
-
-# ---------------- TIME HELPERS ----------------
+# If status token not set, fall back to alerts token
+_TELEGRAM_STATUS_TOKEN = TELEGRAM_TOKEN_STATUS or TELEGRAM_TOKEN_ALERTS
 
 
-def now_est() -> str:
-    """
-    Human-friendly time string in Eastern, e.g. '10:48 AM EST · Nov 20'.
-
-    NOTE: this returns a STRING on purpose, so bots can just do:
-        ts = now_est()
-    and drop it straight into messages.
-    """
-    return datetime.now(eastern).strftime("%I:%M %p EST · %b %d").lstrip("0")
-
-
-def today_est_date() -> date:
-    return datetime.now(eastern).date()
+@dataclass
+class BotStats:
+    bot_name: str
+    scanned: int = 0
+    matched: int = 0
+    alerts: int = 0
+    last_runtime: float = 0.0
+    last_run_ts: float = 0.0           # unix timestamp
+    last_run_str: str = ""             # pretty EST string
 
 
-def iso_today() -> str:
-    return today_est_date().isoformat()
+def _send_telegram_status(text: str) -> None:
+    token = _TELEGRAM_STATUS_TOKEN
+    chat = TELEGRAM_CHAT_ALL
+    if not token or not chat:
+        print(f"[status_report] (no TELEGRAM_STATUS_TOKEN/TELEGRAM_CHAT_ALL) {text}")
+        return
 
-
-def minutes_since_midnight_est() -> int:
-    now = datetime.now(eastern)
-    return now.hour * 60 + now.minute
-
-
-# ---------------- TELEGRAM CORE ----------------
-
-
-def _send_telegram_raw(token: str, chat_id: str, text: str, parse_mode: Optional[str] = None) -> None:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
+    payload = {"chat_id": chat, "text": text}
     try:
         r = requests.post(url, json=payload, timeout=10)
         r.raise_for_status()
     except Exception as e:
-        # We deliberately do not raise; status bot might still be able to report.
-        print(f"[telegram] failed to send: {e} | text={text!r}")
+        print(f"[status_report] failed to send heartbeat: {e} | text={text!r}")
 
 
-def send_alert(
+def _load_stats() -> Dict[str, Any]:
+    """
+    Stats file structure:
+    {
+      "last_heartbeat_ts": float,
+      "bots": {
+        "premarket": {...},
+        "options_flow": {...},
+        ...
+      }
+    }
+    """
+    try:
+        if not os.path.exists(STATS_PATH):
+            return {"last_heartbeat_ts": 0.0, "bots": {}}
+        with open(STATS_PATH, "r") as f:
+            data = json.load(f)
+        if "bots" not in data:
+            data["bots"] = {}
+        if "last_heartbeat_ts" not in data:
+            data["last_heartbeat_ts"] = 0.0
+        return data
+    except Exception as e:
+        print(f"[status_report] _load_stats error: {e}")
+        return {"last_heartbeat_ts": 0.0, "bots": {}}
+
+
+def _save_stats(data: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(STATS_PATH), exist_ok=True)
+    except Exception:
+        pass
+    try:
+        with open(STATS_PATH, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"[status_report] _save_stats error: {e}")
+
+
+def record_bot_stats(
     bot_name: str,
-    symbol: str,
-    last_price: float,
-    rvol: float,
-    extra: Optional[str] = None,
+    scanned: int,
+    matched: int,
+    alerts: int,
+    runtime: float,
 ) -> None:
     """
-    Core alert sender used by all bots.
-    Sends a pretty Telegram message via TELEGRAM_TOKEN_ALERTS → TELEGRAM_CHAT_ALL.
+    Called by each bot once per scan cycle.
+    API is already used by your bots; DO NOT CHANGE THE SIGNATURE.
     """
-    token = TELEGRAM_TOKEN_ALERTS
-    chat = TELEGRAM_CHAT_ALL
-    if not token or not chat:
-        print(f"[alert:{bot_name}] (no TELEGRAM_TOKEN_ALERTS or TELEGRAM_CHAT_ALL) {symbol} {extra}")
-        return
+    data = _load_stats()
+    bots = data.get("bots", {})
 
-    header = f"🧠 {bot_name.upper()} — {symbol}"
-    body_lines = [header]
-    if last_price:
-        body_lines.append(f"💰 Last: ${last_price:.2f}")
-    if rvol:
-        body_lines.append(f"📊 RVOL: {rvol:.1f}x")
-    if extra:
-        body_lines.append("────────────")
-        body_lines.append(extra)
-
-    text = "\n".join(body_lines)
-    _send_telegram_raw(token, chat, text, parse_mode=None)
-
-
-# ---------------- STATUS / ERROR REPORTING ----------------
-
-
-def _send_status(text: str) -> None:
-    token = TELEGRAM_TOKEN_STATUS or TELEGRAM_TOKEN_ALERTS
-    chat = TELEGRAM_CHAT_STATUS or TELEGRAM_CHAT_ALL
-    if not token or not chat:
-        print(f"[status] (no TELEGRAM_TOKEN_STATUS or TELEGRAM_CHAT_ALL) {text}")
-        return
-    _send_telegram_raw(token, chat, text, parse_mode=None)
-
-
-def report_status_error(bot: str, message: str) -> None:
-    """
-    Soft error reporting to the status bot.
-
-    Called by shared helpers when a non-fatal error happens (e.g. Polygon fails),
-    so it shows up in Telegram even if the main bot continues.
-    """
-    ts = now_est()
-    text = f"⚠️ [{bot}] {ts}\n{message}"
-    _send_status(text)
-
-
-# ---------------- HTTP HELPER WITH RETRIES ----------------
-
-
-def _http_get_json(
-    url: str,
-    params: Dict[str, Any],
-    *,
-    tag: str,
-    timeout: float = 20.0,
-    retries: int = 2,
-    backoff_seconds: float = 2.5,
-) -> Optional[Dict[str, Any]]:
-    """
-    Thin wrapper around requests.get with:
-      • configurable timeout
-      • a few retries with exponential backoff
-      • optional status reporting on final failure
-
-    This is used for Polygon grouped/agg/snapshot GETs so that transient
-    slowness does not kill the bots or flood them with exceptions.
-    """
-    for attempt in range(retries + 1):
-        try:
-            resp = requests.get(url, params=params, timeout=timeout)
-            # Graceful handling of rate limits
-            if resp.status_code == 429:
-                wait = backoff_seconds * (attempt + 1)
-                print(f"[{tag}] Polygon 429 rate-limit; sleeping {wait:.1f}s before retry.")
-                time.sleep(wait)
-                continue
-
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            if attempt < retries:
-                wait = backoff_seconds * (attempt + 1)
-                print(f"[{tag}] HTTP error on attempt {attempt+1}/{retries+1}: {e} — retrying in {wait:.1f}s")
-                time.sleep(wait)
-            else:
-                msg = f"[{tag}] error after {retries+1} attempts: {e}"
-                print(msg)
-                report_status_error(tag, msg)
-                return None
-    return None
-
-
-# ---------------- DYNAMIC UNIVERSE (OPTIMIZED) ----------------
-
-_UNIVERSE_CACHE: Dict[str, Any] = {"ts": 0.0, "data": []}
-
-
-def get_dynamic_top_volume_universe(
-    max_tickers: int = 100,
-    volume_coverage: float = 0.90,
-) -> List[str]:
-    """
-    Use Polygon's previous day's most-active (by dollar volume) to build a liquid universe.
-
-    Optimizations:
-      • 60s in-process cache to avoid hammering Polygon
-      • Faster timeouts (7s) + 1 retry instead of 2
-      • Clean fallback to FALLBACK_TICKER_UNIVERSE when Polygon is slow/empty
-    """
     now_ts = time.time()
+    pretty_ts = now_est()
 
-    # 60-second cache to avoid repeated heavy calls
-    if _UNIVERSE_CACHE["data"] and now_ts - float(_UNIVERSE_CACHE["ts"]) < 60.0:
-        data: List[str] = _UNIVERSE_CACHE["data"]
-        return data[:max_tickers]
-
-    # If no Polygon key, go straight to fallback
-    if not POLYGON_KEY:
-        print("[shared] POLYGON_KEY missing; using FALLBACK_TICKER_UNIVERSE")
-        env = os.getenv("FALLBACK_TICKER_UNIVERSE", "")
-        tickers = [t.strip().upper() for t in env.replace('"', "").split(",") if t.strip()]
-        if not tickers:
-            print("[shared] FALLBACK_TICKER_UNIVERSE empty; returning [].")
-            _UNIVERSE_CACHE["ts"] = now_ts
-            _UNIVERSE_CACHE["data"] = []
-            return []
-        print(f"[shared] fallback universe: {len(tickers)} names (no POLYGON_KEY)")
-        _UNIVERSE_CACHE["ts"] = now_ts
-        _UNIVERSE_CACHE["data"] = tickers[:max_tickers]
-        return tickers[:max_tickers]
-
-    # Apply global caps from env for safety
-    try:
-        env_cap = int(os.getenv("DYNAMIC_MAX_TICKERS", str(max_tickers)))
-        max_tickers = max(1, min(max_tickers, env_cap))
-    except Exception:
-        pass
-
-    try:
-        env_cov = os.getenv("DYNAMIC_VOLUME_COVERAGE")
-        if env_cov is not None:
-            volume_coverage = float(env_cov)
-    except Exception:
-        pass
-
-    today = today_est_date()
-    prev = today - timedelta(days=1)
-    from_ = prev.isoformat()
-
-    url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{from_}"
-    params = {"adjusted": "true", "apiKey": POLYGON_KEY}
-
-    # Slightly tighter timeout + fewer retries for responsiveness
-    data = _http_get_json(
-        url,
-        params,
-        tag="shared:universe",
-        timeout=7.0,
-        retries=1,
-        backoff_seconds=2.0,
+    prev = bots.get(bot_name) or {}
+    stats = BotStats(
+        bot_name=bot_name,
+        scanned=int(scanned),
+        matched=int(matched),
+        alerts=int(alerts),
+        last_runtime=float(runtime),
+        last_run_ts=now_ts,
+        last_run_str=pretty_ts,
     )
 
-    # ---------- FALLBACK IF POLYGON RETURNS NOTHING ----------
-    results = data.get("results") if data else None
-    if not results:
-        print("[shared] Polygon universe empty/slow — using FALLBACK_TICKER_UNIVERSE")
-        env = os.getenv("FALLBACK_TICKER_UNIVERSE", "")
-        tickers = [t.strip().upper() for t in env.replace('"', "").split(",") if t.strip()]
-        if not tickers:
-            print("[shared] FALLBACK_TICKER_UNIVERSE empty; returning [].")
-            _UNIVERSE_CACHE["ts"] = now_ts
-            _UNIVERSE_CACHE["data"] = []
-            return []
-        print(f"[shared] fallback universe: {len(tickers)} names")
-        _UNIVERSE_CACHE["ts"] = now_ts
-        _UNIVERSE_CACHE["data"] = tickers[:max_tickers]
-        return tickers[:max_tickers]
-    # ----------------------------------------------------------
-
-    enriched: List[Tuple[str, float]] = []
-    for row in results:
-        sym = row.get("T")
-        vol = float(row.get("v") or 0.0)
-        vwap = float(row.get("vw") or 0.0)
-        dollar_vol = vol * max(vwap, 0.0)
-        if not sym or dollar_vol <= 0:
-            continue
-        enriched.append((sym, dollar_vol))
-
-    if not enriched:
-        print("[shared] dynamic universe: 0 names after filtering — using fallback.")
-        env = os.getenv("FALLBACK_TICKER_UNIVERSE", "")
-        tickers = [t.strip().upper() for t in env.replace('"', "").split(",") if t.strip()]
-        if not tickers:
-            print("[shared] FALLBACK_TICKER_UNIVERSE empty; returning [].")
-            _UNIVERSE_CACHE["ts"] = now_ts
-            _UNIVERSE_CACHE["data"] = []
-            return []
-        print(f"[shared] fallback universe: {len(tickers)} names")
-        _UNIVERSE_CACHE["ts"] = now_ts
-        _UNIVERSE_CACHE["data"] = tickers[:max_tickers]
-        return tickers[:max_tickers]
-
-    enriched.sort(key=lambda x: x[1], reverse=True)
-
-    universe: List[str] = []
-    total_dollar = sum(row[1] for row in enriched)
-    running = 0.0
-    for sym, dv in enriched:
-        universe.append(sym)
-        running += dv
-        if len(universe) >= max_tickers:
-            break
-        if total_dollar > 0 and running / total_dollar >= volume_coverage:
-            break
-
-    print(f"[shared] dynamic universe: {len(universe)} names, covers ~{volume_coverage*100:.0f}% vol.")
-    _UNIVERSE_CACHE["ts"] = now_ts
-    _UNIVERSE_CACHE["data"] = universe
-    return universe
+    # merge with previous if you ever want cumulative metrics later
+    bots[bot_name] = asdict(stats)
+    data["bots"] = bots
+    _save_stats(data)
 
 
-# ---------------- ETF BLACKLIST ----------------
-
-ETF_BLACKLIST = {
-    "DIA",
-    "VTI",
-    "XLK",
-    "XLF",
-    "XLE",
-    "XLY",
-    "XLI",
-    "XLV",
-    "XLP",
-    "XLB",
-    "XLU",
-    "XOP",
-    "XRT",
-}
-
-
-def is_etf_blacklisted(symbol: str) -> bool:
-    return symbol.upper() in ETF_BLACKLIST
-
-
-# ---------------- CACHED UNDERLYING LAST ----------------
-
-@dataclass
-class LastTradeCacheEntry:
-    ts: float
-    last: float
-    dollar_vol: float
-
-
-_LAST_TRADE_CACHE: Dict[str, LastTradeCacheEntry] = {}
-
-
-def get_last_trade_cached(symbol: str, ttl_seconds: int = 15) -> Tuple[Optional[float], Optional[float]]:
+async def run_status_report():
     """
-    Cached last / dollar volume for the underlying (equity/ETF).
-    Uses v2 last trade + MIN_VOLUME_GLOBAL as a rough dollar-vol approximation.
+    Periodic heartbeat:
+      • Shows per-bot "OK @ time"
+      • Shows global totals
+      • Shows per-bot scanned / matches / alerts
+      • Shows top 3 by scanned (heaviest bots)
     """
-    if not POLYGON_KEY:
-        print("[shared] POLYGON_KEY missing; cannot fetch last trade.")
-        return None, None
-
-    key = symbol.upper()
-    now_ts = time.time()
-    entry = _LAST_TRADE_CACHE.get(key)
-    if entry and isinstance(entry.ts, (int, float)) and now_ts - float(entry.ts) < ttl_seconds:
-        return entry.last, entry.dollar_vol
-
-    url = f"https://api.polygon.io/v2/last/trade/{symbol.upper()}"
-    params = {"apiKey": POLYGON_KEY}
-
-    data = _http_get_json(url, params, tag="shared:last_trade", timeout=15.0, retries=1)
-    if not data:
-        return None, None
-
-    results = data.get("results")
-    if isinstance(results, dict):
-        last_raw = results.get("p")
-    else:
-        last_raw = None
-
-    try:
-        last_price = float(last_raw) if last_raw is not None else None
-    except (TypeError, ValueError):
-        last_price = None
-
-    if last_price is None or last_price <= 0:
-        return None, None
-
-    dollar_vol = last_price * MIN_VOLUME_GLOBAL
-    _LAST_TRADE_CACHE[key] = LastTradeCacheEntry(ts=now_ts, last=last_price, dollar_vol=dollar_vol)
-    return last_price, dollar_vol
-
-
-# ---------------- OPTION CACHES ----------------
-
-@dataclass
-class OptionCacheEntry:
-    ts: float
-    data: Dict[str, Any]
-
-
-_OPTION_CACHE: Dict[str, OptionCacheEntry] = {}
-
-
-def _cache_key(prefix: str, identifier: str) -> str:
-    return f"{prefix}:{identifier}"
-
-
-def get_option_chain_cached(
-    underlying: str,
-    ttl_seconds: int = 90,
-) -> Optional[Dict[str, Any]]:
-    """Fetches Polygon snapshot option chain via HTTP and caches it.
-
-    Used by options_flow and any options-related logic.
-    """
-    if not POLYGON_KEY:
-        print("[shared] POLYGON_KEY missing; cannot fetch option chain.")
-        return None
-
-    key = _cache_key("chain", underlying.upper())
+    data = _load_stats()
+    bots = data.get("bots", {})
+    last_hb = float(data.get("last_heartbeat_ts", 0.0))
     now_ts = time.time()
 
-    entry = _OPTION_CACHE.get(key)
-    if isinstance(entry, OptionCacheEntry) and isinstance(entry.ts, (int, float)):
-        if now_ts - float(entry.ts) < ttl_seconds:
-            return entry.data
+    # Heartbeat interval guard
+    min_interval_sec = HEARTBEAT_INTERVAL_MIN * 60.0
+    if now_ts - last_hb < min_interval_sec:
+        print("[status_report] Heartbeat skipped (interval).")
+        return
 
-    url = f"https://api.polygon.io/v3/snapshot/options/{underlying.upper()}"
-    params = {"apiKey": POLYGON_KEY}
+    if not bots:
+        print("[status_report] no bot stats yet; skipping heartbeat.")
+        return
 
-    data = _http_get_json(url, params, tag="shared:option_chain", timeout=20.0, retries=1)
-    if not data:
-        return None
+    # Compute totals
+    total_scanned = 0
+    total_matched = 0
+    total_alerts = 0
 
-    _OPTION_CACHE[key] = OptionCacheEntry(ts=now_ts, data=data)
-    return data
+    # We'll also build a list for sorting by scans
+    bot_rows = []
+    for name, raw in bots.items():
+        scanned = int(raw.get("scanned", 0))
+        matched = int(raw.get("matched", 0))
+        alerts = int(raw.get("alerts", 0))
+        last_run_str = raw.get("last_run_str") or "N/A"
+        last_runtime = float(raw.get("last_runtime", 0.0))
 
+        total_scanned += scanned
+        total_matched += matched
+        total_alerts += alerts
 
-def get_last_option_trades_cached(
-    full_option_symbol: str,
-    ttl_seconds: int = 45,
-) -> Optional[Dict[str, Any]]:
-    """
-    Fetches the last option trade for a specific contract (v3 last/trade).
+        bot_rows.append(
+            {
+                "name": name,
+                "scanned": scanned,
+                "matched": matched,
+                "alerts": alerts,
+                "last_run_str": last_run_str,
+                "last_runtime": last_runtime,
+            }
+        )
 
-    Improvements:
-      • Slightly longer timeout (default ~20s).
-      • One retry with backoff.
-      • 404 is treated as benign (no status spam).
-    """
-    if not POLYGON_KEY:
-        print("[shared] POLYGON_KEY missing; cannot fetch last option trades.")
-        return None
+    # Sort for display: by name for status list, by scanned desc for "heaviest"
+    bot_rows_by_name = sorted(bot_rows, key=lambda r: r["name"])
+    bot_rows_by_scans = sorted(bot_rows, key=lambda r: r["scanned"], reverse=True)
 
-    key = _cache_key("last_trade", full_option_symbol)
-    now_ts = time.time()
+    # ---------------- BUILD HEARTBEAT TEXT ----------------
 
-    entry = _OPTION_CACHE.get(key)
-    if isinstance(entry, OptionCacheEntry) and isinstance(entry.ts, (int, float)):
-        if now_ts - float(entry.ts) < ttl_seconds:
-            return entry.data
+    ts_str = now_est()
 
-    # ✅ Correct Polygon options last-trade endpoint
-    url = f"https://api.polygon.io/v3/last/trade/options/{full_option_symbol}"
-    params = {"apiKey": POLYGON_KEY}
+    lines: list[str] = []
+    lines.append("📡 MoneySignalAI Heartbeat ❤️")
+    lines.append(f"⏰ {ts_str}")
+    lines.append("────────────────")
+    lines.append("✅ ALL SYSTEMS GOOD")
+    lines.append("")
+    lines.append("🤖 Bot Status:")
 
-    timeout = 20.0
-    retries = 1
-    backoff_seconds = 2.5
+    # Per-bot status line, like before
+    for r in bot_rows_by_name:
+        name = r["name"]
+        last_run_str = r["last_run_str"]
+        lines.append(f"• ✅ {name}: OK @ {last_run_str}")
 
-    for attempt in range(retries + 1):
-        try:
-            resp = requests.get(url, params=params, timeout=timeout)
-            if resp.status_code == 404:
-                # Benign: no last option trade exists yet for this contract.
-                return None
-            resp.raise_for_status()
-            data = resp.json()
-            _OPTION_CACHE[key] = OptionCacheEntry(ts=now_ts, data=data)
-            return data
-        except Exception as e:
-            if attempt < retries:
-                wait = backoff_seconds * (attempt + 1)
-                print(
-                    f"[shared:last_option_trade] HTTP error on attempt "
-                    f"{attempt+1}/{retries+1}: {e} — retrying in {wait:.1f}s"
-                )
-                time.sleep(wait)
-            else:
-                msg = f"[shared] error fetching last option trade for {full_option_symbol}: {e}"
-                print(msg)
-                report_status_error("shared:last_option_trade", msg)
-                return None
+    lines.append("────────────────")
+    lines.append("📊 Scanner Analytics:")
+    lines.append(f"• Total scanned: **{total_scanned:,}**")
+    lines.append(f"• Filter matches: **{total_matched:,}**")
+    lines.append(f"• Alerts fired: **{total_alerts:,}**")
+    lines.append("")
+    lines.append("📈 Per-bot metrics:")
+    for r in bot_rows_by_name:
+        lines.append(
+            f"• {r['name']}: "
+            f"scanned={r['scanned']:,} | matches={r['matched']:,} | alerts={r['alerts']:,}"
+        )
 
-    return None
+    # Top 3 heavy bots by scans (keep your existing vibe)
+    top3 = bot_rows_by_scans[:3]
+    if top3:
+        lines.append("────────────────")
+        lines.append("🥵 Top 3 Heaviest Bots (by scans):")
+        for r in top3:
+            lines.append(f"• {r['name']}: {r['scanned']:,} scanned")
 
+    text = "\n".join(lines)
 
-# Legacy camelCase aliases
-def getOptionChainCached(underlying: str, ttl_seconds: int = 60):
-    return get_option_chain_cached(underlying, ttl_seconds=ttl_seconds)
+    _send_telegram_status(text)
 
+    # Update heartbeat timestamp
+    data["last_heartbeat_ts"] = now_ts
+    _save_stats(data)
 
-def getLastOptionTradesCached(full_option_symbol: str, ttl_seconds: int = 30):
-    return get_last_option_trades_cached(full_option_symbol, ttl_seconds=ttl_seconds)
-
-
-# ---------------- CHART LINK ----------------
-
-
-def chart_link(symbol: str) -> str:
-    return f"https://www.tradingview.com/chart/?symbol={symbol.upper()}"
-
-
-# ---------------- GRADING ----------------
-
-
-def grade_equity_setup(
-    move_pct: float,
-    rvol: float,
-    dollar_vol: float,
-) -> str:
-    """Simple letter grade: A+ / A / B / C based on strength."""
-    score = 0.0
-
-    score += max(0.0, min(rvol / 2.0, 3.0))  # up to 3 points
-    score += max(0.0, min(abs(move_pct) / 3.0, 3.0))  # up to 3
-    score += max(0.0, min(math.log10(max(dollar_vol, 1.0)) - 6.0, 2.0))  # up to 2
-
-    if score >= 7.0:
-        return "A+"
-    if score >= 5.5:
-        return "A"
-    if score >= 4.0:
-        return "B"
-    return "C"
-
-
-# ---------------- TIME WINDOWS HELPERS ----------------
-
-
-def is_between_times(
-    start_h: int,
-    start_m: int,
-    end_h: int,
-    end_m: int,
-    tz: pytz.timezone,
-) -> bool:
-    now = datetime.now(tz)
-    mins = now.hour * 60 + now.minute
-    start = start_h * 60 + start_m
-    end = end_h * 60 + end_m
-    return start <= mins <= end
-
-
-def is_rth() -> bool:
-    """Regular trading hours 09:30–16:00 ET."""
-    return is_between_times(9, 30, 16, 0, eastern)
-
-
-def is_premarket() -> bool:
-    return is_between_times(4, 0, 9, 29, eastern)
-
-
-def is_postmarket() -> bool:
-    return is_between_times(16, 1, 20, 0, eastern)
+    print("[status_report] Heartbeat sent.")
