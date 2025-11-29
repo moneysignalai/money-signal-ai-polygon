@@ -41,6 +41,7 @@ BOTS = [
 ]
 
 
+
 @app.get("/")
 def root():
     """Simple health endpoint for Render / browser checks."""
