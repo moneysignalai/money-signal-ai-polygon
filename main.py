@@ -18,19 +18,13 @@ def now_est_str() -> str:
 app = FastAPI()
 
 # ---------------- CONFIG ----------------
-
-# How often to run a full scan cycle (seconds).
-SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "30"))
-
-# Per-bot hard timeout in seconds so a slow request can't block the whole cycle.
-BOT_TIMEOUT_SECONDS = int(os.getenv("BOT_TIMEOUT_SECONDS", "40"))
-
 # Ordered list of all bots we want to run every cycle.
 # (public_name, module_path, function_name)
 BOTS = [
     ("premarket", "bots.premarket", "run_premarket"),
     ("equity_flow", "bots.equity_flow", "run_equity_flow"),
     ("intraday_flow", "bots.intraday_flow", "run_intraday_flow"),
+    ("rsi_signals", "bots.rsi_signals", "run_rsi_signals"),
     ("opening_range_breakout", "bots.openingrangebreakout", "run_opening_range_breakout"),
     ("options_flow", "bots.options_flow", "run_options_flow"),
     ("options_indicator", "bots.options_indicator", "run_options_indicator"),
@@ -39,7 +33,6 @@ BOTS = [
     ("trend_flow", "bots.trend_flow", "run_trend_flow"),
     ("dark_pool_radar", "bots.dark_pool_radar", "run_dark_pool_radar"),
 ]
-
 
 
 @app.get("/")
