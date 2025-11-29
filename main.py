@@ -8,6 +8,8 @@ import pytz
 import uvicorn
 from fastapi import FastAPI
 
+# ----------------- Time helpers -----------------
+
 eastern = pytz.timezone("US/Eastern")
 
 
@@ -15,9 +17,11 @@ def now_est_str() -> str:
     return datetime.now(eastern).strftime("%I:%M %p EST · %b %d").lstrip("0")
 
 
-app = FastAPI()
+# ----------------- Global config -----------------
 
-# ---------------- CONFIG ----------------
+SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "20"))
+BOT_TIMEOUT_SECONDS = int(os.getenv("BOT_TIMEOUT_SECONDS", "40"))
+
 # Ordered list of all bots we want to run every cycle.
 # (public_name, module_path, function_name)
 BOTS = [
@@ -35,160 +39,106 @@ BOTS = [
     ("daily_ideas", "bots.daily_ideas", "run_daily_ideas"),
 ]
 
+# ----------------- FastAPI app -----------------
+
+app = FastAPI(title="MoneySignalAI", version="1.0.0")
+
 
 @app.get("/")
-def root():
-    """Simple health endpoint for Render / browser checks."""
+async def root():
+    """
+    Basic status endpoint.
+    """
     return {
-        "status": "LIVE",
-        "timestamp": now_est_str(),
+        "status": "ok",
+        "now_est": now_est_str(),
         "scan_interval_seconds": SCAN_INTERVAL_SECONDS,
         "bot_timeout_seconds": BOT_TIMEOUT_SECONDS,
-        "bots": [name for name, _, _ in BOTS] + ["status_report"],
+        "bots": [b[0] for b in BOTS],
     }
 
 
-async def run_all_once():
-    """
-    Run one full scan cycle.
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "now_est": now_est_str()}
 
-    Steps:
-      1) Import status_report so we can forward errors and log bot runs.
-      2) Import every bot in BOTS and schedule its coroutine (wrapped with timeout).
-      3) Schedule status_report.run_status_report() as another coroutine if available.
-      4) Await all tasks with asyncio.gather(return_exceptions=True).
-      5) For each result, forward status to status_report.
-    """
-    record_error = None
-    run_status = None
-    log_bot_run = None
 
+# ----------------- Scheduler logic -----------------
+
+
+async def _run_single_bot(public_name: str, module_path: str, func_name: str, record_error):
+    """
+    Import and run a single bot with a per-bot timeout.
+    """
     try:
-        status_mod = importlib.import_module("bots.status_report")
-        record_error = getattr(status_mod, "record_bot_error", None)
-        run_status = getattr(status_mod, "run_status_report", None)
-        log_bot_run = getattr(status_mod, "log_bot_run", None)
-    except Exception as e:
-        print("[main] ERROR importing bots.status_report:", e)
+        module = importlib.import_module(module_path)
+        func = getattr(module, func_name, None)
+        if func is None:
+            raise AttributeError(f"{module_path} has no attribute {func_name}")
 
-    tasks = []
-    names = []
-
-    # 2) Import every bot and schedule its run_* coroutine (with timeout wrapper)
-    for public_name, module_path, func_name in BOTS:
-        try:
-            mod = importlib.import_module(module_path)
-            fn = getattr(mod, func_name, None)
-            if fn is None:
-                raise AttributeError(f"{module_path}.{func_name} not found")
-
-            print(f"[main] scheduling bot '{public_name}' ({module_path}.{func_name})")
-
-            maybe_coro = fn()
-            if asyncio.iscoroutine(maybe_coro):
-                task = asyncio.wait_for(maybe_coro, timeout=BOT_TIMEOUT_SECONDS)
-            else:
-                async def _run_sync(sync_fn=fn):
-                    loop = asyncio.get_running_loop()
-                    return await loop.run_in_executor(None, sync_fn)
-
-                task = asyncio.wait_for(_run_sync(), timeout=BOT_TIMEOUT_SECONDS)
-
-            tasks.append(task)
-            names.append(public_name)
-        except Exception as e:
-            print(f"[main] ERROR importing/initializing bot {public_name} ({module_path}.{func_name}): {e}")
-            if record_error:
-                try:
-                    record_error(public_name, e)
-                except Exception as inner:
-                    print("[main] ERROR while recording bot import error:", inner)
-
-    # 3) Add status_report as another async task if available
-    if run_status is not None:
-        try:
-            print("[main] scheduling bot 'status_report' (bots.status_report.run_status_report)")
-            status_coro = run_status()
-            if asyncio.iscoroutine(status_coro):
-                status_task = asyncio.wait_for(status_coro, timeout=BOT_TIMEOUT_SECONDS)
-            else:
-                async def _run_status_sync(sf=run_status):
-                    loop = asyncio.get_running_loop()
-                    return await loop.run_in_executor(None, sf)
-
-                status_task = asyncio.wait_for(_run_status_sync(), timeout=BOT_TIMEOUT_SECONDS)
-
-            tasks.append(status_task)
-            names.append("status_report")
-        except Exception as e:
-            print("[main] ERROR scheduling status_report:", e)
-            if record_error:
-                try:
-                    record_error("status_report", e)
-                except Exception as inner:
-                    print("[main] ERROR while recording status_report scheduling error:", inner)
-
-    if not tasks:
-        print("[main] No bot tasks scheduled in this cycle.")
-        return
-
-    # 4) Run all bots concurrently
-    print(f"[main] running {len(tasks)} bot tasks concurrently...")
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    # 5) Interpret results and forward to status_report
-    for name, result in zip(names, results):
-        if isinstance(result, Exception):
-            print(f"[ERROR] Bot {name} raised: {result}")
-            if record_error:
-                try:
-                    record_error(name, result)
-                except Exception as inner:
-                    print("[main] ERROR while recording bot runtime error:", inner)
-            if log_bot_run:
-                try:
-                    log_bot_run(name, "error")
-                except Exception as inner:
-                    print("[main] ERROR while logging bot run (error):", inner)
+        # If the bot function is async, await it; otherwise run in thread pool.
+        if asyncio.iscoroutinefunction(func):
+            await asyncio.wait_for(func(), timeout=BOT_TIMEOUT_SECONDS)
         else:
-            print(f"[main] bot '{name}' completed cycle without crash")
-            if log_bot_run:
-                try:
-                    log_bot_run(name, "ok")
-                except Exception as inner:
-                    print("[main] ERROR while logging bot run (ok):", inner)
+            loop = asyncio.get_running_loop()
+            await asyncio.wait_for(loop.run_in_executor(None, func), timeout=BOT_TIMEOUT_SECONDS)
+
+    except Exception as e:
+        print(f"[main] ERROR running bot {public_name} ({module_path}.{func_name}): {e}")
+        if record_error is not None:
+            try:
+                record_error(public_name, e)
+            except Exception as inner:
+                print("[main] ERROR while recording bot error:", inner)
 
 
 async def scheduler_loop(interval_seconds: int = SCAN_INTERVAL_SECONDS):
-    """Main scheduler loop."""
-    cycle = 0
-    print(
-        f"[main] MoneySignalAI scheduler starting at {now_est_str()} "
-        f"with interval={interval_seconds}s, bot_timeout={BOT_TIMEOUT_SECONDS}s"
-    )
+    """
+    Main async loop that runs all bots in parallel every `interval_seconds`.
+    """
+    print(f"[main] scheduler_loop starting with interval={interval_seconds}s, bot_timeout={BOT_TIMEOUT_SECONDS}s")
+
+    # Lazy import status_report helpers so we can log errors & send heartbeat
+    try:
+        from bots.status_report import run_status, record_error
+    except Exception as e:
+        print(f"[main] WARNING: could not import bots.status_report: {e}")
+        run_status = None  # type: ignore
+        record_error = None  # type: ignore
 
     while True:
-        cycle += 1
-        print(
-            f"[main] SCANNING CYCLE #{cycle} — "
-            "Premarket, EquityFlow, IntradayFlow, OpeningRangeBreakout, "
-            "OptionsFlow, OptionsIndicator, Squeeze, Earnings, TrendFlow, "
-            "DarkPool, Status"
-        )
-        try:
-            await run_all_once()
-        except Exception as e:
-            print("[main] FATAL error in run_all_once():", e)
+        start_ts = datetime.now(eastern)
+        print(f"[main] scheduler cycle starting at {start_ts.strftime('%H:%M:%S')} ET")
 
-        print(
-            f"[main] cycle #{cycle} finished at {now_est_str()} — "
-            f"sleeping {interval_seconds} seconds before next scan."
-        )
+        tasks = []
+
+        # 1) schedule all trading bots
+        for public_name, module_path, func_name in BOTS:
+            task = asyncio.create_task(_run_single_bot(public_name, module_path, func_name, record_error))
+            tasks.append(task)
+
+        # 2) schedule status_report.run_status, if available
+        if run_status is not None:
+            try:
+                tasks.append(asyncio.create_task(run_status()))
+            except Exception as e:
+                print(f"[main] ERROR scheduling run_status: {e}")
+
+        # 3) wait for all tasks to complete (errors are logged inside the tasks)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        end_ts = datetime.now(eastern)
+        elapsed = (end_ts - start_ts).total_seconds()
+        print(f"[main] scheduler cycle finished in {elapsed:.2f}s; sleeping {interval_seconds}s")
+
         await asyncio.sleep(interval_seconds)
 
 
 def _start_background_scheduler():
-    """Starts the asyncio scheduler loop in a background thread."""
+    """
+    Run the async scheduler loop in a dedicated background thread.
+    """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(scheduler_loop())
