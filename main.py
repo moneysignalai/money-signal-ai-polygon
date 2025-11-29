@@ -32,6 +32,7 @@ BOTS = [
     ("earnings", "bots.earnings", "run_earnings"),
     ("trend_flow", "bots.trend_flow", "run_trend_flow"),
     ("dark_pool_radar", "bots.dark_pool_radar", "run_dark_pool_radar"),
+    ("daily_ideas", "bots.daily_ideas", "run_daily_ideas"),
 ]
 
 
