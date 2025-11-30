@@ -3,6 +3,7 @@ import threading
 import asyncio
 import importlib
 from datetime import datetime
+from typing import Dict, Tuple, List
 
 import pytz
 import uvicorn
@@ -19,25 +20,63 @@ def now_est_str() -> str:
 
 # ----------------- Global config -----------------
 
+# Default global base polling interval (used as minimum sleep)
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "20"))
 BOT_TIMEOUT_SECONDS = int(os.getenv("BOT_TIMEOUT_SECONDS", "40"))
 
-# Ordered list of all bots we want to run every cycle.
-# (public_name, module_path, function_name)
-BOTS = [
-    ("premarket", "bots.premarket", "run_premarket"),
-    ("equity_flow", "bots.equity_flow", "run_equity_flow"),
-    ("intraday_flow", "bots.intraday_flow", "run_intraday_flow"),
-    ("rsi_signals", "bots.rsi_signals", "run_rsi_signals"),
-    ("opening_range_breakout", "bots.openingrangebreakout", "run_opening_range_breakout"),
-    ("options_flow", "bots.options_flow", "run_options_flow"),
-    ("options_indicator", "bots.options_indicator", "run_options_indicator"),
-    ("squeeze", "bots.squeeze", "run_squeeze"),
-    ("earnings", "bots.earnings", "run_earnings"),
-    ("trend_flow", "bots.trend_flow", "run_trend_flow"),
-    ("dark_pool_radar", "bots.dark_pool_radar", "run_dark_pool_radar"),
-    ("daily_ideas", "bots.daily_ideas", "run_daily_ideas"),
+# Per-bot interval can be overridden via env:
+#   <BOTNAME_UPPER>_INTERVAL, e.g. OPTIONS_FLOW_INTERVAL=20
+def _interval_env(bot_name: str, default: int) -> int:
+    key = f"{bot_name.upper()}_INTERVAL"
+    try:
+        v = int(os.getenv(key, str(default)))
+        return max(5, v)  # safety: minimum 5s
+    except Exception:
+        return default
+
+
+# DISABLED_BOTS: comma-separated list, e.g. "daily_ideas,options_indicator"
+DISABLED_BOTS = {
+    b.strip().lower()
+    for b in os.getenv("DISABLED_BOTS", "").replace(" ", "").split(",")
+    if b.strip()
+}
+
+# TEST_MODE_BOTS: comma-separated list of bots that should be considered "test only"
+# (we'll surface this in status; bots can also check this via shared if needed)
+TEST_MODE_BOTS = {
+    b.strip().lower()
+    for b in os.getenv("TEST_MODE_BOTS", "").replace(" ", "").split(",")
+    if b.strip()
+}
+
+# ----------------- Bot registry -----------------
+# (public_name, module_path, function_name, default_interval_seconds)
+
+_BOT_DEFS: List[Tuple[str, str, str, int]] = [
+    ("premarket", "bots.premarket", "run_premarket", 60),
+    ("equity_flow", "bots.equity_flow", "run_equity_flow", 20),
+    ("intraday_flow", "bots.intraday_flow", "run_intraday_flow", 20),
+    ("rsi_signals", "bots.rsi_signals", "run_rsi_signals", 20),
+    ("opening_range_breakout", "bots.openingrangebreakout", "run_opening_range_breakout", 20),
+    ("options_flow", "bots.options_flow", "run_options_flow", 20),
+    ("options_indicator", "bots.options_indicator", "run_options_indicator", 60),
+    ("squeeze", "bots.squeeze", "run_squeeze", 60),
+    ("earnings", "bots.earnings", "run_earnings", 300),
+    ("trend_flow", "bots.trend_flow", "run_trend_flow", 60),
+    ("dark_pool_radar", "bots.dark_pool_radar", "run_dark_pool_radar", 60),
+    ("daily_ideas", "bots.daily_ideas", "run_daily_ideas", 600),
 ]
+
+# Final BOTS list with resolved intervals (after env overrides & disabled filter)
+# (public_name, module_path, function_name, interval_seconds)
+BOTS: List[Tuple[str, str, str, int]] = []
+for name, mod, func, base_interval in _BOT_DEFS:
+    if name.lower() in DISABLED_BOTS:
+        continue
+    interval = _interval_env(name, base_interval)
+    BOTS.append((name, mod, func, interval))
+
 
 # ----------------- FastAPI app -----------------
 
@@ -54,7 +93,17 @@ async def root():
         "now_est": now_est_str(),
         "scan_interval_seconds": SCAN_INTERVAL_SECONDS,
         "bot_timeout_seconds": BOT_TIMEOUT_SECONDS,
-        "bots": [b[0] for b in BOTS],
+        "bots": [
+            {
+                "name": name,
+                "module": module,
+                "func": func,
+                "interval": interval,
+                "disabled": name.lower() in DISABLED_BOTS,
+                "test_mode": name.lower() in TEST_MODE_BOTS,
+            }
+            for (name, module, func, interval) in _BOT_DEFS
+        ],
     }
 
 
@@ -64,7 +113,6 @@ async def health():
 
 
 # ----------------- Scheduler logic -----------------
-
 
 async def _run_single_bot(public_name: str, module_path: str, func_name: str, record_error):
     """
@@ -92,11 +140,16 @@ async def _run_single_bot(public_name: str, module_path: str, func_name: str, re
                 print("[main] ERROR while recording bot error:", inner)
 
 
-async def scheduler_loop(interval_seconds: int = SCAN_INTERVAL_SECONDS):
+async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS):
     """
-    Main async loop that runs all bots in parallel every `interval_seconds`.
+    Main async loop that runs bots on their own cadence.
+
+    Each bot has its own interval, but we tick the loop every `base_interval_seconds`.
     """
-    print(f"[main] scheduler_loop starting with interval={interval_seconds}s, bot_timeout={BOT_TIMEOUT_SECONDS}s")
+    print(
+        f"[main] scheduler_loop starting with base_interval={base_interval_seconds}s, "
+        f"bot_timeout={BOT_TIMEOUT_SECONDS}s"
+    )
 
     # Lazy import status_report helpers so we can log errors & send heartbeat
     try:
@@ -106,16 +159,45 @@ async def scheduler_loop(interval_seconds: int = SCAN_INTERVAL_SECONDS):
         run_status = None  # type: ignore
         record_error = None  # type: ignore
 
+    # Per-bot next-run timestamps
+    next_run_ts: Dict[str, float] = {}
+    now_ts = time_now = datetime.now(eastern).timestamp()
+    for name, _, _, interval in BOTS:
+        # Run everything once on startup
+        next_run_ts[name] = time_now
+
+    # Log configuration
+    print("[main] Bot configuration:")
+    for name, module_path, func_name, interval in _BOT_DEFS:
+        state = []
+        if name.lower() in DISABLED_BOTS:
+            state.append("DISABLED")
+        if name.lower() in TEST_MODE_BOTS:
+            state.append("TEST_MODE")
+        state_str = f" ({', '.join(state)})" if state else ""
+        effective_interval = _interval_env(name, interval)
+        print(f"  - {name}: {module_path}.{func_name}, interval={effective_interval}s{state_str}")
+
+    import time
+
     while True:
-        start_ts = datetime.now(eastern)
-        print(f"[main] scheduler cycle starting at {start_ts.strftime('%H:%M:%S')} ET")
+        cycle_start_dt = datetime.now(eastern)
+        cycle_start_ts = cycle_start_dt.timestamp()
+        print(f"[main] scheduler cycle starting at {cycle_start_dt.strftime('%H:%M:%S')} ET")
 
-        tasks = []
+        tasks: List[asyncio.Task] = []
 
-        # 1) schedule all trading bots
-        for public_name, module_path, func_name in BOTS:
-            task = asyncio.create_task(_run_single_bot(public_name, module_path, func_name, record_error))
-            tasks.append(task)
+        # 1) schedule bots whose next_run_ts is due
+        for name, module_path, func_name, interval in BOTS:
+            due_ts = next_run_ts.get(name, 0.0)
+            if cycle_start_ts >= due_ts:
+                print(f"[main] scheduling bot {name} (interval={interval}s)")
+                tasks.append(
+                    asyncio.create_task(
+                        _run_single_bot(name, module_path, func_name, record_error)
+                    )
+                )
+                next_run_ts[name] = cycle_start_ts + interval
 
         # 2) schedule status_report.run_status, if available
         if run_status is not None:
@@ -124,15 +206,15 @@ async def scheduler_loop(interval_seconds: int = SCAN_INTERVAL_SECONDS):
             except Exception as e:
                 print(f"[main] ERROR scheduling run_status: {e}")
 
-        # 3) wait for all tasks to complete (errors are logged inside the tasks)
+        # 3) wait for all tasks to complete (errors logged inside tasks)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-        end_ts = datetime.now(eastern)
-        elapsed = (end_ts - start_ts).total_seconds()
-        print(f"[main] scheduler cycle finished in {elapsed:.2f}s; sleeping {interval_seconds}s")
+        cycle_end_dt = datetime.now(eastern)
+        elapsed = (cycle_end_dt - cycle_start_dt).total_seconds()
+        print(f"[main] scheduler cycle finished in {elapsed:.2f}s; sleeping {base_interval_seconds}s")
 
-        await asyncio.sleep(interval_seconds)
+        await asyncio.sleep(base_interval_seconds)
 
 
 def _start_background_scheduler():
@@ -150,11 +232,10 @@ async def startup_event():
     print(f"[main] startup_event fired at {now_est_str()}")
     print(
         f"[main] launching background scheduler thread "
-        f"(interval={SCAN_INTERVAL_SECONDS}s, bot_timeout={BOT_TIMEOUT_SECONDS}s)"
+        f"(base_interval={SCAN_INTERVAL_SECONDS}s, bot_timeout={BOT_TIMEOUT_SECONDS}s)"
     )
     threading.Thread(target=_start_background_scheduler, daemon=True).start()
 
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
-    
