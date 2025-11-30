@@ -16,8 +16,10 @@ STATS_PATH = os.getenv("STATUS_STATS_PATH", "/tmp/moneysignal_stats.json")
 # Heartbeat minimum interval (minutes)
 HEARTBEAT_INTERVAL_MIN = float(os.getenv("STATUS_HEARTBEAT_INTERVAL_MIN", "5"))
 
-# Debug flag: if true, we force a heartbeat every scheduler cycle
-DEBUG_STATUS_PING_ENABLED = os.getenv("DEBUG_STATUS_PING_ENABLED", "false").lower() == "true"
+# Optional debug flag: when true, always try to send heartbeat every scheduler cycle
+DEBUG_STATUS_PING_ENABLED = (
+    os.getenv("DEBUG_STATUS_PING_ENABLED", "false").lower() == "true"
+)
 
 # Telegram routing (reuse same envs you already use)
 TELEGRAM_CHAT_ALL = os.getenv("TELEGRAM_CHAT_ALL")
@@ -112,7 +114,10 @@ def record_bot_stats(
     data["bots"] = bots
 
     _save_stats(data)
-    print(f"[status_report] stats recorded for {bot_name}: scanned={scanned} matched={matched} alerts={alerts}")
+    print(
+        f"[status_report] stats recorded for {bot_name}: "
+        f"scanned={scanned} matched={matched} alerts={alerts}"
+    )
 
 
 def record_error(bot_name: str, exc: Exception) -> None:
@@ -148,7 +153,10 @@ def record_error(bot_name: str, exc: Exception) -> None:
 def _send_telegram_status(text: str) -> None:
     """Send heartbeat/status text to Telegram, if configured."""
     if not _TELEGRAM_STATUS_TOKEN or not TELEGRAM_CHAT_ALL:
-        print("[status_report] Telegram status token or chat ID not set; printing instead:")
+        print(
+            "[status_report] Telegram status token or chat ID not set; "
+            "printing instead:"
+        )
         print(text)
         return
 
@@ -161,7 +169,10 @@ def _send_telegram_status(text: str) -> None:
         }
         resp = requests.post(url, json=payload, timeout=10)
         if resp.status_code != 200:
-            print(f"[status_report] Telegram send failed: {resp.status_code} {resp.text}")
+            print(
+                f"[status_report] Telegram send failed: "
+                f"{resp.status_code} {resp.text}"
+            )
     except Exception as e:
         print(f"[status_report] Telegram send error: {e}")
 
@@ -226,15 +237,15 @@ def _format_heartbeat() -> str:
     lines.append("")
     lines.append("🤖 *Bot Status:*")
 
-    from bots.shared import is_bot_test_mode, is_bot_disabled  # local import to avoid cycles
-
     for r in bot_rows:
         name = r["name"]
         last_run_ts = r["last_run_ts"]
         last_run_str = r["last_run_str"]
 
-        # Mark test-mode / disabled bots in label
+        # Mark test-mode bots (if any) with an icon
         name_display = name
+        from bots.shared import is_bot_test_mode, is_bot_disabled  # safe small import
+
         if is_bot_disabled(name):
             name_display = f"{name} (DISABLED)"
         elif is_bot_test_mode(name):
@@ -251,8 +262,8 @@ def _format_heartbeat() -> str:
     lines.append(f"• Filter matches: **{total_matched:,}**")
     lines.append(f"• Alerts fired: **{total_alerts:,}**")
     lines.append("")
-    lines.append("📈 *Per-bot metrics:*")
 
+    lines.append("📈 *Per-bot metrics:*")
     for r in bot_rows:
         lines.append(
             f"• {r['name']}: scanned={r['scanned']:,} | "
@@ -261,8 +272,7 @@ def _format_heartbeat() -> str:
 
     # Bots that are scanning a lot but never alert (helps you tune filters)
     high_scan_low_alert = [
-        r for r in bot_rows
-        if r["scanned"] >= 200 and r["alerts"] == 0
+        r for r in bot_rows if r["scanned"] >= 200 and r["alerts"] == 0
     ]
     if high_scan_low_alert:
         lines.append("────────────────")
@@ -282,8 +292,7 @@ def _format_heartbeat() -> str:
     # Optional: recent errors within last 60 minutes
     now_ts = time.time()
     recent_errors = [
-        e for e in errors_data
-        if now_ts - float(e.get("ts", 0.0)) <= 60 * 60
+        e for e in errors_data if now_ts - float(e.get("ts", 0.0)) <= 60 * 60
     ]
     if recent_errors:
         lines.append("────────────────")
@@ -307,21 +316,30 @@ async def run_status() -> None:
 
     Applies a minimum interval between heartbeats and sends a Telegram
     status message when it's time.
-
-    When DEBUG_STATUS_PING_ENABLED=true, we *always* send a heartbeat
-    every time main.py schedules us, ignoring the min interval.
     """
     data = _load_stats()
     last_hb = float(data.get("last_heartbeat_ts", 0.0))
     now_ts = time.time()
+    min_interval_sec = HEARTBEAT_INTERVAL_MIN * 60.0
+    delta = now_ts - last_hb
 
-    if DEBUG_STATUS_PING_ENABLED:
-        print("[status_report] DEBUG_STATUS_PING_ENABLED=true — forcing heartbeat this cycle.")
-    else:
-        min_interval_sec = HEARTBEAT_INTERVAL_MIN * 60.0
-        if now_ts - last_hb < min_interval_sec:
-            print("[status_report] Heartbeat skipped (interval).")
+    # Loud debug so you can see this run in logs
+    print(
+        f"[status_report] run_status tick — "
+        f"last_hb={last_hb:.1f}, delta={delta:.1f}s, "
+        f"min_interval={min_interval_sec:.1f}s, "
+        f"DEBUG_STATUS_PING_ENABLED={DEBUG_STATUS_PING_ENABLED}"
+    )
+
+    if not DEBUG_STATUS_PING_ENABLED:
+        if delta < min_interval_sec:
+            print("[status_report] Heartbeat skipped (interval gate).")
             return
+    else:
+        print(
+            "[status_report] DEBUG_STATUS_PING_ENABLED is TRUE → "
+            "forcing heartbeat this cycle."
+        )
 
     text = _format_heartbeat()
     _send_telegram_status(text)
