@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass, asdict
 from typing import Dict, Any, List
 
-from bots.shared import now_est  # reuse your EST timestamp helper
+from bots.shared import now_est, is_bot_test_mode, is_bot_disabled
 
 import requests
 
@@ -16,10 +16,7 @@ STATS_PATH = os.getenv("STATUS_STATS_PATH", "/tmp/moneysignal_stats.json")
 # Heartbeat minimum interval (minutes)
 HEARTBEAT_INTERVAL_MIN = float(os.getenv("STATUS_HEARTBEAT_INTERVAL_MIN", "5"))
 
-# Optional debug flag so you can see heartbeat text in logs
-DEBUG_STATUS_PING_ENABLED = os.getenv("DEBUG_STATUS_PING_ENABLED", "false").lower() == "true"
-
-# Telegram routing (reuse same envs you already use)
+# Telegram routing (reuse your envs)
 TELEGRAM_CHAT_ALL = os.getenv("TELEGRAM_CHAT_ALL")
 TELEGRAM_TOKEN_STATUS = os.getenv("TELEGRAM_TOKEN_STATUS")
 TELEGRAM_TOKEN_ALERTS = os.getenv("TELEGRAM_TOKEN_ALERTS")
@@ -146,41 +143,26 @@ def record_error(bot_name: str, exc: Exception) -> None:
 
 
 def _send_telegram_status(text: str) -> None:
-    """Send heartbeat/status text to Telegram, if configured."""
-    if DEBUG_STATUS_PING_ENABLED:
-        print("[status_report] DEBUG_STATUS_PING_ENABLED=true — heartbeat text:")
-        print(text)
+    """
+    Send heartbeat/status text to Telegram, if configured.
 
+    NOTE: we send as plain text (no Markdown) to avoid 'can't parse entities' errors.
+    """
     if not _TELEGRAM_STATUS_TOKEN or not TELEGRAM_CHAT_ALL:
         print("[status_report] Telegram status token or chat ID not set; printing instead:")
         print(text)
         return
 
-    url = f"https://api.telegram.org/bot{_TELEGRAM_STATUS_TOKEN}/sendMessage"
-
-    # 1) Try Markdown formatting
     try:
-        payload_md = {
+        url = f"https://api.telegram.org/bot{_TELEGRAM_STATUS_TOKEN}/sendMessage"
+        payload = {
             "chat_id": TELEGRAM_CHAT_ALL,
             "text": text,
-            "parse_mode": "Markdown",
+            # No parse_mode to keep things simple and robust
         }
-        resp = requests.post(url, json=payload_md, timeout=10)
-        if resp.status_code == 200:
-            return
-
-        # If Markdown fails, fall back to plain text
-        print(f"[status_report] Telegram send (Markdown) failed: {resp.status_code} {resp.text}")
-        print("[status_report] Retrying heartbeat as plain text (no parse_mode).")
-
-        payload_plain = {
-            "chat_id": TELEGRAM_CHAT_ALL,
-            "text": text,
-        }
-        resp2 = requests.post(url, json=payload_plain, timeout=10)
-        if resp2.status_code != 200:
-            print(f"[status_report] Telegram send (plain) failed: {resp2.status_code} {resp2.text}")
-
+        resp = requests.post(url, json=payload, timeout=10)
+        if resp.status_code != 200:
+            print(f"[status_report] Telegram send failed: {resp.status_code} {resp.text}")
     except Exception as e:
         print(f"[status_report] Telegram send error: {e}")
 
@@ -192,6 +174,7 @@ def _format_heartbeat() -> str:
     • Always lists all bots from BOT_DISPLAY_ORDER, even if they have no stats yet.
     • Shows per-bot "OK @ time" or "no recent run".
     • Shows global totals and per-bot scanned/matched/alerts.
+    • Shows high-scan, zero-alert bots and top 3 heaviest.
     • Optionally includes recent errors.
     """
     data = _load_stats()
@@ -233,25 +216,22 @@ def _format_heartbeat() -> str:
     bot_rows_by_scans = sorted(bot_rows, key=lambda r: r["scanned"], reverse=True)
     top3 = [r for r in bot_rows_by_scans if r["scanned"] > 0][:3]
 
-    # Build message lines
+    # Build message lines (plain text, no Markdown entities)
     lines: List[str] = []
-    lines.append("📡 *MoneySignalAI Heartbeat* ❤️")
+    lines.append("📡 MoneySignalAI Heartbeat ❤️")
     lines.append(f"⏰ {now_est()}")
     lines.append("────────────────")
 
     # System-level status
     lines.append("✅ ALL SYSTEMS GOOD")
     lines.append("")
-    lines.append("🤖 *Bot Status:*")
-
-    from bots.shared import is_bot_test_mode, is_bot_disabled  # safe small import
+    lines.append("🤖 Bot Status:")
 
     for r in bot_rows:
         name = r["name"]
         last_run_ts = r["last_run_ts"]
         last_run_str = r["last_run_str"]
 
-        # Mark test-mode / disabled bots with suffix
         name_display = name
         if is_bot_disabled(name):
             name_display = f"{name} (DISABLED)"
@@ -264,13 +244,12 @@ def _format_heartbeat() -> str:
             lines.append(f"• ❔ {name_display}: no recent run")
 
     lines.append("────────────────")
-    lines.append("📊 *Scanner Analytics:*")
-    lines.append(f"• Total scanned: **{total_scanned:,}**")
-    lines.append(f"• Filter matches: **{total_matched:,}**")
-    lines.append(f"• Alerts fired: **{total_alerts:,}**")
+    lines.append("📊 Scanner Analytics:")
+    lines.append(f"• Total scanned: {total_scanned:,}")
+    lines.append(f"• Filter matches: {total_matched:,}")
+    lines.append(f"• Alerts fired: {total_alerts:,}")
     lines.append("")
-
-    lines.append("📈 *Per-bot metrics:*")
+    lines.append("📈 Per-bot metrics:")
     for r in bot_rows:
         lines.append(
             f"• {r['name']}: scanned={r['scanned']:,} | "
@@ -284,7 +263,7 @@ def _format_heartbeat() -> str:
     ]
     if high_scan_low_alert:
         lines.append("────────────────")
-        lines.append("🧐 *High-scan, zero-alert bots (tune filters?):*")
+        lines.append("🧐 High-scan, zero-alert bots (tune filters?):")
         for r in high_scan_low_alert:
             lines.append(
                 f"• {r['name']}: scanned={r['scanned']:,}, "
@@ -293,7 +272,7 @@ def _format_heartbeat() -> str:
 
     if top3:
         lines.append("────────────────")
-        lines.append("🥵 *Top 3 Heaviest Bots* (by scans):")
+        lines.append("🥵 Top 3 Heaviest Bots (by scans):")
         for r in top3:
             lines.append(f"• {r['name']}: {r['scanned']:,} scanned")
 
@@ -305,13 +284,12 @@ def _format_heartbeat() -> str:
     ]
     if recent_errors:
         lines.append("────────────────")
-        lines.append("⚠️ *Recent Errors (last 60 min):*")
+        lines.append("⚠️ Recent Errors (last 60 min):")
         for e in recent_errors[-5:]:  # show up to last 5
             bot = e.get("bot", "?")
             when = e.get("when", "?")
             etype = e.get("type", "?")
             msg = e.get("msg", "")
-            # keep error lines short-ish
             if len(msg) > 120:
                 msg = msg[:117] + "..."
             lines.append(f"• {bot} ({etype}) @ {when} → {msg}")
@@ -331,6 +309,15 @@ async def run_status() -> None:
     now_ts = time.time()
 
     min_interval_sec = HEARTBEAT_INTERVAL_MIN * 60.0
+
+    # Debug log so you can see heartbeat gating in logs
+    diff = now_ts - last_hb
+    print(
+        f"[status_report] run_status called: "
+        f"last_hb={last_hb:.0f}, now={now_ts:.0f}, "
+        f"diff={diff:.1f}s, min_interval={min_interval_sec:.1f}s"
+    )
+
     if now_ts - last_hb < min_interval_sec:
         print("[status_report] Heartbeat skipped (interval).")
         return
