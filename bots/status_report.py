@@ -5,13 +5,13 @@ import json
 import time
 import statistics
 from dataclasses import dataclass, asdict, field
-from typing import Dict, Any, List, Tuple
-
-from bots.shared import now_est  # reuse your EST timestamp helper
+from typing import Dict, Any, List, Optional
 
 import requests
 
-# ---------------- CONFIG ----------------
+from bots.shared import now_est, is_bot_test_mode, is_bot_disabled  # reuse existing helpers
+
+# ----------------- CONFIG -----------------
 
 # Where we persist per-bot stats between scans
 STATS_PATH = os.getenv("STATUS_STATS_PATH", "/tmp/moneysignal_stats.json")
@@ -19,10 +19,7 @@ STATS_PATH = os.getenv("STATUS_STATS_PATH", "/tmp/moneysignal_stats.json")
 # Heartbeat minimum interval (minutes)
 HEARTBEAT_INTERVAL_MIN = float(os.getenv("STATUS_HEARTBEAT_INTERVAL_MIN", "5"))
 
-# How many recent runtimes to keep per bot for median calc
-RUNTIME_HISTORY_DEPTH = int(os.getenv("STATUS_RUNTIME_HISTORY_DEPTH", "20"))
-
-# Optional extra console noise for debugging heartbeat behavior
+# Optional extra logging for heartbeat decisions
 DEBUG_STATUS_PING_ENABLED = os.getenv("DEBUG_STATUS_PING_ENABLED", "false").lower() == "true"
 
 # Telegram routing (reuse same envs you already use)
@@ -33,7 +30,7 @@ TELEGRAM_TOKEN_ALERTS = os.getenv("TELEGRAM_TOKEN_ALERTS")
 # If status token not set, fall back to alerts token
 _TELEGRAM_STATUS_TOKEN = TELEGRAM_TOKEN_STATUS or TELEGRAM_TOKEN_ALERTS
 
-# Human-friendly display order (bot keys must match what main.py / bots use)
+# Human-friendly display order (must match bot names used in main.py / bots)
 BOT_DISPLAY_ORDER: List[str] = [
     "premarket",
     "equity_flow",
@@ -49,8 +46,12 @@ BOT_DISPLAY_ORDER: List[str] = [
     "daily_ideas",
 ]
 
+# How many runtimes to keep in rolling history (for median)
+RUNTIME_HISTORY_MAX = 20
 
-# ---------------- DATA MODEL ----------------
+
+# ----------------- MODELS -----------------
+
 
 @dataclass
 class BotStats:
@@ -61,18 +62,16 @@ class BotStats:
     last_runtime: float = 0.0
     last_run_ts: float = 0.0
     last_run_str: str = ""
-    # recent runtimes for median, stored newest-last
     runtime_history: List[float] = field(default_factory=list)
 
 
-# ---------------- STORAGE HELPERS ----------------
+# ----------------- FILE I/O -----------------
+
 
 def _load_stats() -> Dict[str, Any]:
     """Load stats JSON from disk."""
     try:
         if not os.path.exists(STATS_PATH):
-            if DEBUG_STATUS_PING_ENABLED:
-                print(f"[status_report] STATS_PATH does not exist yet: {STATS_PATH}")
             return {"bots": {}, "errors": [], "last_heartbeat_ts": 0.0}
         with open(STATS_PATH, "r") as f:
             return json.load(f)
@@ -95,7 +94,8 @@ def _save_stats(data: Dict[str, Any]) -> None:
         print(f"[status_report] failed to save stats to {STATS_PATH}: {e}")
 
 
-# ---------------- RECORDING FROM BOTS ----------------
+# ----------------- RECORDING HELPERS -----------------
+
 
 def record_bot_stats(
     bot_name: str,
@@ -108,7 +108,8 @@ def record_bot_stats(
     Called by each bot at the end of its run.
 
     This updates the per-bot stats and preserves other bots' data.
-    Also maintains a rolling history of runtimes for median calculations.
+    It also maintains a small rolling history of runtimes so we can
+    compute per-bot median runtime in the heartbeat.
     """
     data = _load_stats()
     bots = data.get("bots", {})
@@ -116,38 +117,44 @@ def record_bot_stats(
     now_ts = time.time()
     pretty_ts = now_est()
 
-    # Start from any existing entry to preserve history
-    existing = bots.get(bot_name, {})
-    existing_history = existing.get("runtime_history", []) or []
+    prev = bots.get(bot_name) or {}
+    prev_history = prev.get("runtime_history") or []
 
-    # Append latest runtime, keep only last N
+    # Normalize history into list of floats
+    history: List[float] = []
+    if isinstance(prev_history, list):
+        for x in prev_history:
+            try:
+                history.append(float(x))
+            except Exception:
+                continue
+
+    # Append new runtime, trim to max length
     try:
-        existing_history = list(existing_history)
+        history.append(float(runtime))
     except Exception:
-        existing_history = []
-    existing_history.append(float(runtime))
-    if len(existing_history) > RUNTIME_HISTORY_DEPTH:
-        existing_history = existing_history[-RUNTIME_HISTORY_DEPTH:]
+        pass
+    if len(history) > RUNTIME_HISTORY_MAX:
+        history = history[-RUNTIME_HISTORY_MAX:]
 
     stats = BotStats(
         bot_name=bot_name,
-        scanned=scanned,
-        matched=matched,
-        alerts=alerts,
-        last_runtime=runtime,
+        scanned=int(scanned),
+        matched=int(matched),
+        alerts=int(alerts),
+        last_runtime=float(runtime),
         last_run_ts=now_ts,
         last_run_str=pretty_ts,
-        runtime_history=existing_history,
+        runtime_history=history,
     )
     bots[bot_name] = asdict(stats)
     data["bots"] = bots
 
     _save_stats(data)
-    if DEBUG_STATUS_PING_ENABLED:
-        print(
-            f"[status_report] stats recorded for {bot_name}: "
-            f"scanned={scanned} matched={matched} alerts={alerts} runtime={runtime:.2f}s"
-        )
+    print(
+        f"[status_report] stats recorded for {bot_name}: "
+        f"scanned={scanned} matched={matched} alerts={alerts} runtime={runtime:.2f}s"
+    )
 
 
 def record_error(bot_name: str, exc: Exception) -> None:
@@ -180,7 +187,22 @@ def record_error(bot_name: str, exc: Exception) -> None:
     print(f"[status_report] error recorded for {bot_name}: {exc}")
 
 
-# ---------------- TELEGRAM SENDING ----------------
+# ----------------- TELEGRAM HELPERS -----------------
+
+
+def _escape_markdown(text: str) -> str:
+    """
+    Minimal escaping for Telegram Markdown.
+
+    We only escape characters that are likely to break formatting when they
+    appear inside dynamic content such as error messages.
+    """
+    if not text:
+        return text
+    for ch in ("*", "_", "[", "]", "(", ")", "`"):
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
 
 def _send_telegram_status(text: str) -> None:
     """Send heartbeat/status text to Telegram, if configured."""
@@ -194,7 +216,6 @@ def _send_telegram_status(text: str) -> None:
         payload = {
             "chat_id": TELEGRAM_CHAT_ALL,
             "text": text,
-            # Use basic Markdown, keep dynamic content outside of *...* to avoid parse issues
             "parse_mode": "Markdown",
         }
         resp = requests.post(url, json=payload, timeout=10)
@@ -204,146 +225,115 @@ def _send_telegram_status(text: str) -> None:
         print(f"[status_report] Telegram send error: {e}")
 
 
-# ---------------- PRETTY LABEL HELPERS ----------------
+# ----------------- HEARTBEAT FORMAT -----------------
 
-def _pretty_bot_label(name: str) -> str:
+
+def _display_name(bot_name: str) -> str:
     """
-    Turn internal bot keys into nicer labels for display.
-
-    equity_flow -> Equity Flow
-    rsi_signals -> RSI Signals
-    dark_pool_radar -> Dark Pool Radar
+    Convert internal bot name (equity_flow) to a human-readable label ("Equity Flow").
     """
-    base = name.replace("_", " ").strip()
-    if not base:
-        return name
+    label = bot_name.replace("_", " ").strip()
+    if not label:
+        return bot_name
+    return label.title()
 
-    # Simple title-case then fix known acronyms
-    title = base.title()
-    # Fix specific cases
-    title = title.replace("Rsi", "RSI")
-    title = title.replace("Etf", "ETF")
-    title = title.replace("Orb", "ORB")
-    return title
-
-
-def _normalize_bot_row(name: str, info: Dict[str, Any]) -> Dict[str, Any]:
-    """Ensure we always have all fields present for a given bot."""
-    scanned = int(info.get("scanned", 0) or 0)
-    matched = int(info.get("matched", 0) or 0)
-    alerts = int(info.get("alerts", 0) or 0)
-    last_runtime = float(info.get("last_runtime", 0.0) or 0.0)
-    last_run_ts = float(info.get("last_run_ts", 0.0) or 0.0)
-    last_run_str = info.get("last_run_str", "no recent run")
-
-    rh = info.get("runtime_history", []) or []
-    try:
-        runtime_history = [float(x) for x in rh]
-    except Exception:
-        runtime_history = []
-
-    return {
-        "name": name,
-        "label": _pretty_bot_label(name),
-        "scanned": scanned,
-        "matched": matched,
-        "alerts": alerts,
-        "last_runtime": last_runtime,
-        "last_run_ts": last_run_ts,
-        "last_run_str": last_run_str,
-        "runtime_history": runtime_history,
-    }
-
-
-# ---------------- HEARTBEAT FORMATTING ----------------
 
 def _format_heartbeat() -> str:
     """
     Build the heartbeat message text.
 
-    • Always lists all bots from BOT_DISPLAY_ORDER, even if they have no stats yet.
-    • Shows per-bot "OK @ time" or "no recent run".
-    • Shows global totals and per-bot scanned/matched/alerts.
-    • Shows latency metrics (median / last / n).
-    • Shows top 3 heaviest bots by scanned.
-    • Optionally includes recent errors.
+    Sections:
+      • Header (time + global status)
+      • Bot Status (per-bot OK / no recent run)
+      • Scanner Analytics (global totals)
+      • Per-bot metrics (scanned / matches / alerts)
+      • Runtime per bot (median + last runtime)
+      • High-scan, zero-alert bots
+      • Top 3 heaviest by scans
+      • Recent errors (last 60 minutes)
     """
     data = _load_stats()
     bots_data: Dict[str, Any] = data.get("bots", {})
     errors_data: List[Dict[str, Any]] = data.get("errors", [])
 
-    # Normalize rows for every known bot
+    # Build normalized rows for every bot in display order
     bot_rows: List[Dict[str, Any]] = []
     total_scanned = 0
     total_matched = 0
     total_alerts = 0
 
-    # Ensure we include anything that might not be in BOT_DISPLAY_ORDER yet
-    all_bot_names: List[str] = list(BOT_DISPLAY_ORDER)
-    for k in bots_data.keys():
-        if k not in all_bot_names:
-            all_bot_names.append(k)
+    for internal_name in BOT_DISPLAY_ORDER:
+        info = bots_data.get(internal_name, {})
+        scanned = int(info.get("scanned", 0))
+        matched = int(info.get("matched", 0))
+        alerts = int(info.get("alerts", 0))
+        last_runtime = float(info.get("last_runtime", 0.0))
+        last_run_str = info.get("last_run_str", "no recent run")
+        last_run_ts = float(info.get("last_run_ts", 0.0))
 
-    for name in all_bot_names:
-        info = bots_data.get(name, {})
-        row = _normalize_bot_row(name, info)
+        rh = info.get("runtime_history") or []
+        runtime_history: List[float] = []
+        if isinstance(rh, list):
+            for x in rh:
+                try:
+                    runtime_history.append(float(x))
+                except Exception:
+                    continue
 
-        total_scanned += row["scanned"]
-        total_matched += row["matched"]
-        total_alerts += row["alerts"]
+        # Totals
+        total_scanned += scanned
+        total_matched += matched
+        total_alerts += alerts
 
-        bot_rows.append(row)
+        bot_rows.append(
+            {
+                "internal_name": internal_name,
+                "display_name": _display_name(internal_name),
+                "scanned": scanned,
+                "matched": matched,
+                "alerts": alerts,
+                "last_runtime": last_runtime,
+                "last_run_str": last_run_str,
+                "last_run_ts": last_run_ts,
+                "runtime_history": runtime_history,
+            }
+        )
 
-    # Sort copies for heaviest + runtime sections
+    # Sort a copy by scanned volume for "heaviest" section
     bot_rows_by_scans = sorted(bot_rows, key=lambda r: r["scanned"], reverse=True)
     top3 = [r for r in bot_rows_by_scans if r["scanned"] > 0][:3]
 
-    # Runtime stats, sorted by median runtime (desc)
-    runtime_rows: List[Tuple[str, str, float, float, int]] = []
-    for r in bot_rows:
-        history = r["runtime_history"]
-        if history:
-            try:
-                median_rt = statistics.median(history)
-            except statistics.StatisticsError:
-                median_rt = history[-1]
-            last_rt = history[-1]
-            n = len(history)
-            runtime_rows.append((r["name"], r["label"], median_rt, last_rt, n))
+    # ----------------- Build message lines -----------------
 
-    runtime_rows.sort(key=lambda x: x[2], reverse=True)  # sort by median_rt desc
-
-    # Build message lines
     lines: List[str] = []
+
+    # Header
     lines.append("📡 *MoneySignalAI Heartbeat* ❤️")
     lines.append(f"⏰ {now_est()}")
     lines.append("────────────────")
-    lines.append("✅ *System:* ALL SYSTEMS GOOD")
+    lines.append("✅ ALL SYSTEMS GOOD")
     lines.append("")
 
-    # Bot status (OK / no recent run), including test/disabled flags
+    # Bot status
     lines.append("🤖 *Bot Status:*")
-
-    from bots.shared import is_bot_test_mode, is_bot_disabled  # small safe import
-
     for r in bot_rows:
-        name = r["name"]
-        label = r["label"]
+        internal = r["internal_name"]
+        display = r["display_name"]
         last_run_ts = r["last_run_ts"]
         last_run_str = r["last_run_str"]
 
-        display = label
-        if is_bot_disabled(name):
-            display = f"{label} (DISABLED)"
-        elif is_bot_test_mode(name):
-            display = f"{label} (TEST)"
+        label = display
+        if is_bot_disabled(internal):
+            label = f"{display} (DISABLED)"
+        elif is_bot_test_mode(internal):
+            label = f"{display} (TEST)"
 
         if last_run_ts > 0:
-            lines.append(f"• ✅ {display}: OK @ {last_run_str}")
+            lines.append(f"• ✅ {label}: OK @ {last_run_str}")
         else:
-            lines.append(f"• ❔ {display}: no recent run")
+            lines.append(f"• ❔ {label}: no recent run")
 
-    # Global scanner analytics
+    # Scanner analytics
     lines.append("────────────────")
     lines.append("📊 *Scanner Analytics:*")
     lines.append(f"• Total scanned: **{total_scanned:,}**")
@@ -351,28 +341,61 @@ def _format_heartbeat() -> str:
     lines.append(f"• Alerts fired: **{total_alerts:,}**")
     lines.append("")
 
-    # Per-bot metrics (raw numbers)
+    # Per-bot metrics
     lines.append("📈 *Per-bot metrics:*")
     for r in bot_rows:
-        # Keep this section simple (no Markdown entities inside bot names)
+        display = r["display_name"]
         lines.append(
-            f"• {r['name']}: scanned={r['scanned']:,} | "
+            f"• {display}: scanned={r['scanned']:,} | "
             f"matches={r['matched']:,} | alerts={r['alerts']:,}"
         )
 
-    # Runtime metrics
+    # Runtime / latency section
     lines.append("────────────────")
-    lines.append("⏱ *Runtime (per bot, last runs):*")
-    if runtime_rows:
-        for name, label, median_rt, last_rt, n in runtime_rows:
-            lines.append(
-                f"• {label}: median {median_rt:.2f}s "
-                f"(last {last_rt:.2f}s, n={n})"
-            )
-    else:
-        lines.append("• No runtime data yet")
+    lines.append("⏱ *Runtime (per bot):*")
+    any_runtime = False
+    # Compute median runtime for each bot that has history
+    def _median_or_none(vals: List[float]) -> Optional[float]:
+        if not vals:
+            return None
+        try:
+            return float(statistics.median(vals))
+        except Exception:
+            return None
 
-    # Bots that scan a lot but never alert (tuning candidates)
+    # Sort by median runtime descending for runtime section
+    runtime_rows: List[Dict[str, Any]] = []
+    for r in bot_rows:
+        history = r["runtime_history"]
+        med = _median_or_none(history)
+        if med is not None:
+            runtime_rows.append(
+                {
+                    "display_name": r["display_name"],
+                    "median": med,
+                    "last": r["last_runtime"],
+                    "count": len(history),
+                }
+            )
+
+    runtime_rows.sort(key=lambda x: x["median"], reverse=True)
+
+    for rr in runtime_rows:
+        any_runtime = True
+        lines.append(
+            f"• {rr['display_name']}: median {rr['median']:.2f}s "
+            f"(last {rr['last']:.2f}s, n={rr['count']})"
+        )
+
+    # Bots with no runtime data
+    for r in bot_rows:
+        if not r["runtime_history"]:
+            lines.append(f"• {_display_name(r['internal_name'])}: no runtime data yet")
+
+    if not any_runtime:
+        lines.append("• (no runtime data yet)")
+
+    # High-scan, zero-alert bots
     high_scan_low_alert = [
         r for r in bot_rows
         if r["scanned"] >= 200 and r["alerts"] == 0
@@ -382,20 +405,22 @@ def _format_heartbeat() -> str:
         lines.append("🧐 *High-scan, zero-alert bots (tune filters?):*")
         for r in high_scan_low_alert:
             lines.append(
-                f"• {r['name']}: scanned={r['scanned']:,}, "
+                f"• {r['display_name']}: scanned={r['scanned']:,}, "
                 f"matches={r['matched']:,}, alerts={r['alerts']:,}"
             )
 
-    # Top 3 by scans
+    # Top 3 heaviest
     if top3:
         lines.append("────────────────")
         lines.append("🥵 *Top 3 Heaviest Bots* (by scans):")
-        max_scans = max(r["scanned"] for r in top3) or 1
+        max_scans = top3[0]["scanned"] or 1
         for r in top3:
-            # tiny ASCII bar based on relative scans
-            bar_len = max(1, int(5 * r["scanned"] / max_scans))
-            bar = "▇" * bar_len
-            lines.append(f"• {r['name']}: {r['scanned']:,} scanned {bar}")
+            display = r["display_name"]
+            scans = r["scanned"]
+            # Simple relative bar
+            bar_len = max(1, int((scans / max_scans) * 4))
+            bar = "█" * bar_len
+            lines.append(f"• {display}: {scans:,} scanned {bar}")
 
     # Optional: recent errors within last 60 minutes
     now_ts = time.time()
@@ -407,11 +432,10 @@ def _format_heartbeat() -> str:
         lines.append("────────────────")
         lines.append("⚠️ *Recent Errors (last 60 min):*")
         for e in recent_errors[-5:]:  # show up to last 5
-            bot = e.get("bot", "?")
-            when = e.get("when", "?")
-            etype = e.get("type", "?")
-            msg = e.get("msg", "")
-            # keep error lines short-ish
+            bot = _escape_markdown(str(e.get("bot", "?")))
+            when = _escape_markdown(str(e.get("when", "?")))
+            etype = _escape_markdown(str(e.get("type", "?")))
+            msg = _escape_markdown(str(e.get("msg", "")))
             if len(msg) > 120:
                 msg = msg[:117] + "..."
             lines.append(f"• {bot} ({etype}) @ {when} → {msg}")
@@ -419,7 +443,8 @@ def _format_heartbeat() -> str:
     return "\n".join(lines)
 
 
-# ---------------- HEARTBEAT ENTRYPOINT ----------------
+# ----------------- ENTRYPOINT -----------------
+
 
 async def run_status() -> None:
     """
@@ -433,21 +458,23 @@ async def run_status() -> None:
     now_ts = time.time()
 
     min_interval_sec = HEARTBEAT_INTERVAL_MIN * 60.0
-    delta = now_ts - last_hb
+    since_last = now_ts - last_hb
 
-    if DEBUG_STATUS_PING_ENABLED:
-        print(
-            f"[status_report] run_status called. "
-            f"delta_since_last={delta:.1f}s, "
-            f"min_interval={min_interval_sec:.1f}s"
-        )
-
-    if delta < min_interval_sec:
+    if since_last < min_interval_sec:
         if DEBUG_STATUS_PING_ENABLED:
-            print("[status_report] Heartbeat skipped (interval not reached).")
+            print(
+                f"[status_report] Heartbeat skipped (interval). "
+                f"since_last={since_last:.1f}s, min={min_interval_sec:.1f}s"
+            )
         return
 
     text = _format_heartbeat()
+    if DEBUG_STATUS_PING_ENABLED:
+        print(
+            f"[status_report] Sending heartbeat "
+            f"(len={len(text)} chars, interval={HEARTBEAT_INTERVAL_MIN}m)"
+        )
+
     _send_telegram_status(text)
 
     data["last_heartbeat_ts"] = now_ts
