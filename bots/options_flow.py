@@ -28,6 +28,8 @@ from bots.shared import (
     minutes_since_midnight_est,
     get_option_chain_cached,
     get_last_option_trades_cached,
+    is_bot_test_mode,
+    debug_filter_reason,
 )
 from bots.status_report import record_bot_stats  # ✅ status-report integration
 
@@ -62,6 +64,11 @@ UNUSUAL_MAX_DTE       = int(os.getenv("UNUSUAL_MAX_DTE", "45"))
 WHALES_MIN_NOTIONAL = float(os.getenv("WHALES_MIN_NOTIONAL", "300000"))
 WHALES_MIN_SIZE     = int(os.getenv("WHALES_MIN_SIZE", "75"))
 WHALES_MAX_DTE      = int(os.getenv("WHALES_MAX_DTE", "90"))
+
+# IV crush settings
+IVCRUSH_MIN_IV_DROP_PCT = float(os.getenv("IVCRUSH_MIN_IV_DROP_PCT", "25"))
+IVCRUSH_MIN_VOL         = int(os.getenv("IVCRUSH_MIN_VOL", "100"))
+IVCRUSH_MAX_DTE         = int(os.getenv("IVCRUSH_MAX_DTE", "21"))
 
 # Underlying price floor (ignore sub-penny / micro-cap garbage by default)
 MIN_UNDERLYING_PRICE = float(os.getenv("OPTIONS_MIN_UNDERLYING_PRICE", "5.0"))
@@ -149,71 +156,66 @@ def _parse_option_symbol(sym: str):
         return None, None, None, None
 
     try:
-        base = sym[2:]
+        core = sym[2:]  # drop 'O:'
+        under = core[:-15]
+        date_part = core[-15:-9]  # YYMMDD
+        cp = core[-9:-8]
+        strike_part = core[-8:]
 
-        # find first digit (start of YYMMDD)
-        idx = 0
-        while idx < len(base) and not base[idx].isdigit():
-            idx += 1
-        if idx >= len(base):
-            return None, None, None, None
+        yy = int(date_part[0:2])
+        mm = int(date_part[2:4])
+        dd = int(date_part[4:6])
+        year = 2000 + yy
+        expiry = _date(year, mm, dd)
 
-        under = base[:idx]
-        exp_raw = base[idx:idx+6]   # YYMMDD
-        cp_char = base[idx+6:idx+7]  # C or P
-        rest = base[idx+7:]
-        strike_raw = rest[7:]   # 000450000
-
-        yy = int("20" + exp_raw[0:2])
-        mm = int(exp_raw[2:4])
-        dd = int(exp_raw[4:6])
-        expiry = _date(yy, mm, dd)
-
-        strike = int(strike_raw) / 1000.0 if strike_raw else None
-
-        return under, expiry, cp_char, strike
+        strike = float(strike_part) / 1000.0
+        if cp == "C":
+            cptype = "CALL"
+        elif cp == "P":
+            cptype = "PUT"
+        else:
+            cptype = None
+        return under, expiry, cptype, strike
     except Exception:
         return None, None, None, None
 
 
-def _days_to_expiry(expiry: date | None) -> int | None:
+def _days_to_expiry(expiry: Optional[date]) -> Optional[int]:
     if not expiry:
         return None
     today = date.today()
-    return (expiry - today).days
+    delta = (expiry - today).days
+    return delta
 
 
-def _underlying_price_from_opt(opt: dict) -> float | None:
-    try:
-        ua = opt.get("underlying_asset") or {}
-        val = ua.get("price")
-        return float(val) if val is not None else None
-    except Exception:
-        return None
-
-
-def _contract_type(opt: dict, cp_raw: str | None) -> str | None:
-    """Return 'CALL' or 'PUT' if we can figure it out."""
-    if cp_raw:
-        return "CALL" if cp_raw.upper() == "C" else "PUT"
-    details = opt.get("details") or {}
-    ct = (details.get("contract_type") or "").upper()
-    if ct in ("CALL", "PUT"):
-        return ct
+def _contract_type(opt: Dict[str, Any], cp_raw: Optional[str]) -> Optional[str]:
+    cp = cp_raw
+    if not cp:
+        cp = opt.get("contract_type") or opt.get("type")
+    if isinstance(cp, str):
+        c = cp.upper()[0]
+        if c == "C":
+            return "CALL"
+        if c == "P":
+            return "PUT"
     return None
 
 
-def _format_time() -> str:
-    """
-    now_est() from shared returns a human-friendly string already.
-    We keep this wrapper in case we ever change shared.now_est.
-    """
-    try:
-        return now_est()
-    except Exception:
-        # fallback
-        return datetime.now(eastern).strftime("%I:%M %p EST · %b %d").lstrip("0")
+def _underlying_price_from_opt(opt: Dict[str, Any]) -> Optional[float]:
+    ua = opt.get("underlying_asset") or {}
+    last = ua.get("last_price") or ua.get("lastTrade") or {}
+    if isinstance(last, dict):
+        price = last.get("price") or last.get("p")
+    else:
+        price = last
+    return _safe_float(price)
 
+
+def _format_time() -> str:
+    return now_est()
+
+
+# ---------------- UNIVERSE RESOLUTION ----------------
 
 def _resolve_universe() -> list[str]:
     """
@@ -245,28 +247,19 @@ def _maybe_iv_crush(
     sym: str,
     contract: str,
     under: str,
-    expiry: date | None,
-    dte: int | None,
-    opt: dict,
+    expiry: Optional[date],
+    dte: Optional[int],
+    opt: Dict[str, Any],
     size: int,
     time_str: str,
 ) -> None:
     """
-    Lightweight IV Crush detection per contract:
-      • short-dated (<= IVCRUSH_MAX_DTE)
-      • sufficient volume/size
-      • big IV drop vs cached prior IV for same underlying+expiry
-    Fires an additional "IV CRUSH" alert, separate from cheap/unusual/whale.
+    Track implied volatility per underlying+expiry and fire an alert when IV
+    drops sharply (IVCRUSH_MIN_IV_DROP_PCT) on decent volume (IVCRUSH_MIN_VOL).
     """
-    from bots.shared import (
-        IVCRUSH_MIN_IV_DROP_PCT,
-        IVCRUSH_MAX_DTE,
-        IVCRUSH_MIN_VOL,
-        chart_link,
-    )
+    from datetime import date as _date
 
-    if contract in _seen_ivcrush:
-        return
+    # Only care about reasonably short-dated options
     if dte is None or dte < 0 or dte > IVCRUSH_MAX_DTE:
         return
     if size < IVCRUSH_MIN_VOL:
@@ -280,7 +273,7 @@ def _maybe_iv_crush(
     if iv <= 0:
         return
 
-    today_str = str(date.today())
+    today_str = str(_date.today())
     key = f"{under}:{expiry}"
     prev = _iv_cache.get(key)
     if prev and prev.get("date") != today_str:
@@ -296,36 +289,32 @@ def _maybe_iv_crush(
     # Compute IV drop
     if prev_iv <= 0:
         return
-    iv_drop_pct = (prev_iv - iv) / prev_iv * 100.0
-    if iv_drop_pct < IVCRUSH_MIN_IV_DROP_PCT:
+    drop_pct = (prev_iv - iv) / prev_iv * 100.0
+    if drop_pct < IVCRUSH_MIN_IV_DROP_PCT:
         return
 
-    # Update cache with current IV
-    _iv_cache[key] = {"iv": iv, "date": today_str}
+    # Avoid spamming multiple IV crush alerts for same contract/day
+    if contract in _seen_ivcrush:
+        return
 
-    # Underlying price (for alert)
-    under_px = _underlying_price_from_opt(opt)
-    under_line = f"💰 Underlying ${under_px:.2f}" if under_px is not None else "💰 Underlying price N/A"
-
-    implied_move_pct = iv * math.sqrt(1.0 / 252.0) * 100.0
-
-    extra_lines = [
-        f"🧊 IV CRUSH — {sym}",
+    # Build alert body
+    header = f"🧊 IV CRUSH — {sym}"
+    exp_str = expiry.strftime("%b %d %Y") if expiry else "N/A"
+    body_lines = [
+        header,
         f"🕒 {time_str}",
-        under_line,
         "────────────",
-        f"🎯 Contract: {contract}",
-        f"📅 Exp: {expiry.strftime('%Y-%m-%d')} · DTE: {dte}",
-        f"📊 IV now: {iv * 100:.1f}% (prev {prev_iv * 100:.1f}%, drop {iv_drop_pct:.1f}%)",
-        f"📦 Volume / Size: {size:,}",
-        f"📉 Implied 1-day move: ≈ {implied_move_pct:.1f}%",
+        f"🎯 Contract: {under} {exp_str}",
+        f"📦 Size: {size:,}",
+        f"📉 IV Drop: {drop_pct:.1f}%",
         f"🔗 Chart: {chart_link(sym)}",
+        "",
+        "Big IV crush on short-dated options.",
     ]
+    extra_text = "\n".join(body_lines)
 
-    extra_text = "\n".join(extra_lines)
-
-    # We don't know last trade underlying RVOL here → pass 0.0
-    last_price_for_bot = under_px if under_px is not None else 0.0
+    # We don't need super precise underlying here → pass 0.0
+    last_price_for_bot = 0.0
     send_alert("iv_crush", sym, last_price_for_bot, 0.0, extra=extra_text)
     _seen_ivcrush.add(contract)
 
@@ -361,6 +350,7 @@ async def run_options_flow():
     _load_iv_cache()  # initialize cache from disk if present
 
     BOT_NAME = "options_flow"
+    test_mode = is_bot_test_mode(BOT_NAME)
     start_ts = time.time()
     alerts_sent = 0
     matched_contracts: set[str] = set()
@@ -380,10 +370,12 @@ async def run_options_flow():
 
         chain = get_option_chain_cached(sym)
         if not chain:
+            debug_filter_reason("options_flow", sym, "no option chain from Polygon")
             continue
 
         opts = chain.get("results") or chain.get("result") or chain.get("options") or []
         if not isinstance(opts, list) or not opts:
+            debug_filter_reason("options_flow", sym, "option chain results empty")
             continue
 
         for opt in opts:
@@ -397,11 +389,13 @@ async def run_options_flow():
             )
             if not contract:
                 # If we don't know the contract symbol, we can't look up trades.
+                debug_filter_reason("options_flow", sym, "no contract symbol in snapshot")
                 continue
 
             # Last trade for this contract (v3 last/trade/options)
             trade = get_last_option_trades_cached(contract)
             if not trade:
+                debug_filter_reason("options_flow", sym, f"no last trade for {contract}")
                 continue
 
             t_res = trade.get("results")
@@ -414,13 +408,16 @@ async def run_options_flow():
                 last = trade
 
             if not isinstance(last, dict):
+                debug_filter_reason("options_flow", sym, f"last-trade payload not dict for {contract}")
                 continue
 
             price = _safe_float(last.get("p") or last.get("price"))
             size = _safe_int(last.get("s") or last.get("size"))
             if price is None or size is None:
+                debug_filter_reason("options_flow", sym, f"missing price/size for {contract}")
                 continue
             if price <= 0 or size <= 0:
+                debug_filter_reason("options_flow", sym, f"non-positive price/size for {contract}")
                 continue
 
             notional = price * size * 100.0
@@ -450,6 +447,7 @@ async def run_options_flow():
 
             dte = _days_to_expiry(expiry)
             if dte is None or dte < 0:
+                debug_filter_reason("options_flow", sym, f"invalid DTE for {contract}")
                 continue
 
             cp = _contract_type(opt, cp_raw)
@@ -457,6 +455,7 @@ async def run_options_flow():
 
             # Ignore tiny / illiquid penny stuff by default
             if under_px is not None and under_px < MIN_UNDERLYING_PRICE:
+                debug_filter_reason("options_flow", sym, f"underlying below min price ({under_px:.2f} < {MIN_UNDERLYING_PRICE})")
                 continue
 
             # --- CATEGORY DECISION (priority: WHALE > UNUSUAL > CHEAP) ---
@@ -472,7 +471,7 @@ async def run_options_flow():
             ):
                 category = "whale"
 
-            # UNUSUAL (if not already whale)
+            # UNUSUAL
             elif (
                 dte <= UNUSUAL_MAX_DTE
                 and size >= UNUSUAL_MIN_SIZE
@@ -495,6 +494,13 @@ async def run_options_flow():
             _maybe_iv_crush(sym, contract, under, expiry, dte, opt, size, time_str)
 
             if not category:
+                notional_rounded = round(notional)
+                debug_filter_reason(
+                    "options_flow",
+                    sym,
+                    f"no category match for {contract} "
+                    f"(dte={dte}, size={size}, notional≈${notional_rounded:,.0f}, price={price:.2f})"
+                )
                 continue
 
             # ---------------- ALERT FORMATTING ----------------
@@ -504,8 +510,8 @@ async def run_options_flow():
             cp_letter = "C" if cp == "CALL" else "P" if cp == "PUT" else "?"
 
             # Base contract line (pretty)
-            exp_str = expiry.strftime('%b %d %Y') if expiry else 'N/A'
-            contract_line = f"{under} {exp_str} {cp_letter}"
+            exp_str2 = expiry.strftime('%b %d %Y') if expiry else 'N/A'
+            contract_line = f"{under} {exp_str2} {cp_letter}"
 
             # Build category-specific header & description
             if category == "whale":
@@ -542,8 +548,14 @@ async def run_options_flow():
 
             extra = "\n".join(body_lines)
 
-            # Send alert
-            send_alert(category, sym, under_px or 0.0, 0.0, extra=extra)
+            # Send alert (respects test_mode)
+            if test_mode:
+                print(
+                    f"[options_flow:test] would alert {category.upper()} "
+                    f"{contract} on {sym} · size={size} notional≈${notional_rounded:,.0f}"
+                )
+            else:
+                send_alert(category, sym, under_px or 0.0, 0.0, extra=extra)
 
             # Mark as seen
             if category == "whale":
