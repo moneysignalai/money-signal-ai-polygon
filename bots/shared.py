@@ -83,15 +83,57 @@ def minutes_since_midnight_est() -> int:
 
 
 # ----------------------------------------------------------------------
+# Pretty-format helpers (for contracts / debug)
+# ----------------------------------------------------------------------
+
+
+def pretty_contract(raw: str) -> str:
+    """
+    Convert Polygon-style contract symbols like:
+        O:TSLA251121C00450000
+    into human-readable:
+        TSLA 11/21/25 450C
+
+    If parsing fails, returns the original string.
+    """
+    try:
+        if not raw or not raw.startswith("O:"):
+            return raw
+
+        core = raw[2:]  # TSLA251121C00450000
+        if len(core) < 15:
+            return raw
+
+        underlying = core[:-15]
+        date_part = core[-15:-9]  # YYMMDD
+        cp = core[-9:-8]          # C / P
+        strike_part = core[-8:]   # 00450000 -> 450.000
+
+        yy = int(date_part[0:2]) + 2000
+        mm = int(date_part[2:4])
+        dd = int(date_part[4:6])
+
+        strike_int = int(strike_part)
+        strike = strike_int / 1000.0
+
+        exp_fmt = f"{mm:02d}/{dd:02d}/{str(yy)[2:]}"  # 11/21/25
+        cp_letter = cp.upper() if cp in ("C", "P") else "?"
+
+        return f"{underlying} {exp_fmt} {strike:g}{cp_letter}"
+    except Exception:
+        return raw
+
+
+# ----------------------------------------------------------------------
 # Bot-mode helper functions
 # ----------------------------------------------------------------------
+
 
 def is_bot_disabled(bot_name: str) -> bool:
     """
     Return True if this bot is globally disabled via env (DISABLED_BOTS).
 
-    This is primarily used by status/diagnostics, but bots can also check
-    this if they want to early-exit in code.
+    This is primarily used by scheduler / bots to early-exit.
     """
     return bot_name.strip().lower() in DISABLED_BOTS
 
@@ -114,10 +156,29 @@ def debug_filter_reason(bot_name: str, symbol: str, reason: str) -> None:
     If DEBUG_FLOW_REASONS=true, bots can call this to log why a candidate
     was rejected by filters. This is useful when you see scanned>0 but alerts=0
     and want to understand which filter is doing the blocking.
+
+    Output is cleaned up:
+      • Polygon option tickers (O:TSLA251121C00450000) are converted to:
+            TSLA 11/21/25 450C
+      • One-line, emoji-tagged, timestamped.
     """
     if not DEBUG_FLOW_REASONS:
         return
-    print(f"[debug:{bot_name}] {symbol}: {reason}")
+
+    # Clean up any Polygon-style option symbols in the reason text
+    parts = reason.split()
+    cleaned_parts: List[str] = []
+    for p in parts:
+        if p.startswith("O:"):
+            cleaned_parts.append(pretty_contract(p))
+        else:
+            cleaned_parts.append(p)
+    cleaned_reason = " ".join(cleaned_parts)
+
+    ts = now_est()
+    # Example:
+    # 🐞 DEBUG — options_flow | TSLA | 10:15 AM EST · Nov 30 → no last trade for TSLA 11/21/25 450C
+    print(f"🐞 DEBUG — {bot_name} | {symbol} | {ts} → {cleaned_reason}")
 
 
 # ---------------- TELEGRAM CORE ----------------
