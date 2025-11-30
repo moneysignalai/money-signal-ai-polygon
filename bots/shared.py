@@ -28,6 +28,30 @@ TELEGRAM_TOKEN_STATUS = os.getenv("TELEGRAM_TOKEN_STATUS")
 # Some bots may want a separate status-only chat; if not set, fallback to CHAT_ALL
 TELEGRAM_CHAT_STATUS = os.getenv("TELEGRAM_CHAT_STATUS") or TELEGRAM_CHAT_ALL
 
+# ----------------------------------------------------------------------
+# Bot-level config flags (for system-level control & debugging)
+# ----------------------------------------------------------------------
+
+# DISABLED_BOTS: comma-separated list of bot names that should NOT run at all.
+# Example: DISABLED_BOTS=daily_ideas,options_indicator
+DISABLED_BOTS = {
+    b.strip().lower()
+    for b in os.getenv("DISABLED_BOTS", "").replace(" ", "").split(",")
+    if b.strip()
+}
+
+# TEST_MODE_BOTS: comma-separated list of bot names that should run in "shadow" / test mode.
+# Example: TEST_MODE_BOTS=options_flow,rsi_signals
+TEST_MODE_BOTS = {
+    b.strip().lower()
+    for b in os.getenv("TEST_MODE_BOTS", "").replace(" ", "").split(",")
+    if b.strip()
+}
+
+# DEBUG_FLOW_REASONS: if true, bots can log why candidates were rejected by filters.
+# Example: DEBUG_FLOW_REASONS=true
+DEBUG_FLOW_REASONS = os.getenv("DEBUG_FLOW_REASONS", "false").lower() == "true"
+
 eastern = pytz.timezone("US/Eastern")
 
 
@@ -56,6 +80,44 @@ def iso_today() -> str:
 def minutes_since_midnight_est() -> int:
     now = datetime.now(eastern)
     return now.hour * 60 + now.minute
+
+
+# ----------------------------------------------------------------------
+# Bot-mode helper functions
+# ----------------------------------------------------------------------
+
+def is_bot_disabled(bot_name: str) -> bool:
+    """
+    Return True if this bot is globally disabled via env (DISABLED_BOTS).
+
+    This is primarily used by status/diagnostics, but bots can also check
+    this if they want to early-exit in code.
+    """
+    return bot_name.strip().lower() in DISABLED_BOTS
+
+
+def is_bot_test_mode(bot_name: str) -> bool:
+    """
+    Return True if this bot is in TEST_MODE_BOTS.
+
+    Bots can use this to:
+      • avoid sending real alerts (shadow mode), or
+      • route alerts to a separate Telegram chat, etc.
+    """
+    return bot_name.strip().lower() in TEST_MODE_BOTS
+
+
+def debug_filter_reason(bot_name: str, symbol: str, reason: str) -> None:
+    """
+    Optional debugging helper.
+
+    If DEBUG_FLOW_REASONS=true, bots can call this to log why a candidate
+    was rejected by filters. This is useful when you see scanned>0 but alerts=0
+    and want to understand which filter is doing the blocking.
+    """
+    if not DEBUG_FLOW_REASONS:
+        return
+    print(f"[debug:{bot_name}] {symbol}: {reason}")
 
 
 # ---------------- TELEGRAM CORE ----------------
