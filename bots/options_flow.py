@@ -13,9 +13,8 @@
 import os
 import time
 import json
-import math
 from datetime import datetime, date
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import pytz
 
@@ -29,6 +28,7 @@ from bots.shared import (
     get_option_chain_cached,
     get_last_option_trades_cached,
     is_bot_test_mode,
+    is_bot_disabled,
     debug_filter_reason,
 )
 from bots.status_report import record_bot_stats  # ✅ status-report integration
@@ -49,8 +49,6 @@ def _in_rth_window() -> bool:
 # ---------------- CONFIG (reuses your env vars) ----------------
 
 # Cheap lottos
-# Default thresholds made a bit more permissive so you actually SEE flow
-# out of the box. You can still override all of these via env vars.
 CHEAP_MAX_PREMIUM   = float(os.getenv("CHEAP_MAX_PREMIUM", "0.40"))
 CHEAP_MIN_SIZE      = int(os.getenv("CHEAP_MIN_SIZE", "50"))
 CHEAP_MIN_NOTIONAL  = float(os.getenv("CHEAP_MIN_NOTIONAL", "5000"))
@@ -342,6 +340,11 @@ async def run_options_flow():
         print("[options_flow] POLYGON_KEY missing; skipping.")
         return
 
+    BOT_NAME = "options_flow"
+    if is_bot_disabled(BOT_NAME):
+        print("[options_flow] disabled via DISABLED_BOTS; skipping.")
+        return
+
     if not _in_rth_window():
         print("[options_flow] outside RTH; skipping.")
         return
@@ -349,7 +352,6 @@ async def run_options_flow():
     _reset_if_new_day()
     _load_iv_cache()  # initialize cache from disk if present
 
-    BOT_NAME = "options_flow"
     test_mode = is_bot_test_mode(BOT_NAME)
     start_ts = time.time()
     alerts_sent = 0
@@ -366,6 +368,7 @@ async def run_options_flow():
 
     for sym in universe:
         if is_etf_blacklisted(sym):
+            debug_filter_reason("options_flow", sym, "ETF blacklisted")
             continue
 
         chain = get_option_chain_cached(sym)
@@ -455,7 +458,11 @@ async def run_options_flow():
 
             # Ignore tiny / illiquid penny stuff by default
             if under_px is not None and under_px < MIN_UNDERLYING_PRICE:
-                debug_filter_reason("options_flow", sym, f"underlying below min price ({under_px:.2f} < {MIN_UNDERLYING_PRICE})")
+                debug_filter_reason(
+                    "options_flow",
+                    sym,
+                    f"underlying below min price ({under_px:.2f} < {MIN_UNDERLYING_PRICE})",
+                )
                 continue
 
             # --- CATEGORY DECISION (priority: WHALE > UNUSUAL > CHEAP) ---
@@ -499,7 +506,7 @@ async def run_options_flow():
                     "options_flow",
                     sym,
                     f"no category match for {contract} "
-                    f"(dte={dte}, size={size}, notional≈${notional_rounded:,.0f}, price={price:.2f})"
+                    f"(dte={dte}, size={size}, notional≈${notional_rounded:,.0f}, price={price:.2f})",
                 )
                 continue
 
