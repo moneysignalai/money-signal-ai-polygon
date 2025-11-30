@@ -212,7 +212,7 @@ def _format_heartbeat() -> str:
     bot_rows_by_scans = sorted(bot_rows, key=lambda r: r["scanned"], reverse=True)
     top3 = [r for r in bot_rows_by_scans if r["scanned"] > 0][:3]
 
-    # Build message lines
+        # Build message lines
     lines: List[str] = []
     lines.append("📡 *MoneySignalAI Heartbeat* ❤️")
     lines.append(f"⏰ {now_est()}")
@@ -228,10 +228,19 @@ def _format_heartbeat() -> str:
         last_run_ts = r["last_run_ts"]
         last_run_str = r["last_run_str"]
 
+        # Mark test-mode bots (if any) with an icon
+        name_display = name
+        from bots.shared import is_bot_test_mode, is_bot_disabled  # safe small import
+
+        if is_bot_disabled(name):
+            name_display = f"{name} (DISABLED)"
+        elif is_bot_test_mode(name):
+            name_display = f"{name} (TEST)"
+
         if last_run_ts > 0:
-            lines.append(f"• ✅ {name}: OK @ {last_run_str}")
+            lines.append(f"• ✅ {name_display}: OK @ {last_run_str}")
         else:
-            lines.append(f"• ❔ {name}: no recent run")
+            lines.append(f"• ❔ {name_display}: no recent run")
 
     lines.append("────────────────")
     lines.append("📊 *Scanner Analytics:*")
@@ -246,6 +255,20 @@ def _format_heartbeat() -> str:
             f"• {r['name']}: scanned={r['scanned']:,} | "
             f"matches={r['matched']:,} | alerts={r['alerts']:,}"
         )
+
+    # Bots that are scanning a lot but never alert (helps you tune filters)
+    high_scan_low_alert = [
+        r for r in bot_rows
+        if r["scanned"] >= 200 and r["alerts"] == 0
+    ]
+    if high_scan_low_alert:
+        lines.append("────────────────")
+        lines.append("🧐 *High-scan, zero-alert bots (tune filters?):*")
+        for r in high_scan_low_alert:
+            lines.append(
+                f"• {r['name']}: scanned={r['scanned']:,}, "
+                f"matches={r['matched']:,}, alerts={r['alerts']:,}"
+            )
 
     if top3:
         lines.append("────────────────")
