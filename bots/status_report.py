@@ -6,9 +6,9 @@ import time
 from dataclasses import dataclass, asdict
 from typing import Dict, Any, List
 
-from bots.shared import now_est  # reuse your EST timestamp helper
-
 import requests
+
+from bots.shared import now_est  # reuse your EST timestamp helper
 
 # Where we persist per-bot stats between scans
 STATS_PATH = os.getenv("STATUS_STATS_PATH", "/tmp/moneysignal_stats.json")
@@ -212,7 +212,7 @@ def _format_heartbeat() -> str:
     bot_rows_by_scans = sorted(bot_rows, key=lambda r: r["scanned"], reverse=True)
     top3 = [r for r in bot_rows_by_scans if r["scanned"] > 0][:3]
 
-        # Build message lines
+    # ---------------- Build message lines ----------------
     lines: List[str] = []
     lines.append("📡 *MoneySignalAI Heartbeat* ❤️")
     lines.append(f"⏰ {now_est()}")
@@ -223,15 +223,16 @@ def _format_heartbeat() -> str:
     lines.append("")
     lines.append("🤖 *Bot Status:*")
 
+    # Import here to avoid circular import at module import time
+    from bots.shared import is_bot_test_mode, is_bot_disabled  # type: ignore
+
     for r in bot_rows:
         name = r["name"]
         last_run_ts = r["last_run_ts"]
         last_run_str = r["last_run_str"]
 
-        # Mark test-mode bots (if any) with an icon
+        # Mark disabled / test-mode bots
         name_display = name
-        from bots.shared import is_bot_test_mode, is_bot_disabled  # safe small import
-
         if is_bot_disabled(name):
             name_display = f"{name} (DISABLED)"
         elif is_bot_test_mode(name):
