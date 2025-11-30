@@ -16,7 +16,7 @@ STATS_PATH = os.getenv("STATUS_STATS_PATH", "/tmp/moneysignal_stats.json")
 # Heartbeat minimum interval (minutes)
 HEARTBEAT_INTERVAL_MIN = float(os.getenv("STATUS_HEARTBEAT_INTERVAL_MIN", "5"))
 
-# Debug: if true, send a heartbeat EVERY time run_status() is called
+# Debug flag: if true, we force a heartbeat every scheduler cycle
 DEBUG_STATUS_PING_ENABLED = os.getenv("DEBUG_STATUS_PING_ENABLED", "false").lower() == "true"
 
 # Telegram routing (reuse same envs you already use)
@@ -226,15 +226,14 @@ def _format_heartbeat() -> str:
     lines.append("")
     lines.append("🤖 *Bot Status:*")
 
-    # Import these lazily to avoid circulars
-    from bots.shared import is_bot_test_mode, is_bot_disabled  # type: ignore
+    from bots.shared import is_bot_test_mode, is_bot_disabled  # local import to avoid cycles
 
     for r in bot_rows:
         name = r["name"]
         last_run_ts = r["last_run_ts"]
         last_run_str = r["last_run_str"]
 
-        # Mark test-mode bots (if any) with an icon
+        # Mark test-mode / disabled bots in label
         name_display = name
         if is_bot_disabled(name):
             name_display = f"{name} (DISABLED)"
@@ -252,8 +251,8 @@ def _format_heartbeat() -> str:
     lines.append(f"• Filter matches: **{total_matched:,}**")
     lines.append(f"• Alerts fired: **{total_alerts:,}**")
     lines.append("")
-
     lines.append("📈 *Per-bot metrics:*")
+
     for r in bot_rows:
         lines.append(
             f"• {r['name']}: scanned={r['scanned']:,} | "
@@ -308,29 +307,23 @@ async def run_status() -> None:
 
     Applies a minimum interval between heartbeats and sends a Telegram
     status message when it's time.
-    """
-    print("[status_report] run_status invoked")
 
+    When DEBUG_STATUS_PING_ENABLED=true, we *always* send a heartbeat
+    every time main.py schedules us, ignoring the min interval.
+    """
     data = _load_stats()
     last_hb = float(data.get("last_heartbeat_ts", 0.0))
     now_ts = time.time()
-    min_interval_sec = HEARTBEAT_INTERVAL_MIN * 60.0
 
-    if not DEBUG_STATUS_PING_ENABLED:
-        # Normal mode: respect min interval
+    if DEBUG_STATUS_PING_ENABLED:
+        print("[status_report] DEBUG_STATUS_PING_ENABLED=true — forcing heartbeat this cycle.")
+    else:
+        min_interval_sec = HEARTBEAT_INTERVAL_MIN * 60.0
         if now_ts - last_hb < min_interval_sec:
             print("[status_report] Heartbeat skipped (interval).")
             return
-    else:
-        # Debug mode: force send every call
-        print("[status_report] DEBUG mode enabled – sending heartbeat this cycle regardless of interval.")
 
-    try:
-        text = _format_heartbeat()
-    except Exception as e:
-        print(f"[status_report] ERROR building heartbeat text: {e}")
-        return
-
+    text = _format_heartbeat()
     _send_telegram_status(text)
 
     data["last_heartbeat_ts"] = now_ts
