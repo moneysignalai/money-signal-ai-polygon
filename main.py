@@ -20,30 +20,24 @@ def now_est_str() -> str:
 
 # ----------------- Global config -----------------
 
-# Default global base polling interval (used as minimum sleep)
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "20"))
 BOT_TIMEOUT_SECONDS = int(os.getenv("BOT_TIMEOUT_SECONDS", "40"))
 
-# Per-bot interval can be overridden via env:
-#   <BOTNAME_UPPER>_INTERVAL, e.g. OPTIONS_FLOW_INTERVAL=20
 def _interval_env(bot_name: str, default: int) -> int:
     key = f"{bot_name.upper()}_INTERVAL"
     try:
         v = int(os.getenv(key, str(default)))
-        return max(5, v)  # safety: minimum 5s
+        return max(5, v)
     except Exception:
         return default
 
 
-# DISABLED_BOTS: comma-separated list, e.g. "daily_ideas,options_indicator"
 DISABLED_BOTS = {
     b.strip().lower()
     for b in os.getenv("DISABLED_BOTS", "").replace(" ", "").split(",")
     if b.strip()
 }
 
-# TEST_MODE_BOTS: comma-separated list of bots that should be considered "test only"
-# (we'll surface this in status; bots can also check this via shared if needed)
 TEST_MODE_BOTS = {
     b.strip().lower()
     for b in os.getenv("TEST_MODE_BOTS", "").replace(" ", "").split(",")
@@ -51,7 +45,6 @@ TEST_MODE_BOTS = {
 }
 
 # ----------------- Bot registry -----------------
-# (public_name, module_path, function_name, default_interval_seconds)
 
 _BOT_DEFS: List[Tuple[str, str, str, int]] = [
     ("premarket", "bots.premarket", "run_premarket", 60),
@@ -68,8 +61,6 @@ _BOT_DEFS: List[Tuple[str, str, str, int]] = [
     ("daily_ideas", "bots.daily_ideas", "run_daily_ideas", 600),
 ]
 
-# Final BOTS list with resolved intervals (after env overrides & disabled filter)
-# (public_name, module_path, function_name, interval_seconds)
 BOTS: List[Tuple[str, str, str, int]] = []
 for name, mod, func, base_interval in _BOT_DEFS:
     if name.lower() in DISABLED_BOTS:
@@ -85,9 +76,6 @@ app = FastAPI(title="MoneySignalAI", version="1.0.0")
 
 @app.get("/")
 async def root():
-    """
-    Basic status endpoint.
-    """
     return {
         "status": "ok",
         "now_est": now_est_str(),
@@ -115,16 +103,12 @@ async def health():
 # ----------------- Scheduler logic -----------------
 
 async def _run_single_bot(public_name: str, module_path: str, func_name: str, record_error):
-    """
-    Import and run a single bot with a per-bot timeout.
-    """
     try:
         module = importlib.import_module(module_path)
         func = getattr(module, func_name, None)
         if func is None:
             raise AttributeError(f"{module_path} has no attribute {func_name}")
 
-        # If the bot function is async, await it; otherwise run in thread pool.
         if asyncio.iscoroutinefunction(func):
             await asyncio.wait_for(func(), timeout=BOT_TIMEOUT_SECONDS)
         else:
@@ -141,45 +125,47 @@ async def _run_single_bot(public_name: str, module_path: str, func_name: str, re
 
 
 async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS):
-    """
-    Main async loop that runs bots on their own cadence.
-
-    Each bot has its own interval, but we tick the loop every `base_interval_seconds`.
-    """
     print(
         f"[main] scheduler_loop starting with base_interval={base_interval_seconds}s, "
         f"bot_timeout={BOT_TIMEOUT_SECONDS}s"
     )
 
-    # Lazy import status_report helpers so we can log errors & send heartbeat
+    # Import status helpers
     try:
-        from bots.status_report import run_status, record_error
+        from bots.status_report import (
+            run_status,
+            record_error,
+            send_heartbeat,
+            HEARTBEAT_MIN_INTERVAL_MIN,
+        )
     except Exception as e:
-        print(f"[main] WARNING: could not import bots.status_report: {e}")
-        run_status = None  # type: ignore
+        print(f"[main] WARNING: failed to import status_report: {e}")
+        run_status = None   # type: ignore
+        send_heartbeat = None  # type: ignore
         record_error = None  # type: ignore
 
-    # Per-bot next-run timestamps
-    next_run_ts: Dict[str, float] = {}
-    now_ts = time_now = datetime.now(eastern).timestamp()
-    for name, _, _, interval in BOTS:
-        # Run everything once on startup
-        next_run_ts[name] = time_now
+    last_heartbeat_ts = 0
 
-    # Log configuration
+    # Next-run timestamps
+    next_run_ts: Dict[str, float] = {}
+    now_ts = datetime.now(eastern).timestamp()
+    for name, _, _, interval in BOTS:
+        next_run_ts[name] = now_ts
+
     print("[main] Bot configuration:")
     for name, module_path, func_name, interval in _BOT_DEFS:
-        state = []
+        labels = []
         if name.lower() in DISABLED_BOTS:
-            state.append("DISABLED")
+            labels.append("DISABLED")
         if name.lower() in TEST_MODE_BOTS:
-            state.append("TEST_MODE")
-        state_str = f" ({', '.join(state)})" if state else ""
+            labels.append("TEST_MODE")
+        label_txt = f" ({', '.join(labels)})" if labels else ""
         effective_interval = _interval_env(name, interval)
-        print(f"  - {name}: {module_path}.{func_name}, interval={effective_interval}s{state_str}")
+        print(f"  - {name}: {module_path}.{func_name}, interval={effective_interval}s{label_txt}")
 
     import time
 
+    # MAIN LOOP
     while True:
         cycle_start_dt = datetime.now(eastern)
         cycle_start_ts = cycle_start_dt.timestamp()
@@ -187,7 +173,7 @@ async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS):
 
         tasks: List[asyncio.Task] = []
 
-        # 1) schedule bots whose next_run_ts is due
+        # Run due bots
         for name, module_path, func_name, interval in BOTS:
             due_ts = next_run_ts.get(name, 0.0)
             if cycle_start_ts >= due_ts:
@@ -199,14 +185,26 @@ async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS):
                 )
                 next_run_ts[name] = cycle_start_ts + interval
 
-        # 2) schedule status_report.run_status, if available
+        # Status report (detailed per cycle)
         if run_status is not None:
             try:
                 tasks.append(asyncio.create_task(run_status()))
             except Exception as e:
                 print(f"[main] ERROR scheduling run_status: {e}")
 
-        # 3) wait for all tasks to complete (errors logged inside tasks)
+        # HEARTBEAT (every X minutes)
+        if send_heartbeat is not None:
+            if HEARTBEAT_MIN_INTERVAL_MIN > 0:
+                now_ts = time.time()
+                if now_ts - last_heartbeat_ts >= HEARTBEAT_MIN_INTERVAL_MIN * 60:
+                    try:
+                        print("[main] sending heartbeat...")
+                        send_heartbeat()
+                        last_heartbeat_ts = now_ts
+                    except Exception as e:
+                        print(f"[main] ERROR sending heartbeat: {e}")
+
+        # Wait for all tasks
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -218,9 +216,6 @@ async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS):
 
 
 def _start_background_scheduler():
-    """
-    Run the async scheduler loop in a dedicated background thread.
-    """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(scheduler_loop())
@@ -228,7 +223,6 @@ def _start_background_scheduler():
 
 @app.on_event("startup")
 async def startup_event():
-    """FastAPI startup hook."""
     print(f"[main] startup_event fired at {now_est_str()}")
     print(
         f"[main] launching background scheduler thread "
