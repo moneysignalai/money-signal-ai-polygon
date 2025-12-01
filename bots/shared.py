@@ -298,7 +298,7 @@ def _http_get_json(
     return None
 
 
-# ---------------- DYNAMIC UNIVERSE (OPTIMIZED) ----------------
+# ---------------- DYNAMIC UNIVERSE (NOW STATIC FROM ENV) ----------------
 
 _UNIVERSE_CACHE: Dict[str, Any] = {"ts": 0.0, "data": []}
 
@@ -308,124 +308,46 @@ def get_dynamic_top_volume_universe(
     volume_coverage: float = 0.90,
 ) -> List[str]:
     """
-    Use Polygon's previous day's most-active (by dollar volume) to build a liquid universe.
+    (UPDATED) Global universe resolver.
 
-    Optimizations:
-      • 60s in-process cache to avoid hammering Polygon
-      • Faster timeouts (7s) + 1 retry instead of 2
-      • Clean fallback to FALLBACK_TICKER_UNIVERSE when Polygon is slow/empty
+    NEW BEHAVIOR:
+      • Ignores Polygon & FALLBACK_TICKER_UNIVERSE.
+      • Reads TICKER_UNIVERSE from ENV and uses ONLY that list.
+      • Returns [] if TICKER_UNIVERSE is empty or missing.
+
+    Example ENV:
+      TICKER_UNIVERSE=SPY,QQQ,TSLA,NVDA,AAPL,AMD
     """
+    env = os.getenv("TICKER_UNIVERSE", "") or ""
+    raw = env.replace('"', "").strip()
+
+    if not raw:
+        print("[shared] TICKER_UNIVERSE env is empty; returning [].")
+        _UNIVERSE_CACHE["ts"] = time.time()
+        _UNIVERSE_CACHE["data"] = []
+        return []
+
+    tickers = [t.strip().upper() for t in raw.split(",") if t.strip()]
+
+    if not tickers:
+        print("[shared] TICKER_UNIVERSE parsed to 0 symbols; returning [].")
+        _UNIVERSE_CACHE["ts"] = time.time()
+        _UNIVERSE_CACHE["data"] = []
+        return []
+
+    # Simple in-process cache so repeated calls in a tight loop don't re-parse
     now_ts = time.time()
+    cached = _UNIVERSE_CACHE.get("data") or []
+    cached_ts = float(_UNIVERSE_CACHE.get("ts") or 0.0)
 
-    # 60-second cache to avoid repeated heavy calls
-    if _UNIVERSE_CACHE["data"] and now_ts - float(_UNIVERSE_CACHE["ts"]) < 60.0:
-        data: List[str] = _UNIVERSE_CACHE["data"]
-        return data[:max_tickers]
+    if cached and cached_ts and now_ts - cached_ts < 60.0:
+        # Still update the cache slice in case max_tickers changed
+        return list(cached)[:max_tickers]
 
-    # If no Polygon key, go straight to fallback
-    if not POLYGON_KEY:
-        print("[shared] POLYGON_KEY missing; using FALLBACK_TICKER_UNIVERSE")
-        env = os.getenv("FALLBACK_TICKER_UNIVERSE", "")
-        tickers = [t.strip().upper() for t in env.replace('"', "").split(",") if t.strip()]
-        if not tickers:
-            print("[shared] FALLBACK_TICKER_UNIVERSE empty; returning [].")
-            _UNIVERSE_CACHE["ts"] = now_ts
-            _UNIVERSE_CACHE["data"] = []
-            return []
-        print(f"[shared] fallback universe: {len(tickers)} names (no POLYGON_KEY)")
-        _UNIVERSE_CACHE["ts"] = now_ts
-        _UNIVERSE_CACHE["data"] = tickers[:max_tickers]
-        return tickers[:max_tickers]
-
-    # Apply global caps from env for safety
-    try:
-        env_cap = int(os.getenv("DYNAMIC_MAX_TICKERS", str(max_tickers)))
-        max_tickers = max(1, min(max_tickers, env_cap))
-    except Exception:
-        pass
-
-    try:
-        env_cov = os.getenv("DYNAMIC_VOLUME_COVERAGE")
-        if env_cov is not None:
-            volume_coverage = float(env_cov)
-    except Exception:
-        pass
-
-    today = today_est_date()
-    prev = today - timedelta(days=1)
-    from_ = prev.isoformat()
-
-    url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{from_}"
-    params = {"adjusted": "true", "apiKey": POLYGON_KEY}
-
-    # Slightly tighter timeout + fewer retries for responsiveness
-    data = _http_get_json(
-        url,
-        params,
-        tag="shared:universe",
-        timeout=7.0,
-        retries=1,
-        backoff_seconds=2.0,
-    )
-
-    # ---------- FALLBACK IF POLYGON RETURNS NOTHING ----------
-    results = data.get("results") if data else None
-    if not results:
-        print("[shared] Polygon universe empty/slow — using FALLBACK_TICKER_UNIVERSE")
-        env = os.getenv("FALLBACK_TICKER_UNIVERSE", "")
-        tickers = [t.strip().upper() for t in env.replace('"', "").split(",") if t.strip()]
-        if not tickers:
-            print("[shared] FALLBACK_TICKER_UNIVERSE empty; returning [].")
-            _UNIVERSE_CACHE["ts"] = now_ts
-            _UNIVERSE_CACHE["data"] = []
-            return []
-        print(f"[shared] fallback universe: {len(tickers)} names")
-        _UNIVERSE_CACHE["ts"] = now_ts
-        _UNIVERSE_CACHE["data"] = tickers[:max_tickers]
-        return tickers[:max_tickers]
-    # ----------------------------------------------------------
-
-    enriched: List[Tuple[str, float]] = []
-    for row in results:
-        sym = row.get("T")
-        vol = float(row.get("v") or 0.0)
-        vwap = float(row.get("vw") or 0.0)
-        dollar_vol = vol * max(vwap, 0.0)
-        if not sym or dollar_vol <= 0:
-            continue
-        enriched.append((sym, dollar_vol))
-
-    if not enriched:
-        print("[shared] dynamic universe: 0 names after filtering — using fallback.")
-        env = os.getenv("FALLBACK_TICKER_UNIVERSE", "")
-        tickers = [t.strip().upper() for t in env.replace('"', "").split(",") if t.strip()]
-        if not tickers:
-            print("[shared] FALLBACK_TICKER_UNIVERSE empty; returning [].")
-            _UNIVERSE_CACHE["ts"] = now_ts
-            _UNIVERSE_CACHE["data"] = []
-            return []
-        print(f"[shared] fallback universe: {len(tickers)} names")
-        _UNIVERSE_CACHE["ts"] = now_ts
-        _UNIVERSE_CACHE["data"] = tickers[:max_tickers]
-        return tickers[:max_tickers]
-
-    enriched.sort(key=lambda x: x[1], reverse=True)
-
-    universe: List[str] = []
-    total_dollar = sum(row[1] for row in enriched)
-    running = 0.0
-    for sym, dv in enriched:
-        universe.append(sym)
-        running += dv
-        if len(universe) >= max_tickers:
-            break
-        if total_dollar > 0 and running / total_dollar >= volume_coverage:
-            break
-
-    print(f"[shared] dynamic universe: {len(universe)} names, covers ~{volume_coverage*100:.0f}% vol.")
+    print(f"[shared] using TICKER_UNIVERSE from env: {len(tickers)} names")
     _UNIVERSE_CACHE["ts"] = now_ts
-    _UNIVERSE_CACHE["data"] = universe
-    return universe
+    _UNIVERSE_CACHE["data"] = tickers
+    return tickers[:max_tickers]
 
 
 # ---------------- ETF BLACKLIST ----------------
