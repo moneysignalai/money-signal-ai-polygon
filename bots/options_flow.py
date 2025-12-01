@@ -14,7 +14,7 @@ import os
 import time
 import json
 from datetime import datetime, date
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import pytz
 
@@ -30,6 +30,7 @@ from bots.shared import (
     is_bot_test_mode,
     is_bot_disabled,
     debug_filter_reason,
+    resolve_universe_for_bot,  # ✅ central universe resolver
 )
 from bots.status_report import record_bot_stats  # ✅ status-report integration
 
@@ -75,14 +76,14 @@ MIN_UNDERLYING_PRICE = float(os.getenv("OPTIONS_MIN_UNDERLYING_PRICE", "5.0"))
 MAX_UNIVERSE = int(os.getenv("OPTIONS_FLOW_MAX_UNIVERSE", "120"))
 
 # Per-day de-dupe (per category, per contract)
-_alert_date: date | None = None
-_seen_cheap: set[str] = set()
-_seen_unusual: set[str] = set()
-_seen_whale: set[str] = set()
-_seen_ivcrush: set[str] = set()  # IV crush per contract
+_alert_date: Optional[date] = None
+_seen_cheap: Set[str] = set()
+_seen_unusual: Set[str] = set()
+_seen_whale: Set[str] = set()
+_seen_ivcrush: Set[str] = set()  # IV crush per contract
 
 # IV cache (prev day IV per underlying+expiry)
-_iv_cache: dict = {}
+_iv_cache: Dict[str, Any] = {}
 
 
 def _reset_if_new_day() -> None:
@@ -97,7 +98,7 @@ def _reset_if_new_day() -> None:
         print("[options_flow] New trading day – reset seen-contract sets and IV cache.")
 
 
-def _load_iv_cache() -> dict:
+def _load_iv_cache() -> Dict[str, Any]:
     global _iv_cache
     path = os.getenv("OPTIONS_IV_CACHE_PATH", "/tmp/options_iv_cache.json")
     try:
@@ -121,7 +122,7 @@ def _save_iv_cache() -> None:
         print(f"[options_flow] iv_cache save error: {e}")
 
 
-def _safe_float(x, default: float | None = None) -> Optional[float]:
+def _safe_float(x, default: Optional[float] = None) -> Optional[float]:
     try:
         if x is None:
             return default
@@ -130,7 +131,7 @@ def _safe_float(x, default: float | None = None) -> Optional[float]:
         return default
 
 
-def _safe_int(x, default: int | None = None) -> Optional[int]:
+def _safe_int(x, default: Optional[int] = None) -> Optional[int]:
     try:
         if x is None:
             return default
@@ -215,28 +216,20 @@ def _format_time() -> str:
 
 # ---------------- UNIVERSE RESOLUTION ----------------
 
-def _resolve_universe() -> list[str]:
+def _resolve_universe() -> List[str]:
     """
     Decide which underlyings to scan for options flow.
 
-    Priority:
+    Priority (handled by shared.resolve_universe_for_bot):
       1. OPTIONS_FLOW_TICKER_UNIVERSE (comma-separated)
       2. TICKER_UNIVERSE (your existing global universe)
-      3. dynamic top-volume universe from shared.py
+      3. dynamic top-volume universe / FALLBACK_TICKER_UNIVERSE
     """
-    from bots.shared import get_dynamic_top_volume_universe
-
-    # Allow a dedicated override
-    env = os.getenv("OPTIONS_FLOW_TICKER_UNIVERSE")
-    if env:
-        return [t.strip().upper() for t in env.split(",") if t.strip()]
-
-    # else fall back to your normal dynamic + global TICKER_UNIVERSE
-    env2 = os.getenv("TICKER_UNIVERSE")
-    if env2:
-        return [t.strip().upper() for t in env2.split(",") if t.strip()]
-
-    return get_dynamic_top_volume_universe(max_tickers=MAX_UNIVERSE, volume_coverage=0.90)
+    return resolve_universe_for_bot(
+        bot_name="options_flow",
+        max_tickers=MAX_UNIVERSE,
+        bot_env_var="OPTIONS_FLOW_TICKER_UNIVERSE",
+    )
 
 
 # ---------------- IV CRUSH CHECK ----------------
@@ -355,7 +348,7 @@ async def run_options_flow():
     test_mode = is_bot_test_mode(BOT_NAME)
     start_ts = time.time()
     alerts_sent = 0
-    matched_contracts: set[str] = set()
+    matched_contracts: Set[str] = set()
 
     universe = _resolve_universe()
     if not universe:
@@ -516,7 +509,7 @@ async def run_options_flow():
             dte_str = f"{dte} days" if dte is not None else "N/A"
             cp_letter = "C" if cp == "CALL" else "P" if cp == "PUT" else "?"
 
-            # Base contract line (pretty)
+            # Base contract line (pretty but simple – no raw O: ticker)
             exp_str2 = expiry.strftime('%b %d %Y') if expiry else 'N/A'
             contract_line = f"{under} {exp_str2} {cp_letter}"
 
