@@ -1,403 +1,285 @@
-# bots/options_flow.py
-#
-# Unified options flow scanner:
-#   – CHEAP lottos
-#   – UNUSUAL sweeps
-#   – WHALE-sized orders
-#   – IV CRUSH (big IV drops on short-dated options)
-#
-# Reads env thresholds from the same vars you already use:
-#   CHEAP_* , UNUSUAL_* , WHALES_* , IVCRUSH_*
-# So you don't need to change your environment.
-
 import os
-import time
-import json
-from datetime import date
-from typing import Any, Dict, List, Optional, Set
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
-import pytz
-
-from bots.shared import (
-    POLYGON_KEY,
-    send_alert,
-    chart_link,
+from .shared import (
     now_est,
-    is_etf_blacklisted,
-    minutes_since_midnight_est,
+    in_rth_window_est,
+    debug_filter_reason,
+    resolve_universe_for_bot,
     get_option_chain_cached,
     get_last_option_trades_cached,
-    is_bot_test_mode,
-    is_bot_disabled,
-    debug_filter_reason,
+    record_bot_stats,
+    chart_link,
+    send_alert,
 )
 
-from bots.status_report import record_bot_stats  # status-report integration
+# ---------------- ENV / CONFIG ----------------
 
-eastern = pytz.timezone("US/Eastern")
+OPTIONS_FLOW_TICKER_UNIVERSE = os.getenv("OPTIONS_FLOW_TICKER_UNIVERSE")
+OPTIONS_FLOW_MAX_UNIVERSE = int(os.getenv("OPTIONS_FLOW_MAX_UNIVERSE", "500"))
 
-# ---------------- TIME WINDOW (RTH) ----------------
+OPTIONS_MIN_UNDERLYING_PRICE = float(os.getenv("OPTIONS_MIN_UNDERLYING_PRICE", "5.0"))
 
-RTH_START_MIN = 9 * 60 + 30   # 09:30
-RTH_END_MIN   = 16 * 60       # 16:00
+CHEAP_MAX_PREMIUM = float(os.getenv("CHEAP_MAX_PREMIUM", "0.75"))
+CHEAP_MIN_SIZE = int(os.getenv("CHEAP_MIN_SIZE", "20"))
+CHEAP_MIN_NOTIONAL = float(os.getenv("CHEAP_MIN_NOTIONAL", "5000"))
 
+UNUSUAL_MIN_SIZE = int(os.getenv("UNUSUAL_MIN_SIZE", "50"))
+UNUSUAL_MIN_NOTIONAL = float(os.getenv("UNUSUAL_MIN_NOTIONAL", "75000"))
+UNUSUAL_MAX_DTE = int(os.getenv("UNUSUAL_MAX_DTE", "45"))
 
-def _in_rth_window() -> bool:
-    mins = minutes_since_midnight_est()
-    return RTH_START_MIN <= mins <= RTH_END_MIN
-
-
-# ---------------- CONFIG (reuses your env vars) ----------------
-
-# Cheap lottos
-CHEAP_MAX_PREMIUM   = float(os.getenv("CHEAP_MAX_PREMIUM", "0.40"))
-CHEAP_MIN_SIZE      = int(os.getenv("CHEAP_MIN_SIZE", "50"))
-CHEAP_MIN_NOTIONAL  = float(os.getenv("CHEAP_MIN_NOTIONAL", "5000"))
-
-# Unusual sweeps
-UNUSUAL_MIN_NOTIONAL  = float(os.getenv("UNUSUAL_MIN_NOTIONAL", "75000"))
-UNUSUAL_MIN_SIZE      = int(os.getenv("UNUSUAL_MIN_SIZE", "20"))
-UNUSUAL_MAX_DTE       = int(os.getenv("UNUSUAL_MAX_DTE", "45"))
-
-# Whale flows
+WHALES_MIN_SIZE = int(os.getenv("WHALES_MIN_SIZE", "75"))
 WHALES_MIN_NOTIONAL = float(os.getenv("WHALES_MIN_NOTIONAL", "300000"))
-WHALES_MIN_SIZE     = int(os.getenv("WHALES_MIN_SIZE", "75"))
-WHALES_MAX_DTE      = int(os.getenv("WHALES_MAX_DTE", "90"))
+WHALES_MAX_DTE = int(os.getenv("WHALES_MAX_DTE", "120"))
 
-# IV crush settings
-IVCRUSH_MIN_IV_DROP_PCT = float(os.getenv("IVCRUSH_MIN_IV_DROP_PCT", "25"))
-IVCRUSH_MIN_VOL         = int(os.getenv("IVCRUSH_MIN_VOL", "100"))
-IVCRUSH_MAX_DTE         = int(os.getenv("IVCRUSH_MAX_DTE", "21"))
+IVCRUSH_MIN_IV_DROP_PCT = float(os.getenv("IVCRUSH_MIN_IV_DROP_PCT", "25.0"))
+IVCRUSH_MIN_VOL = int(os.getenv("IVCRUSH_MIN_VOL", "100"))
+IVCRUSH_MAX_DTE = int(os.getenv("IVCRUSH_MAX_DTE", "21"))
 
-# Underlying price floor (ignore micro-cap garbage by default)
-MIN_UNDERLYING_PRICE = float(os.getenv("OPTIONS_MIN_UNDERLYING_PRICE", "5.0"))
+OPTIONS_IV_CACHE_PATH = os.getenv("OPTIONS_IV_CACHE_PATH", "/tmp/options_iv_cache.json")
 
-# Universe size
-MAX_UNIVERSE = int(os.getenv("OPTIONS_FLOW_MAX_UNIVERSE", "120"))
-
-# Per-day de-dupe (per category, per contract)
-_alert_date: Optional[date] = None
-_seen_cheap: Set[str] = set()
-_seen_unusual: Set[str] = set()
-_seen_whale: Set[str] = set()
-_seen_ivcrush: Set[str] = set()  # IV crush per contract
-
-# IV cache (prev day IV per underlying+expiry)
-_iv_cache: Dict[str, Any] = {}
+# ---------------- DATA STRUCTURES ----------------
 
 
-def _reset_if_new_day() -> None:
-    """Reset seen sets once per calendar day."""
-    global _alert_date, _seen_cheap, _seen_unusual, _seen_whale, _seen_ivcrush
-    today = date.today()
-    if _alert_date != today:
-        _alert_date = today
-        _seen_cheap.clear()
-        _seen_unusual.clear()
-        _seen_whale.clear()
-        _seen_ivcrush.clear()
-        print("[options_flow] New trading day – reset seen-contract sets and IV cache.")
+@dataclass
+class OptionFlowRecord:
+    symbol: str
+    contract: str
+    category: str  # CHEAP | UNUSUAL | WHALE | IVCRUSH
+    direction: str  # CALL / PUT / MIXED / UNKNOWN
+    price: float
+    size: int
+    notional: float
+    dte: int
+    expiry: str
+    cp: str
+    reasons: List[str]
 
 
-def _load_iv_cache() -> Dict[str, Any]:
-    """Load IV cache from disk (non-fatal if missing/corrupt)."""
-    global _iv_cache
-    path = os.getenv("OPTIONS_IV_CACHE_PATH", "/tmp/options_iv_cache.json")
+# ---------------- HELPERS ----------------
+
+
+def _safe_float(val: Any) -> Optional[float]:
     try:
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                _iv_cache = json.load(f) or {}
-                if not isinstance(_iv_cache, dict):
-                    _iv_cache = {}
-    except Exception as e:
-        print(f"[options_flow] iv_cache load error: {e}")
-        _iv_cache = {}
-    return _iv_cache
-
-
-def _save_iv_cache() -> None:
-    """Persist IV cache for tomorrow's comparison."""
-    path = os.getenv("OPTIONS_IV_CACHE_PATH", "/tmp/options_iv_cache.json")
-    try:
-        with open(path, "w") as f:
-            json.dump(_iv_cache, f)
-    except Exception as e:
-        print(f"[options_flow] iv_cache save error: {e}")
-
-
-def _safe_float(x, default: Optional[float] = None) -> Optional[float]:
-    try:
-        if x is None:
-            return default
-        return float(x)
-    except (TypeError, ValueError):
-        return default
-
-
-def _safe_int(x, default: Optional[int] = None) -> Optional[int]:
-    try:
-        if x is None:
-            return default
-        return int(x)
-    except (TypeError, ValueError):
-        return default
-
-
-def _parse_option_symbol(sym: str):
-    """
-    Polygon option symbol example: O:TSLA251121C00450000
-
-    Underlying: TSLA
-    Expiry: 2025-11-21
-    Call/Put: C or P
-    Strike: 450.00
-    """
-    from datetime import date as _date
-
-    if not sym or not sym.startswith("O:"):
-        return None, None, None, None
-
-    try:
-        core = sym[2:]  # drop 'O:'
-        under = core[:-15]
-        date_part = core[-15:-9]  # YYMMDD
-        cp = core[-9:-8]
-        strike_part = core[-8:]
-
-        yy = int(date_part[0:2])
-        mm = int(date_part[2:4])
-        dd = int(date_part[4:6])
-        year = 2000 + yy
-        expiry = _date(year, mm, dd)
-
-        strike = float(strike_part) / 1000.0
-        if cp == "C":
-            cptype = "CALL"
-        elif cp == "P":
-            cptype = "PUT"
-        else:
-            cptype = None
-        return under, expiry, cptype, strike
+        if val is None:
+            return None
+        return float(val)
     except Exception:
-        return None, None, None, None
-
-
-def _days_to_expiry(expiry: Optional[date]) -> Optional[int]:
-    if not expiry:
         return None
-    today = date.today()
-    delta = (expiry - today).days
-    return delta
 
 
-def _contract_type(opt: Dict[str, Any], cp_raw: Optional[str]) -> Optional[str]:
-    cp = cp_raw
-    if not cp:
-        cp = opt.get("contract_type") or opt.get("type")
-    if isinstance(cp, str):
-        c = cp.upper()[0]
-        if c == "C":
+def _safe_int(val: Any) -> Optional[int]:
+    try:
+        if val is None:
+            return None
+        return int(val)
+    except Exception:
+        return None
+
+
+def _parse_option_details(opt: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+    """
+    Try to pull expiry, contract ticker, and DTE from the snapshot object.
+    We expect something like:
+
+      opt["details"]["ticker"] -> "O:TSLA240118C00255000"
+      opt["details"]["expiration_date"] -> "2024-01-18"
+
+    Massive / Polygon sometimes vary naming slightly; we guard for that.
+    """
+    details = opt.get("details") or {}
+    contract = details.get("ticker") or opt.get("ticker")
+    expiry = details.get("expiration_date") or details.get("expiry") or details.get("expiration")
+
+    dte = None
+    if expiry:
+        try:
+            # expiry like "2024-01-18"
+            from datetime import datetime as _dt
+
+            dt_exp = _dt.strptime(expiry, "%Y-%m-%d").date()
+            today = now_est().date()
+            dte = (dt_exp - today).days
+        except Exception:
+            dte = None
+
+    return expiry, contract, dte
+
+
+def _contract_type(contract: str) -> Optional[str]:
+    """
+    Crudely detect CALL/PUT from contract symbol (polygon / massive style).
+      • Contains "C" before strike -> CALL
+      • Contains "P" before strike -> PUT
+    """
+    if not contract:
+        return None
+    try:
+        base = contract.replace("O:", "")
+        if "C" in base and "P" not in base:
             return "CALL"
-        if c == "P":
+        if "P" in base and "C" not in base:
             return "PUT"
+    except Exception:
+        pass
     return None
 
 
-def _underlying_price_from_opt(opt: Dict[str, Any]) -> Optional[float]:
-    ua = opt.get("underlying_asset") or {}
-    last = ua.get("last_price") or ua.get("lastTrade") or {}
-    if isinstance(last, dict):
-        price = last.get("price") or last.get("p")
-    else:
-        price = last
-    return _safe_float(price)
+def _categorize(
+    price: float,
+    size: int,
+    notional: float,
+    dte: int,
+) -> Tuple[Optional[str], List[str]]:
+    """
+    Decide which primary category this flow belongs to.
+    """
+    reasons: List[str] = []
+    category: Optional[str] = None
+
+    # CHEAP: small premium, but decent size & notional
+    if price <= CHEAP_MAX_PREMIUM and size >= CHEAP_MIN_SIZE and notional >= CHEAP_MIN_NOTIONAL:
+        category = "CHEAP"
+        reasons.append("cheap_premium")
+
+    # UNUSUAL: large, short-dated
+    if (
+        dte is not None
+        and 0 <= dte <= UNUSUAL_MAX_DTE
+        and size >= UNUSUAL_MIN_SIZE
+        and notional >= UNUSUAL_MIN_NOTIONAL
+    ):
+        # If already CHEAP, flag both
+        category = category or "UNUSUAL"
+        reasons.append("unusual_size_notional")
+
+    # WHALES: very large size + notional, more relaxed DTE
+    if (
+        dte is not None
+        and 0 <= dte <= WHALES_MAX_DTE
+        and size >= WHALES_MIN_SIZE
+        and notional >= WHALES_MIN_NOTIONAL
+    ):
+        category = category or "WHALE"
+        reasons.append("whale_size_notional")
+
+    return category, reasons
 
 
-def _format_time() -> str:
-    return now_est()
+def _maybe_iv_crush(opt: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """
+    Very rough IV-crush detection using snapshot IV + day stats (if available).
+    """
+    reasons: List[str] = []
+    iv = _safe_float(opt.get("implied_volatility") or opt.get("iv"))
+    day = opt.get("day") or {}
+    vol = _safe_int(day.get("volume") or day.get("v"))
+    if iv is None or vol is None:
+        return False, reasons
 
+    iv_open = _safe_float(day.get("implied_volatility_open") or day.get("iv_open") or day.get("ivOpen"))
+    if iv_open is None or iv_open <= 0:
+        return False, reasons
 
-# ---------------- UNIVERSE RESOLUTION ----------------
+    drop_pct = 100.0 * (iv_open - iv) / iv_open
+    if drop_pct >= IVCRUSH_MIN_IV_DROP_PCT and vol >= IVCRUSH_MIN_VOL:
+        reasons.append(f"iv_drop≈{drop_pct:.1f}%")
+        return True, reasons
+
+    return False, reasons
+
 
 def _resolve_universe() -> List[str]:
     """
-    Decide which underlyings to scan for options flow.
-
-    Priority:
-      1. OPTIONS_FLOW_TICKER_UNIVERSE (comma-separated)
-      2. TICKER_UNIVERSE (your existing global universe)
-      3. dynamic top-volume universe from shared.py
+    Universe for options flow:
+      1) OPTIONS_FLOW_TICKER_UNIVERSE env if set.
+      2) Else TICKER_UNIVERSE/FALLBACK_TICKER_UNIVERSE via shared helper.
     """
-    from bots.shared import get_dynamic_top_volume_universe
-
-    # Allow a dedicated override
-    env = os.getenv("OPTIONS_FLOW_TICKER_UNIVERSE")
-    if env:
-        return [t.strip().upper() for t in env.split(",") if t.strip()]
-
-    # else fall back to your normal dynamic + global TICKER_UNIVERSE
-    env2 = os.getenv("TICKER_UNIVERSE")
-    if env2:
-        return [t.strip().upper() for t in env2.split(",") if t.strip()]
-
-    return get_dynamic_top_volume_universe(max_tickers=MAX_UNIVERSE, volume_coverage=0.90)
-
-
-# ---------------- IV CRUSH CHECK ----------------
-
-def _maybe_iv_crush(
-    sym: str,
-    contract: str,
-    under: str,
-    expiry: Optional[date],
-    dte: Optional[int],
-    opt: Dict[str, Any],
-    size: int,
-    time_str: str,
-) -> None:
-    """
-    Track implied volatility per underlying+expiry and fire an alert when IV
-    drops sharply (IVCRUSH_MIN_IV_DROP_PCT) on decent volume (IVCRUSH_MIN_VOL).
-    """
-    from datetime import date as _date
-
-    # Only care about reasonably short-dated options
-    if dte is None or dte < 0 or dte > IVCRUSH_MAX_DTE:
-        return
-    if size < IVCRUSH_MIN_VOL:
-        return
-
-    iv = opt.get("implied_volatility") or (opt.get("day") or {}).get("implied_volatility")
-    try:
-        iv = float(iv)
-    except (TypeError, ValueError):
-        return
-    if iv <= 0:
-        return
-
-    today_str = str(_date.today())
-    key = f"{under}:{expiry}"
-    prev = _iv_cache.get(key)
-    if prev and prev.get("date") != today_str:
-        prev_iv = float(prev.get("iv") or 0.0)
-    else:
-        prev_iv = None
-
-    # If no previous IV, we can't compute a drop yet
-    if prev_iv is None or prev_iv <= 0:
-        _iv_cache[key] = {"iv": iv, "date": today_str}
-        return
-
-    # Compute IV drop
-    drop_pct = (prev_iv - iv) / prev_iv * 100.0
-    if drop_pct < IVCRUSH_MIN_IV_DROP_PCT:
-        return
-
-    # Avoid spamming multiple IV crush alerts for same contract/day
-    if contract in _seen_ivcrush:
-        return
-
-    # Build alert body
-    header = f"🧊 IV CRUSH — {sym}"
-    exp_str = expiry.strftime("%b %d %Y") if expiry else "N/A"
-    body_lines = [
-        header,
-        f"🕒 {time_str}",
-        "────────────",
-        f"🎯 Contract: {under} {exp_str}",
-        f"📦 Size: {size:,}",
-        f"📉 IV Drop: {drop_pct:.1f}%",
-        f"🔗 Chart: {chart_link(sym)}",
-        "",
-        "Big IV crush on short-dated options.",
-    ]
-    extra_text = "\n".join(body_lines)
-
-    # We don't need super precise underlying here → pass 0.0
-    send_alert("iv_crush", sym, 0.0, 0.0, extra=extra_text)
-    _seen_ivcrush.add(contract)
+    if OPTIONS_FLOW_TICKER_UNIVERSE:
+        syms = [s.strip().upper() for s in OPTIONS_FLOW_TICKER_UNIVERSE.split(",") if s.strip()]
+        return syms[:OPTIONS_FLOW_MAX_UNIVERSE]
+    return resolve_universe_for_bot("options_flow", max_tickers=OPTIONS_FLOW_MAX_UNIVERSE)
 
 
 # ---------------- MAIN BOT ----------------
 
-async def run_options_flow():
+
+async def run_options_flow() -> None:
     """
-    Unified options flow scanner.
-
-    For each symbol in universe:
-      1. Fetch option chain once via get_option_chain_cached().
-      2. For each option:
-           - Fetch last trade via get_last_option_trades_cached().
-           - Compute price, size, notional, DTE, contract type, underlying price.
-           - Classify into ONE of:
-               a) WHALE (highest priority)
-               b) UNUSUAL
-               c) CHEAP
-           - Independently, also check for IV CRUSH conditions and fire a
-             separate IV CRUSH alert per contract per day.
-           - Fire a single alert per contract per category per day.
+    Scan a universe of underlyings for interesting options flow using
+    Massive/Polygon snapshot chains plus the last-trade endpoint as a fallback.
     """
-    if not POLYGON_KEY:
-        print("[options_flow] POLYGON_KEY missing; skipping.")
+    start_ts = now_est()
+    start_unix = time.time()
+
+    import time as _time
+
+    if not in_rth_window_est():
+        # Only run during RTH; options flow outside RTH is less useful.
+        print("[options_flow] outside RTH window; skipping run.")
+        record_bot_stats("Options Flow", 0, 0, 0, 0.0)
         return
-
-    bot_name = "options_flow"
-    if is_bot_disabled(bot_name):
-        print("[options_flow] disabled via DISABLED_BOTS; skipping.")
-        return
-
-    if not _in_rth_window():
-        print("[options_flow] outside RTH; skipping.")
-        return
-
-    print("[options_flow] run starting")
-    _reset_if_new_day()
-    _load_iv_cache()  # initialize cache from disk if present
-
-    test_mode = is_bot_test_mode(bot_name)
-    start_ts = time.time()
-    alerts_sent = 0
-    matched_contracts: Set[str] = set()
 
     universe = _resolve_universe()
-    if not universe:
-        print("[options_flow] empty universe; skipping.")
-        return
+    print(f"[options_flow] universe size={len(universe)}")
 
-    print(f"[options_flow] scanning {len(universe)} symbols")
-    time_str = _format_time()
+    scanned = 0
+    matched_contracts: List[OptionFlowRecord] = []
+    alerts_sent = 0
 
     for sym in universe:
-        try:
-            if is_etf_blacklisted(sym):
-                debug_filter_reason("options_flow", sym, "ETF blacklisted")
+        scanned += 1
+
+        # Snapshots sometimes use lowercase; normalize
+        chain = get_option_chain_cached(sym, ttl_seconds=60)
+        if not chain:
+            debug_filter_reason("options_flow", sym, "no chain snapshot")
+            continue
+
+        results = chain.get("results") or chain.get("options") or []
+        if not isinstance(results, list) or not results:
+            debug_filter_reason("options_flow", sym, "empty chain results")
+            continue
+
+        # Underlying snapshot may help with reference price
+        underlying = chain.get("underlying") or {}
+        under_price = _safe_float(
+            (underlying.get("last") or {}).get("price")
+            or underlying.get("last_price")
+            or underlying.get("price")
+        )
+        if under_price is None or under_price < OPTIONS_MIN_UNDERLYING_PRICE:
+            debug_filter_reason(
+                "options_flow",
+                sym,
+                f"underlying price {under_price} < {OPTIONS_MIN_UNDERLYING_PRICE}",
+            )
+            continue
+
+        for opt in results:
+            if not isinstance(opt, dict):
                 continue
 
-            chain = get_option_chain_cached(sym)
-            if not chain:
-                debug_filter_reason("options_flow", sym, "no option chain from Polygon")
+            expiry, contract, dte = _parse_option_details(opt)
+            if not contract:
+                debug_filter_reason("options_flow", sym, "no contract symbol in snapshot")
                 continue
 
-            opts = chain.get("results") or chain.get("result") or chain.get("options") or []
-            if not isinstance(opts, list) or not opts:
-                debug_filter_reason("options_flow", sym, "option chain results empty")
-                continue
+            # -------- Last trade: prefer snapshot last_trade, then fallback to /v2/last/trade --------
 
-            for opt in opts:
-                # Polygon's option snapshot schema can vary slightly. Be defensive:
-                details = opt.get("details") or {}
-                contract = (
-                    details.get("ticker")
-                    or opt.get("ticker")
-                    or details.get("option_symbol")
-                    or details.get("symbol")
-                )
-                if not contract:
-                    # If we don't know the contract symbol, we can't look up trades.
-                    debug_filter_reason("options_flow", sym, "no contract symbol in snapshot")
-                    continue
+            # Prefer the embedded snapshot `last_trade` from Massive/Polygon's option-chain
+            # snapshot to avoid per-contract HTTP calls and to stay aligned with the
+            # current v3 snapshot schema. If that is missing (plan limitations, illiquid
+            # contract, etc), fall back to the dedicated last-trade endpoint.
+            last_trade_obj = (opt.get("last_trade") or opt.get("lastTrade") or {}) if isinstance(
+                opt, dict
+            ) else {}
 
-                # Last trade for this contract (v3 last/trade/options)
+            price = _safe_float(last_trade_obj.get("price") or last_trade_obj.get("p"))
+            size = _safe_int(last_trade_obj.get("size") or last_trade_obj.get("s"))
+
+            if price is None or size is None:
                 trade = get_last_option_trades_cached(contract)
                 if not trade:
                     debug_filter_reason("options_flow", sym, f"no last trade for {contract}")
@@ -409,192 +291,99 @@ async def run_options_flow():
                 elif isinstance(t_res, dict):
                     last = t_res
                 else:
-                    # Some Polygon responses put the trade fields at the top level
+                    # Some Polygon/Massive responses put the trade fields at the top level
                     last = trade
 
-                if not isinstance(last, dict):
-                    debug_filter_reason("options_flow", sym, f"last-trade payload not dict for {contract}")
-                    continue
+                if isinstance(last, dict):
+                    price = _safe_float(last.get("price") or last.get("p"))
+                    size = _safe_int(last.get("size") or last.get("s"))
 
-                price = _safe_float(last.get("p") or last.get("price"))
-                size = _safe_int(last.get("s") or last.get("size"))
-                if price is None or size is None:
-                    debug_filter_reason("options_flow", sym, f"missing price/size for {contract}")
-                    continue
-                if price <= 0 or size <= 0:
-                    debug_filter_reason("options_flow", sym, f"non-positive price/size for {contract}")
-                    continue
+            if price is None or size is None:
+                debug_filter_reason("options_flow", sym, f"missing price/size for {contract}")
+                continue
+            if price <= 0 or size <= 0:
+                debug_filter_reason("options_flow", sym, f"non-positive price/size for {contract}")
+                continue
 
-                notional = price * size * 100.0
+            notional = price * size * 100.0
 
-                # -------- Resolve underlying, expiry, contract type --------
+            # -------- Resolve underlying, expiry, contract type --------
 
-                # First, parse from the raw option symbol (works for O:TSLA251121C00450000)
-                under_guess, expiry_guess, cp_raw, _strike = _parse_option_symbol(contract)
+            cp = _contract_type(contract) or "UNKNOWN"
 
-                # Then, prefer explicit metadata from the snapshot where available
-                exp_str = details.get("expiration_date")
-                expiry = expiry_guess
-                if exp_str:
-                    try:
-                        expiry = date.fromisoformat(exp_str)
-                    except Exception:
-                        # keep expiry_guess
-                        pass
+            # DTE guards
+            if dte is None or dte < 0:
+                debug_filter_reason("options_flow", sym, f"bad dte={dte} for {contract}")
+                continue
+            if dte > WHALES_MAX_DTE:
+                debug_filter_reason("options_flow", sym, f"dte={dte} beyond whales max={WHALES_MAX_DTE}")
+                continue
 
-                ua = details.get("underlying_asset") or opt.get("underlying_asset") or {}
-                under = (
-                    ua.get("ticker")
-                    or ua.get("symbol")
-                    or under_guess
-                    or sym
-                )
+            # -------- Categorize flow (cheap / unusual / whales) --------
 
-                dte = _days_to_expiry(expiry)
-                if dte is None or dte < 0:
-                    debug_filter_reason("options_flow", sym, f"invalid DTE for {contract}")
-                    continue
+            category, reasons = _categorize(price, size, notional, dte)
 
-                cp = _contract_type(opt, cp_raw)
-                under_px = _underlying_price_from_opt(opt)
-
-                # Ignore tiny / illiquid penny stuff by default
-                if under_px is not None and under_px < MIN_UNDERLYING_PRICE:
-                    debug_filter_reason(
-                        "options_flow",
-                        sym,
-                        f"underlying below min price ({under_px:.2f} < {MIN_UNDERLYING_PRICE})",
-                    )
-                    continue
-
-                # --- CATEGORY DECISION (priority: WHALE > UNUSUAL > CHEAP) ---
-
-                category = None
-
-                # WHALE
-                if (
-                    dte <= WHALES_MAX_DTE
-                    and size >= WHALES_MIN_SIZE
-                    and notional >= WHALES_MIN_NOTIONAL
-                    and contract not in _seen_whale
-                ):
-                    category = "whale"
-
-                # UNUSUAL
-                elif (
-                    dte <= UNUSUAL_MAX_DTE
-                    and size >= UNUSUAL_MIN_SIZE
-                    and notional >= UNUSUAL_MIN_NOTIONAL
-                    and contract not in _seen_unusual
-                ):
-                    category = "unusual"
-
-                # CHEAP (CALL only, low premium)
-                elif (
-                    cp == "CALL"
-                    and price <= CHEAP_MAX_PREMIUM
-                    and size >= CHEAP_MIN_SIZE
-                    and notional >= CHEAP_MIN_NOTIONAL
-                    and contract not in _seen_cheap
-                ):
-                    category = "cheap"
-
-                # Even if no category, we still may want to check IV CRUSH
-                _maybe_iv_crush(sym, contract, under, expiry, dte, opt, size, time_str)
-
+            # IV Crush overlay (can stack with others)
+            iv_hit, iv_reasons = _maybe_iv_crush(opt)
+            if iv_hit:
+                reasons.extend(iv_reasons)
                 if not category:
-                    notional_rounded = round(notional)
-                    debug_filter_reason(
-                        "options_flow",
-                        sym,
-                        f"no category match for {contract} "
-                        f"(dte={dte}, size={size}, notional≈${notional_rounded:,.0f}, price={price:.2f})",
-                    )
-                    continue
+                    category = "IVCRUSH"
 
-                # ---------------- ALERT FORMATTING ----------------
+            if not category:
+                debug_filter_reason("options_flow", sym, f"no category for {contract}")
+                continue
 
-                notional_rounded = round(notional)
-                dte_str = f"{dte} days" if dte is not None else "N/A"
-                cp_letter = "C" if cp == "CALL" else "P" if cp == "PUT" else "?"
+            record = OptionFlowRecord(
+                symbol=sym,
+                contract=contract,
+                category=category,
+                direction=cp,
+                price=price,
+                size=size,
+                notional=notional,
+                dte=dte,
+                expiry=expiry or "N/A",
+                cp=cp,
+                reasons=reasons,
+            )
+            matched_contracts.append(record)
 
-                # Base contract line (pretty-ish)
-                exp_str2 = expiry.strftime('%b %d %Y') if expiry else 'N/A'
-                contract_line = f"{under} {exp_str2} {cp_letter}"
+    # -------- Alert formatting --------
 
-                # Build category-specific header & description
-                if category == "whale":
-                    header = f"🐋 WHALES — {sym}"
-                    desc = f"🐋 Large {(cp or 'Option')} order detected"
-                elif category == "unusual":
-                    header = f"🕵️ UNUSUAL — {sym}"
-                    desc = f"🕵️ Unusual {(cp or 'Option')} sweep detected"
-                else:  # cheap
-                    header = f"🧨 CHEAP — {sym}"
-                    desc = "🎯 Cheap CALL lotto flow"
+    def _fmt_record(rec: OptionFlowRecord) -> str:
+        direction = "BULL" if rec.cp == "CALL" else "BEAR" if rec.cp == "PUT" else "UNKNOWN"
+        emoji = {
+            "CHEAP": "🎲",
+            "UNUSUAL": "🕵️",
+            "WHALE": "🐋",
+            "IVCRUSH": "💥",
+        }.get(rec.category, "📈")
 
-                # Underlying line
-                if under_px is not None:
-                    under_line = f"💰 Underlying ${under_px:.2f}"
-                else:
-                    under_line = "💰 Underlying price N/A"
+        reasons_str = " • ".join(rec.reasons) if rec.reasons else "flow_detected"
+        chart = chart_link(rec.symbol)
 
-                body_lines = [
-                    header,
-                    f"🕒 {time_str}",
-                    under_line,
-                    "────────────",
-                    f"🎯 Contract: {contract_line}",
-                    f"📦 Size: {size:,} · Notional: ≈ ${notional_rounded:,.0f}",
-                    f"📅 DTE: {dte_str}",
-                    f"📈 Side: {cp or 'Option'}",
-                    f"🔗 Chart: {chart_link(sym)}",
-                    "",
-                    desc,
-                ]
-
-                extra = "\n".join(body_lines)
-
-                # Send alert (respects test_mode)
-                if test_mode:
-                    print(
-                        f"[options_flow:test] would alert {category.upper()} "
-                        f"{contract} on {sym} · size={size} notional≈${notional_rounded:,.0f}"
-                    )
-                else:
-                    send_alert(category, sym, under_px or 0.0, 0.0, extra=extra)
-
-                # Mark as seen
-                if category == "whale":
-                    _seen_whale.add(contract)
-                elif category == "unusual":
-                    _seen_unusual.add(contract)
-                elif category == "cheap":
-                    _seen_cheap.add(contract)
-
-                matched_contracts.add(contract)
-                alerts_sent += 1
-
-        except Exception as e:
-            # Hard guard so a single bad symbol never kills the whole process
-            print(f"[options_flow] error while processing {sym}: {e}")
-
-    # Persist IV cache at end of scan
-    _save_iv_cache()
-
-    run_seconds = time.time() - start_ts
-    try:
-        record_bot_stats(
-            bot_name,
-            scanned=len(universe),
-            matched=len(matched_contracts),
-            alerts=alerts_sent,
-            runtime=run_seconds,
+        return (
+            f"{emoji} {rec.category} — {rec.symbol}\n"
+            f"🕒 {now_est().strftime('%I:%M %p EST').lstrip('0')}\n"
+            f"📌 Contract: {rec.contract}\n"
+            f"📦 Size: {rec.size}\n"
+            f"💰 Notional: ≈ ${rec.notional:,.0f}\n"
+            f"🗓️ DTE: {rec.dte} (exp {rec.expiry})\n"
+            f"📈 Direction: {direction}\n"
+            f"🔍 Reasons: {reasons_str}\n"
+            f"🔗 Chart: {chart}"
         )
-    except Exception as e:
-        print(f"[options_flow] record_bot_stats error: {e}")
 
+    for rec in matched_contracts:
+        text = _fmt_record(rec)
+        send_alert(text)
+        alerts_sent += 1
+
+    run_seconds = time.time() - start_unix
     print(
-        f"[options_flow] scan complete. "
-        f"scanned={len(universe)} matched={len(matched_contracts)} alerts={alerts_sent}"
+        f"[options_flow] done. scanned={scanned} matched={len(matched_contracts)} "
+        f"alerts={alerts_sent} run_seconds={run_seconds:.2f}"
     )
+
+    record_bot_stats("Options Flow", scanned, len(matched_contracts), alerts_sent, run_seconds)
