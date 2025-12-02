@@ -2,6 +2,7 @@
 import os
 import time
 import math
+import json
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from typing import Dict, Any, List, Optional, Tuple
@@ -250,6 +251,83 @@ def report_status_error(bot: str, message: str) -> None:
     ts = now_est()
     text = f"⚠️ [{bot}] {ts}\n{message}"
     _send_status(text)
+
+
+# ---------------- BOT STATS (for status_report.py) ----------------
+
+STATS_PATH = os.getenv("STATUS_STATS_PATH", "/tmp/moneysignal_stats.json")
+
+
+def _load_stats_file() -> Dict[str, Any]:
+    """Internal helper: load the JSON stats file, or return empty."""
+    try:
+        if os.path.exists(STATS_PATH):
+            with open(STATS_PATH, "r") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+    except Exception as e:
+        print(f"[record_bot_stats] failed to read stats file: {e}")
+    return {}
+
+
+def _save_stats_file(data: Dict[str, Any]) -> None:
+    """Internal helper: save the JSON stats file, swallowing errors."""
+    try:
+        with open(STATS_PATH, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        msg = f"[record_bot_stats] failed to write stats file: {e}"
+        print(msg)
+        # soft report so it shows in status if possible
+        try:
+            report_status_error("status_report", msg)
+        except Exception:
+            pass
+
+
+def record_bot_stats(
+    bot_name: str,
+    scanned: int,
+    matched: int,
+    alerts: int,
+    runtime_seconds: Optional[float] = None,
+) -> None:
+    """
+    Shared helper used by bots to record their stats for the heartbeat.
+
+    Stores per-bot:
+      • last scanned / matched / alerts
+      • list of recent runtimes (used for medians)
+      • last_run_ts (epoch seconds)
+    """
+    bot_name = str(bot_name)
+
+    data = _load_stats_file()
+    bots = data.setdefault("bots", {})
+
+    entry: Dict[str, Any] = bots.get(bot_name, {})
+    entry["scanned"] = int(scanned)
+    entry["matched"] = int(matched)
+    entry["alerts"] = int(alerts)
+    entry["last_run_ts"] = time.time()
+
+    # Keep a rolling window of runtimes for median calc
+    runtimes = entry.get("runtimes") or []
+    if runtime_seconds is not None:
+        try:
+            runtimes.append(float(runtime_seconds))
+        except Exception:
+            pass
+        # cap history to last 50 runs
+        if len(runtimes) > 50:
+            runtimes = runtimes[-50:]
+    entry["runtimes"] = runtimes
+
+    bots[bot_name] = entry
+    data["bots"] = bots
+
+    _save_stats_file(data)
 
 
 # ---------------- HTTP HELPER WITH RETRIES ----------------
