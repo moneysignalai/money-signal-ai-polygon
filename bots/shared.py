@@ -650,7 +650,7 @@ def get_last_option_trades_cached(
         if now_ts - float(entry.ts) < ttl_seconds:
             return entry.data
 
-    # ✅ Massive/Polygon-compatible last-trade endpoint for options:
+    # Polygon-compatible last-trade endpoint for options:
     #    /v2/last/trade/{optionsTicker}
     url = f"https://api.polygon.io/v2/last/trade/{full_option_symbol}"
     params = {"apiKey": POLYGON_KEY}
@@ -678,7 +678,10 @@ def get_last_option_trades_cached(
                 )
                 time.sleep(wait)
             else:
-                msg = f"[shared] error fetching last option trade for {full_option_symbol}: {e}"
+                msg = (
+                    f"[shared] error fetching last option trade for "
+                    f"{full_option_symbol}: {e}"
+                )
                 print(msg)
                 report_status_error("shared:last_option_trade", msg)
                 return None
@@ -754,3 +757,23 @@ def is_premarket() -> bool:
 
 def is_postmarket() -> bool:
     return is_between_times(16, 1, 20, 0, eastern)
+
+
+def in_rth_window_est(start_minute: int = 0, end_minute: int = 390) -> bool:
+    """Return True if now is within a sub-window of regular trading hours (ET).
+
+    start_minute/end_minute are offsets in minutes from the 09:30 ET open.
+
+    Examples:
+      • in_rth_window_est() → full RTH (09:30–16:00).
+      • in_rth_window_est(0, 60) → first hour after open.
+      • in_rth_window_est(60, 240) → between 10:30–13:30 ET.
+    """
+    if not is_rth():
+        return False
+
+    now = datetime.now(eastern)
+    mins = now.hour * 60 + now.minute
+    rth_start = 9 * 60 + 30
+    offset = mins - rth_start
+    return start_minute <= offset <= end_minute
