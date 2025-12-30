@@ -1,8 +1,9 @@
 # bots/options_flow.py
 
 import os
-import time  # 🔹 ADD THIS LINE
+import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from .shared import (
@@ -15,24 +16,26 @@ from .shared import (
     record_bot_stats,
     chart_link,
     send_alert,
+    DEBUG_FLOW_REASONS,
 )
 # ---------------- ENV / CONFIG ----------------
 
 OPTIONS_FLOW_TICKER_UNIVERSE = os.getenv("OPTIONS_FLOW_TICKER_UNIVERSE")
-OPTIONS_FLOW_MAX_UNIVERSE = int(os.getenv("OPTIONS_FLOW_MAX_UNIVERSE", "500"))
+OPTIONS_FLOW_MAX_UNIVERSE = int(os.getenv("OPTIONS_FLOW_MAX_UNIVERSE", "2000"))
+ALLOW_OUTSIDE_RTH = os.getenv("OPTIONS_FLOW_ALLOW_OUTSIDE_RTH", "false").lower() == "true"
 
 OPTIONS_MIN_UNDERLYING_PRICE = float(os.getenv("OPTIONS_MIN_UNDERLYING_PRICE", "5.0"))
 
-CHEAP_MAX_PREMIUM = float(os.getenv("CHEAP_MAX_PREMIUM", "0.75"))
-CHEAP_MIN_SIZE = int(os.getenv("CHEAP_MIN_SIZE", "20"))
-CHEAP_MIN_NOTIONAL = float(os.getenv("CHEAP_MIN_NOTIONAL", "5000"))
+CHEAP_MAX_PREMIUM = float(os.getenv("CHEAP_MAX_PREMIUM", "0.60"))
+CHEAP_MIN_SIZE = int(os.getenv("CHEAP_MIN_SIZE", "5"))
+CHEAP_MIN_NOTIONAL = float(os.getenv("CHEAP_MIN_NOTIONAL", "3000"))
 
-UNUSUAL_MIN_SIZE = int(os.getenv("UNUSUAL_MIN_SIZE", "50"))
-UNUSUAL_MIN_NOTIONAL = float(os.getenv("UNUSUAL_MIN_NOTIONAL", "75000"))
+UNUSUAL_MIN_SIZE = int(os.getenv("UNUSUAL_MIN_SIZE", "20"))
+UNUSUAL_MIN_NOTIONAL = float(os.getenv("UNUSUAL_MIN_NOTIONAL", "15000"))
 UNUSUAL_MAX_DTE = int(os.getenv("UNUSUAL_MAX_DTE", "45"))
 
-WHALES_MIN_SIZE = int(os.getenv("WHALES_MIN_SIZE", "75"))
-WHALES_MIN_NOTIONAL = float(os.getenv("WHALES_MIN_NOTIONAL", "300000"))
+WHALES_MIN_SIZE = int(os.getenv("WHALES_MIN_SIZE", "50"))
+WHALES_MIN_NOTIONAL = float(os.getenv("WHALES_MIN_NOTIONAL", "150000"))
 WHALES_MAX_DTE = int(os.getenv("WHALES_MAX_DTE", "120"))
 
 IVCRUSH_MIN_IV_DROP_PCT = float(os.getenv("IVCRUSH_MIN_IV_DROP_PCT", "25.0"))
@@ -91,17 +94,32 @@ def _parse_option_details(opt: Dict[str, Any]) -> Tuple[Optional[str], Optional[
     Massive / Polygon sometimes vary naming slightly; we guard for that.
     """
     details = opt.get("details") or {}
-    contract = details.get("ticker") or opt.get("ticker")
-    expiry = details.get("expiration_date") or details.get("expiry") or details.get("expiration")
+    alt = opt.get("option") or {}
+    contract = (
+        details.get("ticker")
+        or details.get("symbol")
+        or opt.get("ticker")
+        or opt.get("symbol")
+        or opt.get("option_symbol")
+        or alt.get("symbol")
+    )
+    expiry = (
+        details.get("expiration_date")
+        or details.get("expiry")
+        or details.get("expiration")
+        or details.get("exp_date")
+        or alt.get("expiration_date")
+        or opt.get("expiration_date")
+        or opt.get("exp_date")
+    )
 
     dte = None
     if expiry:
         try:
-            # expiry like "2024-01-18"
-            from datetime import datetime as _dt
-
-            dt_exp = _dt.strptime(expiry, "%Y-%m-%d").date()
-            today = now_est().date()
+            # expiry like "2024-01-18" or "20240118"
+            fmt = "%Y-%m-%d" if "-" in expiry else "%Y%m%d"
+            dt_exp = datetime.strptime(expiry, fmt).date()
+            today = datetime.now().date()
             dte = (dt_exp - today).days
         except Exception:
             dte = None
@@ -200,8 +218,19 @@ def _resolve_universe() -> List[str]:
     """
     if OPTIONS_FLOW_TICKER_UNIVERSE:
         syms = [s.strip().upper() for s in OPTIONS_FLOW_TICKER_UNIVERSE.split(",") if s.strip()]
+        print(
+            f"[options_flow] Using OPTIONS_FLOW_TICKER_UNIVERSE with {len(syms)} symbols "
+            f"(capped to {OPTIONS_FLOW_MAX_UNIVERSE})."
+        )
         return syms[:OPTIONS_FLOW_MAX_UNIVERSE]
-    return resolve_universe_for_bot("options_flow", max_tickers=OPTIONS_FLOW_MAX_UNIVERSE)
+
+    universe = resolve_universe_for_bot("options_flow", max_tickers=OPTIONS_FLOW_MAX_UNIVERSE)
+    universe = universe[:OPTIONS_FLOW_MAX_UNIVERSE]
+    print(
+        f"[options_flow] Using dynamic universe with {len(universe)} symbols (max "
+        f"{OPTIONS_FLOW_MAX_UNIVERSE})."
+    )
+    return universe
 
 
 # ---------------- MAIN BOT ----------------
@@ -212,146 +241,154 @@ async def run_options_flow() -> None:
     Scan a universe of underlyings for interesting options flow using
     Massive/Polygon snapshot chains plus the last-trade endpoint as a fallback.
     """
-    start_ts = now_est()
     start_unix = time.time()
 
-    import time as _time
-
-    if not in_rth_window_est():
-        # Only run during RTH; options flow outside RTH is less useful.
-        print("[options_flow] outside RTH window; skipping run.")
+    if not ALLOW_OUTSIDE_RTH and not in_rth_window_est():
+        print(
+            "[options_flow] outside RTH window; skipping run (set "
+            "OPTIONS_FLOW_ALLOW_OUTSIDE_RTH=true to debug)."
+        )
         record_bot_stats("Options Flow", 0, 0, 0, 0.0)
         return
 
     universe = _resolve_universe()
-    print(f"[options_flow] universe size={len(universe)}")
+    if not universe:
+        print("[options_flow] universe empty; nothing to scan.")
+        record_bot_stats("Options Flow", 0, 0, 0, 0.0)
+        return
 
     scanned = 0
     matched_contracts: List[OptionFlowRecord] = []
     alerts_sent = 0
+    reason_counts: Optional[Dict[str, int]] = {} if DEBUG_FLOW_REASONS else None
+
+    def _log_reason(symbol: str, reason: str) -> None:
+        debug_filter_reason("options_flow", symbol, reason)
+        if reason_counts is not None:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
 
     for sym in universe:
         scanned += 1
+        try:
+            chain = get_option_chain_cached(sym, ttl_seconds=60)
+            if not chain:
+                _log_reason(sym, "no chain snapshot")
+                continue
 
-        # Snapshots sometimes use lowercase; normalize
-        chain = get_option_chain_cached(sym, ttl_seconds=60)
-        if not chain:
-            debug_filter_reason("options_flow", sym, "no chain snapshot")
-            continue
+            if not isinstance(chain, dict):
+                _log_reason(sym, "bad_chain_data")
+                continue
 
-        results = chain.get("results") or chain.get("options") or []
-        if not isinstance(results, list) or not results:
-            debug_filter_reason("options_flow", sym, "empty chain results")
-            continue
+            results = chain.get("results") or chain.get("options") or []
+            if not isinstance(results, list) or not results:
+                _log_reason(sym, "empty chain results")
+                continue
 
-        # Underlying snapshot may help with reference price
-        underlying = chain.get("underlying") or {}
-        under_price = _safe_float(
-            (underlying.get("last") or {}).get("price")
-            or underlying.get("last_price")
-            or underlying.get("price")
-        )
-        if under_price is None or under_price < OPTIONS_MIN_UNDERLYING_PRICE:
-            debug_filter_reason(
-                "options_flow",
-                sym,
-                f"underlying price {under_price} < {OPTIONS_MIN_UNDERLYING_PRICE}",
+            underlying = chain.get("underlying") or chain.get("underlying_asset") or {}
+            last_under = underlying.get("last") or underlying.get("last_trade") or {}
+            under_price = _safe_float(
+                last_under.get("price")
+                or last_under.get("p")
+                or underlying.get("last_price")
+                or underlying.get("price")
+                or underlying.get("close")
             )
-            continue
-
-        for opt in results:
-            if not isinstance(opt, dict):
+            if under_price is None or under_price < OPTIONS_MIN_UNDERLYING_PRICE:
+                _log_reason(sym, f"underlying price {under_price} < {OPTIONS_MIN_UNDERLYING_PRICE}")
                 continue
 
-            expiry, contract, dte = _parse_option_details(opt)
-            if not contract:
-                debug_filter_reason("options_flow", sym, "no contract symbol in snapshot")
-                continue
-
-            # -------- Last trade: prefer snapshot last_trade, then fallback to /v2/last/trade --------
-
-            # Prefer the embedded snapshot `last_trade` from Massive/Polygon's option-chain
-            # snapshot to avoid per-contract HTTP calls and to stay aligned with the
-            # current v3 snapshot schema. If that is missing (plan limitations, illiquid
-            # contract, etc), fall back to the dedicated last-trade endpoint.
-            last_trade_obj = (opt.get("last_trade") or opt.get("lastTrade") or {}) if isinstance(
-                opt, dict
-            ) else {}
-
-            price = _safe_float(last_trade_obj.get("price") or last_trade_obj.get("p"))
-            size = _safe_int(last_trade_obj.get("size") or last_trade_obj.get("s"))
-
-            if price is None or size is None:
-                trade = get_last_option_trades_cached(contract)
-                if not trade:
-                    debug_filter_reason("options_flow", sym, f"no last trade for {contract}")
+            for opt in results:
+                if not isinstance(opt, dict):
+                    _log_reason(sym, "non-dict option record")
                     continue
 
-                t_res = trade.get("results")
-                if isinstance(t_res, list) and t_res:
-                    last = t_res[0]
-                elif isinstance(t_res, dict):
-                    last = t_res
-                else:
-                    # Some Polygon/Massive responses put the trade fields at the top level
-                    last = trade
+                expiry, contract, dte = _parse_option_details(opt)
+                if not contract:
+                    _log_reason(sym, "no contract symbol in snapshot")
+                    continue
 
-                if isinstance(last, dict):
-                    price = _safe_float(last.get("price") or last.get("p"))
-                    size = _safe_int(last.get("size") or last.get("s"))
+                last_trade_obj = (
+                    opt.get("last")
+                    or opt.get("last_trade")
+                    or opt.get("lastTrade")
+                    or {}
+                )
 
-            if price is None or size is None:
-                debug_filter_reason("options_flow", sym, f"missing price/size for {contract}")
-                continue
-            if price <= 0 or size <= 0:
-                debug_filter_reason("options_flow", sym, f"non-positive price/size for {contract}")
-                continue
+                price = _safe_float(
+                    (last_trade_obj.get("price") if isinstance(last_trade_obj, dict) else None)
+                    or (last_trade_obj.get("p") if isinstance(last_trade_obj, dict) else None)
+                )
+                size = _safe_int(
+                    (last_trade_obj.get("size") if isinstance(last_trade_obj, dict) else None)
+                    or (last_trade_obj.get("s") if isinstance(last_trade_obj, dict) else None)
+                )
 
-            notional = price * size * 100.0
+                if price is None or size is None:
+                    trade = get_last_option_trades_cached(contract)
+                    if not trade:
+                        _log_reason(sym, f"no last trade for {contract}")
+                        continue
 
-            # -------- Resolve underlying, expiry, contract type --------
+                    t_res = trade.get("results")
+                    if isinstance(t_res, list) and t_res:
+                        last = t_res[0]
+                    elif isinstance(t_res, dict):
+                        last = t_res
+                    else:
+                        last = trade
 
-            cp = _contract_type(contract) or "UNKNOWN"
+                    if isinstance(last, dict):
+                        price = _safe_float(last.get("price") or last.get("p"))
+                        size = _safe_int(last.get("size") or last.get("s"))
 
-            # DTE guards
-            if dte is None or dte < 0:
-                debug_filter_reason("options_flow", sym, f"bad dte={dte} for {contract}")
-                continue
-            if dte > WHALES_MAX_DTE:
-                debug_filter_reason("options_flow", sym, f"dte={dte} beyond whales max={WHALES_MAX_DTE}")
-                continue
+                if price is None or size is None:
+                    _log_reason(sym, f"missing price/size for {contract}")
+                    continue
+                if price <= 0 or size <= 0:
+                    _log_reason(sym, f"non-positive price/size for {contract}")
+                    continue
 
-            # -------- Categorize flow (cheap / unusual / whales) --------
+                notional = price * size * 100.0
 
-            category, reasons = _categorize(price, size, notional, dte)
+                cp = _contract_type(contract) or "UNKNOWN"
 
-            # IV Crush overlay (can stack with others)
-            iv_hit, iv_reasons = _maybe_iv_crush(opt)
-            if iv_hit:
-                reasons.extend(iv_reasons)
+                if dte is None or dte < 0:
+                    _log_reason(sym, f"bad dte={dte} for {contract}")
+                    continue
+                if dte > WHALES_MAX_DTE:
+                    _log_reason(sym, f"dte={dte} beyond whales max={WHALES_MAX_DTE}")
+                    continue
+
+                category, reasons = _categorize(price, size, notional, dte)
+
+                iv_hit, iv_reasons = _maybe_iv_crush(opt)
+                if iv_hit:
+                    reasons.extend(iv_reasons)
+                    if not category:
+                        category = "IVCRUSH"
+
                 if not category:
-                    category = "IVCRUSH"
+                    _log_reason(sym, f"no category for {contract}")
+                    continue
 
-            if not category:
-                debug_filter_reason("options_flow", sym, f"no category for {contract}")
-                continue
-
-            record = OptionFlowRecord(
-                symbol=sym,
-                contract=contract,
-                category=category,
-                direction=cp,
-                price=price,
-                size=size,
-                notional=notional,
-                dte=dte,
-                expiry=expiry or "N/A",
-                cp=cp,
-                reasons=reasons,
-            )
-            matched_contracts.append(record)
-
-    # -------- Alert formatting --------
+                record = OptionFlowRecord(
+                    symbol=sym,
+                    contract=contract,
+                    category=category,
+                    direction=cp,
+                    price=price,
+                    size=size,
+                    notional=notional,
+                    dte=dte,
+                    expiry=expiry or "N/A",
+                    cp=cp,
+                    reasons=reasons,
+                )
+                matched_contracts.append(record)
+        except Exception as e:
+            _log_reason(sym, f"exception {e}")
+            print(f"[options_flow] Error on {sym}: {e}")
+            continue
 
     def _fmt_record(rec: OptionFlowRecord) -> str:
         direction = "BULL" if rec.cp == "CALL" else "BEAR" if rec.cp == "PUT" else "UNKNOWN"
@@ -367,7 +404,7 @@ async def run_options_flow() -> None:
 
         return (
             f"{emoji} {rec.category} — {rec.symbol}\n"
-            f"🕒 {now_est().strftime('%I:%M %p EST').lstrip('0')}\n"
+            f"🕒 {now_est()}\n"
             f"📌 Contract: {rec.contract}\n"
             f"📦 Size: {rec.size}\n"
             f"💰 Notional: ≈ ${rec.notional:,.0f}\n"
@@ -383,6 +420,10 @@ async def run_options_flow() -> None:
         alerts_sent += 1
 
     run_seconds = time.time() - start_unix
+
+    if reason_counts is not None and not matched_contracts:
+        print(f"[options_flow] No alerts. Filter breakdown: {reason_counts}")
+
     print(
         f"[options_flow] done. scanned={scanned} matched={len(matched_contracts)} "
         f"alerts={alerts_sent} run_seconds={run_seconds:.2f}"

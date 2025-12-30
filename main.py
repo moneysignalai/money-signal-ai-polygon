@@ -1,9 +1,9 @@
-import os
-import threading
 import asyncio
 import importlib
+import os
+import threading
 from datetime import datetime
-from typing import Dict, Tuple, List
+from typing import Dict, List, Tuple
 
 import pytz
 import uvicorn
@@ -119,9 +119,11 @@ async def _run_single_bot(public_name: str, module_path: str, func_name: str, re
     """
     try:
         module = importlib.import_module(module_path)
-        func = getattr(module, func_name, None)
+        func = getattr(module, "run_bot", None) or getattr(module, func_name, None)
         if func is None:
-            raise AttributeError(f"{module_path} has no attribute {func_name}")
+            raise AttributeError(
+                f"{module_path} has no attribute run_bot or {func_name}"
+            )
 
         # If the bot function is async, await it; otherwise run in thread pool.
         if asyncio.iscoroutinefunction(func):
