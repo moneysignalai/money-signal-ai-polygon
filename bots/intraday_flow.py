@@ -35,6 +35,10 @@ from bots.status_report import record_bot_stats
 eastern = pytz.timezone("US/Eastern")
 _client: Optional[RESTClient] = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
+INTRADAY_FLOW_ALLOW_OUTSIDE_RTH = (
+    os.getenv("INTRADAY_FLOW_ALLOW_OUTSIDE_RTH", "false").lower() == "true"
+)
+
 # ---------------- GLOBAL CONFIG ----------------
 
 INTRADAY_START_MIN = 9 * 60 + 30   # 09:30
@@ -87,6 +91,14 @@ def _in_intraday_window() -> bool:
     now = datetime.now(eastern)
     mins = now.hour * 60 + now.minute
     return INTRADAY_START_MIN <= mins <= INTRADAY_END_MIN
+
+
+def should_run_now() -> tuple[bool, str | None]:
+    if INTRADAY_FLOW_ALLOW_OUTSIDE_RTH:
+        return True, None
+    if _in_intraday_window():
+        return True, None
+    return False, "outside intraday window"
 
 
 def _in_mr_window() -> bool:
@@ -496,10 +508,12 @@ async def run_intraday_flow() -> None:
 
     if not POLYGON_KEY or not _client:
         print("[intraday_flow] missing POLYGON_KEY or REST client; skipping.")
+        record_bot_stats("intraday_flow", 0, 0, 0, 0.0)
         return
 
-    if not _in_intraday_window():
+    if not (INTRADAY_FLOW_ALLOW_OUTSIDE_RTH or _in_intraday_window()):
         print("[intraday_flow] outside intraday window; skipping.")
+        record_bot_stats("intraday_flow", 0, 0, 0, 0.0)
         return
 
     BOT_NAME = "intraday_flow"
@@ -510,6 +524,7 @@ async def run_intraday_flow() -> None:
     universe = _get_universe()
     if not universe:
         print("[intraday_flow] empty universe; skipping.")
+        record_bot_stats("intraday_flow", 0, 0, 0, 0.0)
         return
 
     trading_day = date.today()

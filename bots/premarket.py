@@ -49,6 +49,9 @@ MAX_PREMARKET_MOVE_PCT    = float(os.getenv("MAX_PREMARKET_MOVE_PCT", "0.0"))
 # Premarket window (EST)
 PREMARKET_START_MIN       = 4 * 60        # 04:00
 PREMARKET_END_MIN         = 9 * 60 + 29   # 09:29
+PREMARKET_ALLOW_OUTSIDE_WINDOW = (
+    os.getenv("PREMARKET_ALLOW_OUTSIDE_WINDOW", "false").lower() == "true"
+)
 
 # Universe
 PREMARKET_MAX_UNIVERSE    = int(os.getenv("PREMARKET_MAX_UNIVERSE", "120"))
@@ -82,6 +85,14 @@ def _in_premarket_window() -> bool:
     now = datetime.now(eastern)
     mins = now.hour * 60 + now.minute
     return PREMARKET_START_MIN <= mins <= PREMARKET_END_MIN
+
+
+def should_run_now() -> tuple[bool, str | None]:
+    if PREMARKET_ALLOW_OUTSIDE_WINDOW:
+        return True, None
+    if _in_premarket_window():
+        return True, None
+    return False, "outside premarket window"
 
 
 # ---------------- HELPERS ----------------
@@ -266,10 +277,12 @@ async def run_premarket() -> None:
 
     if not POLYGON_KEY or not _client:
         print("[premarket] POLYGON_KEY or client missing; skipping.")
+        record_bot_stats("Premarket", 0, 0, 0, 0.0)
         return
 
-    if not _in_premarket_window():
+    if not PREMARKET_ALLOW_OUTSIDE_WINDOW and not _in_premarket_window():
         print("[premarket] Outside premarket window; skipping.")
+        record_bot_stats("Premarket", 0, 0, 0, 0.0)
         return
 
     BOT_NAME = "premarket"
@@ -280,6 +293,7 @@ async def run_premarket() -> None:
     universe = _get_universe()
     if not universe:
         print("[premarket] empty universe; skipping.")
+        record_bot_stats("Premarket", 0, 0, 0, 0.0)
         return
 
     trading_day = date.today()
