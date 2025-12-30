@@ -29,7 +29,7 @@ from bots.shared import (
     POLYGON_KEY,
     MIN_RVOL_GLOBAL,
     MIN_VOLUME_GLOBAL,
-    get_dynamic_top_volume_universe,
+    resolve_universe_for_bot,
     get_option_chain_cached,
     send_alert,
     chart_link,
@@ -48,7 +48,10 @@ _client: Optional[RESTClient] = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY e
 
 DAILY_IDEAS_MIN_PRICE = float(os.getenv("DAILY_IDEAS_MIN_PRICE", "5.0"))
 DAILY_IDEAS_MIN_DOLLAR_VOL = float(os.getenv("DAILY_IDEAS_MIN_DOLLAR_VOL", "200000"))
-DAILY_IDEAS_MAX_UNIVERSE = int(os.getenv("DAILY_IDEAS_MAX_UNIVERSE", "80"))
+DEFAULT_MAX_UNIVERSE = int(os.getenv("DYNAMIC_MAX_TICKERS", "2000"))
+DAILY_IDEAS_MAX_UNIVERSE = int(
+    os.getenv("DAILY_IDEAS_MAX_UNIVERSE", str(DEFAULT_MAX_UNIVERSE))
+)
 
 DAILY_IDEAS_MIN_SCORE = int(os.getenv("DAILY_IDEAS_MIN_SCORE", "3"))
 DAILY_IDEAS_TOP_N = int(os.getenv("DAILY_IDEAS_TOP_N", "5"))
@@ -480,9 +483,12 @@ async def run_daily_ideas() -> None:
     trading_day = today_est_date()
     now_str = now_est()
 
-    universe = get_dynamic_top_volume_universe(
-        max_tickers=DAILY_IDEAS_MAX_UNIVERSE,
-        volume_coverage=0.90,
+    universe = resolve_universe_for_bot(
+        bot_name="daily_ideas",
+        bot_env_var="DAILY_IDEAS_TICKER_UNIVERSE",
+        max_universe_env="DAILY_IDEAS_MAX_UNIVERSE",
+        default_max_universe=DEFAULT_MAX_UNIVERSE,
+        apply_dynamic_filters=True,
     )
     if not universe:
         print("[daily_ideas] empty universe; skipping.")

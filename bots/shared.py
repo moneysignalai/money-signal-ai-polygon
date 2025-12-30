@@ -1,4 +1,5 @@
 # bots/shared.py
+import asyncio
 import os
 import time
 import math
@@ -385,6 +386,7 @@ def _http_get_json(
 # ---------------- DYNAMIC / CONFIGURABLE UNIVERSE ----------------
 
 _UNIVERSE_CACHE: Dict[str, Any] = {"ts": 0.0, "data": []}
+_EMERGENCY_UNIVERSE = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA"]
 
 
 def _parse_ticker_env(raw: str) -> List[str]:
@@ -417,175 +419,193 @@ def _get_env_universe(env_var: str) -> List[str]:
     return tickers
 
 
-def get_dynamic_top_volume_universe(
-    max_tickers: int = 100,
-    volume_coverage: float = 0.90,
+def _get_top_volume_universe_sync(
+    max_tickers: int = 1500, volume_coverage: Optional[float] = None
 ) -> List[str]:
-    """
-    Use Polygon's previous day's most-active (by dollar volume) to build a liquid universe.
+    """Return a liquid universe ordered by dollar volume with layered fallbacks."""
 
-    Optimizations:
-      • 60s in-process cache to avoid hammering Polygon
-      • Faster timeouts (7s) + 1 retry instead of 2
-      • Clean fallback to FALLBACK_TICKER_UNIVERSE when Polygon is slow/empty
-
-    NOTE: most bots should NOT call this directly anymore. Instead use
-    resolve_universe_for_bot(...) so that TICKER_UNIVERSE and per-bot overrides
-    are respected.
-    """
     now_ts = time.time()
-
-    # 60-second cache to avoid repeated heavy calls
     if _UNIVERSE_CACHE["data"] and now_ts - float(_UNIVERSE_CACHE["ts"]) < 60.0:
-        data: List[str] = _UNIVERSE_CACHE["data"]
-        return data[:max_tickers]
+        return _UNIVERSE_CACHE["data"][:max_tickers]
 
-    # If no Polygon key, go straight to fallback
-    if not POLYGON_KEY:
-        print("[shared] POLYGON_KEY missing; using FALLBACK_TICKER_UNIVERSE")
-        env = os.getenv("FALLBACK_TICKER_UNIVERSE", "")
-        tickers = _parse_ticker_env(env)
-        if not tickers:
-            print("[shared] FALLBACK_TICKER_UNIVERSE empty; returning [].")
-            _UNIVERSE_CACHE["ts"] = now_ts
-            _UNIVERSE_CACHE["data"] = []
-            return []
-        print(f"[shared] fallback universe: {len(tickers)} names (no POLYGON_KEY)")
-        _UNIVERSE_CACHE["ts"] = now_ts
-        _UNIVERSE_CACHE["data"] = tickers[:max_tickers]
-        return tickers[:max_tickers]
-
-    # Apply global caps from env for safety
     try:
         env_cap = int(os.getenv("DYNAMIC_MAX_TICKERS", str(max_tickers)))
         max_tickers = max(1, min(max_tickers, env_cap))
     except Exception:
-        pass
+        max_tickers = max(1, max_tickers)
 
-    try:
-        env_cov = os.getenv("DYNAMIC_VOLUME_COVERAGE")
-        if env_cov is not None:
-            volume_coverage = float(env_cov)
-    except Exception:
-        pass
+    tickers: List[Tuple[str, float]] = []
+    if POLYGON_KEY:
+        today = today_est_date()
+        prev = today - timedelta(days=1)
+        from_ = prev.isoformat()
+        url = f"{API_BASE}/v2/aggs/grouped/locale/us/market/stocks/{from_}"
+        params = {"adjusted": "true", "apiKey": POLYGON_KEY}
+        data = _http_get_json(
+            url,
+            params,
+            tag="shared:universe",
+            timeout=7.0,
+            retries=1,
+            backoff_seconds=2.0,
+        )
+        results = data.get("results") if data else None
+        if results:
+            for row in results:
+                sym = row.get("T")
+                vol = float(row.get("v") or 0.0)
+                vwap = float(row.get("vw") or 0.0)
+                dollar_vol = vol * max(vwap, 0.0)
+                if not sym or dollar_vol <= 0:
+                    continue
+                tickers.append((sym, dollar_vol))
+    if tickers:
+        tickers.sort(key=lambda x: x[1], reverse=True)
+        total_dollar = sum(row[1] for row in tickers)
+        universe: List[str] = []
+        running = 0.0
+        for sym, dv in tickers:
+            universe.append(sym)
+            running += dv
+            if len(universe) >= max_tickers:
+                break
+            if volume_coverage and total_dollar > 0 and running / total_dollar >= volume_coverage:
+                break
+        _UNIVERSE_CACHE["ts"] = now_ts
+        _UNIVERSE_CACHE["data"] = universe
+        print(
+            f"[universe] using top-volume universe size={len(universe)} (source=massive/polygon)"
+        )
+        return universe[:max_tickers]
 
-    today = today_est_date()
-    prev = today - timedelta(days=1)
-    from_ = prev.isoformat()
+    env_universe = _get_env_universe("TICKER_UNIVERSE")
+    if not env_universe:
+        env_universe = _get_env_universe("FALLBACK_TICKER_UNIVERSE")
 
-    url = f"{API_BASE}/v2/aggs/grouped/locale/us/market/stocks/{from_}"
-    params = {"adjusted": "true", "apiKey": POLYGON_KEY}
+    if env_universe:
+        _UNIVERSE_CACHE["ts"] = now_ts
+        _UNIVERSE_CACHE["data"] = env_universe
+        print(
+            f"[universe] massive volume feed unavailable, using ENV TICKER_UNIVERSE size={len(env_universe)}"
+        )
+        return env_universe[:max_tickers]
 
-    # Slightly tighter timeout + fewer retries for responsiveness
-    data = _http_get_json(
-        url,
-        params,
-        tag="shared:universe",
-        timeout=7.0,
-        retries=1,
-        backoff_seconds=2.0,
+    print("[universe] CRITICAL: universe empty — using emergency minimal fallback set")
+    _UNIVERSE_CACHE["ts"] = now_ts
+    _UNIVERSE_CACHE["data"] = _EMERGENCY_UNIVERSE
+    return _EMERGENCY_UNIVERSE[:max_tickers]
+
+
+async def get_top_volume_universe(
+    limit: int = 1500, volume_coverage: Optional[float] = None
+) -> List[str]:
+    """Async helper wrapper for fetching the top-volume universe with fallbacks."""
+
+    return await asyncio.to_thread(
+        _get_top_volume_universe_sync, limit, volume_coverage
     )
 
-    # ---------- FALLBACK IF POLYGON RETURNS NOTHING ----------
-    results = data.get("results") if data else None
-    if not results:
-        print("[shared] Polygon universe empty/slow — using FALLBACK_TICKER_UNIVERSE")
-        env = os.getenv("FALLBACK_TICKER_UNIVERSE", "")
-        tickers = _parse_ticker_env(env)
-        if not tickers:
-            print("[shared] FALLBACK_TICKER_UNIVERSE empty; returning [].")
-            _UNIVERSE_CACHE["ts"] = now_ts
-            _UNIVERSE_CACHE["data"] = []
-            return []
-        print(f"[shared] fallback universe: {len(tickers)} names")
-        _UNIVERSE_CACHE["ts"] = now_ts
-        _UNIVERSE_CACHE["data"] = tickers[:max_tickers]
-        return tickers[:max_tickers]
-    # ----------------------------------------------------------
 
-    enriched: List[Tuple[str, float]] = []
-    for row in results:
-        sym = row.get("T")
-        vol = float(row.get("v") or 0.0)
-        vwap = float(row.get("vw") or 0.0)
-        dollar_vol = vol * max(vwap, 0.0)
-        if not sym or dollar_vol <= 0:
-            continue
-        enriched.append((sym, dollar_vol))
+def get_dynamic_top_volume_universe(
+    max_tickers: int = 100, volume_coverage: Optional[float] = None
+) -> List[str]:
+    """Backwards-compatible wrapper for older callers (uses top-volume resolver)."""
 
-    if not enriched:
-        print("[shared] dynamic universe: 0 names after filtering — using fallback.")
-        env = os.getenv("FALLBACK_TICKER_UNIVERSE", "")
-        tickers = _parse_ticker_env(env)
-        if not tickers:
-            print("[shared] FALLBACK_TICKER_UNIVERSE empty; returning [].")
-            _UNIVERSE_CACHE["ts"] = now_ts
-            _UNIVERSE_CACHE["data"] = []
-            return []
-        print(f"[shared] fallback universe: {len(tickers)} names")
-        _UNIVERSE_CACHE["ts"] = now_ts
-        _UNIVERSE_CACHE["data"] = tickers[:max_tickers]
-        return tickers[:max_tickers]
-
-    enriched.sort(key=lambda x: x[1], reverse=True)
-
-    universe: List[str] = []
-    total_dollar = sum(row[1] for row in enriched)
-    running = 0.0
-    for sym, dv in enriched:
-        universe.append(sym)
-        running += dv
-        if len(universe) >= max_tickers:
-            break
-        if total_dollar > 0 and running / total_dollar >= volume_coverage:
-            break
-
-    print(f"[shared] dynamic universe: {len(universe)} names, covers ~{volume_coverage*100:.0f}% vol.")
-    _UNIVERSE_CACHE["ts"] = now_ts
-    _UNIVERSE_CACHE["data"] = universe
-    return universe
+    return _get_top_volume_universe_sync(max_tickers, volume_coverage)
 
 
 def resolve_universe_for_bot(
     bot_name: str,
-    max_tickers: int,
     bot_env_var: Optional[str] = None,
+    base_env_universe: str = "TICKER_UNIVERSE",
+    max_universe_env: Optional[str] = None,
+    default_max_universe: Optional[int] = None,
+    apply_dynamic_filters: bool = True,
+    volume_coverage_env: str = "DYNAMIC_VOLUME_COVERAGE",
 ) -> List[str]:
     """
     Unified universe resolver for all bots.
 
     Priority:
       1) If `bot_env_var` (e.g. OPTIONS_FLOW_TICKER_UNIVERSE) is set → use that.
-      2) Else if global TICKER_UNIVERSE is set → use that.
-      3) Else → fall back to dynamic Polygon universe / FALLBACK_TICKER_UNIVERSE.
+      2) Else if `base_env_universe` (default: TICKER_UNIVERSE) is set → use that.
+      3) Else → fall back to dynamic Polygon/Massive universe or FALLBACK_TICKER_UNIVERSE.
 
-    All steps cap to `max_tickers`.
+    Configuration knobs:
+      • max_universe_env (e.g. EQUITY_FLOW_MAX_UNIVERSE) caps the list if set.
+      • default_max_universe falls back if no max env is set (defaults to
+        DYNAMIC_MAX_TICKERS when omitted).
+      • apply_dynamic_filters trims the chosen universe to the most liquid names
+        using get_dynamic_top_volume_universe. This helps keep counts consistent
+        across bots even when TICKER_UNIVERSE is large.
     """
+
+    def _int_env(name: str) -> Optional[int]:
+        try:
+            return int(os.getenv(name, "")) if os.getenv(name, "").strip() else None
+        except Exception:
+            return None
+
+    dyn_cap = _int_env("DYNAMIC_MAX_TICKERS") or default_max_universe or 2000
+    resolved_max = dyn_cap
+    if max_universe_env:
+        env_cap = _int_env(max_universe_env)
+        if env_cap:
+            resolved_max = min(resolved_max, env_cap)
+
+    coverage_val: Optional[float] = None
+    if volume_coverage_env:
+        try:
+            env_cov = os.getenv(volume_coverage_env)
+            if env_cov:
+                coverage_val = float(env_cov)
+        except Exception:
+            coverage_val = None
+
     # 1) Per-bot override (e.g. OPTIONS_FLOW_TICKER_UNIVERSE)
+    selected_universe: List[str] = []
     if bot_env_var:
         override = _get_env_universe(bot_env_var)
         if override:
-            if len(override) > max_tickers:
-                print(
-                    f"[shared] {bot_name}: capping {bot_env_var} universe "
-                    f"from {len(override)} → {max_tickers}"
-                )
-            return override[:max_tickers]
+            selected_universe = override
 
-    # 2) Global TICKER_UNIVERSE
-    global_u = _get_env_universe("TICKER_UNIVERSE")
-    if global_u:
-        if len(global_u) > max_tickers:
-            print(
-                f"[shared] {bot_name}: capping TICKER_UNIVERSE "
-                f"from {len(global_u)} → {max_tickers}"
-            )
-        return global_u[:max_tickers]
+    # 2) Base env
+    if not selected_universe:
+        base_env = _get_env_universe(base_env_universe)
+        if base_env:
+            selected_universe = base_env
 
-    # 3) Dynamic Polygon-based universe fallback
-    universe = get_dynamic_top_volume_universe(max_tickers=max_tickers)
-    print(f"[shared] {bot_name}: using dynamic universe ({len(universe)} names)")
-    return universe
+    # 3) Dynamic fallback when no env universe is present
+    if not selected_universe:
+        universe = get_dynamic_top_volume_universe(
+            max_tickers=resolved_max,
+            volume_coverage=coverage_val,
+        )
+        print(f"[shared] {bot_name}: using dynamic universe ({len(universe)} names)")
+        return universe
+
+    trimmed = selected_universe
+    if apply_dynamic_filters:
+        liquid = get_dynamic_top_volume_universe(
+            max_tickers=resolved_max,
+            volume_coverage=coverage_val,
+        )
+        if liquid:
+            liquid_set = set(liquid)
+            trimmed = [t for t in selected_universe if t in liquid_set]
+        else:
+            trimmed = selected_universe
+
+    if len(trimmed) > resolved_max:
+        print(
+            f"[shared] {bot_name}: capping universe from {len(trimmed)} → {resolved_max}"
+        )
+    final_universe = trimmed[:resolved_max]
+    print(
+        f"[shared] {bot_name}: universe {len(final_universe)} names "
+        f"(max={resolved_max}, dynamic={'on' if apply_dynamic_filters else 'off'})"
+    )
+    return final_universe
 
 
 # ---------------- ETF BLACKLIST ----------------

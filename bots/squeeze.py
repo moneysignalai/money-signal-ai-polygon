@@ -18,7 +18,7 @@ from bots.shared import (
     MIN_VOLUME_GLOBAL,
     send_alert,
     chart_link,
-    get_dynamic_top_volume_universe,
+    resolve_universe_for_bot,
     is_etf_blacklisted,
     now_est,
 )
@@ -52,8 +52,11 @@ SQUEEZE_LOOKBACK_DAYS    = int(os.getenv("SQUEEZE_LOOKBACK_DAYS", "40"))        
 SQUEEZE_RECENT_WINDOW    = int(os.getenv("SQUEEZE_RECENT_WINDOW", "20"))          # days for recent high
 SQUEEZE_NEAR_HIGH_PCT    = float(os.getenv("SQUEEZE_NEAR_HIGH_PCT", "10.0"))      # within 10% of recent high
 
-# Universe size
-SQUEEZE_MAX_UNIVERSE     = int(os.getenv("SQUEEZE_MAX_UNIVERSE", "80"))
+# Universe size: base TICKER_UNIVERSE unless SQUEEZE_TICKER_UNIVERSE override.
+DEFAULT_MAX_UNIVERSE     = int(os.getenv("DYNAMIC_MAX_TICKERS", "2000"))
+SQUEEZE_MAX_UNIVERSE     = int(
+    os.getenv("SQUEEZE_MAX_UNIVERSE", str(DEFAULT_MAX_UNIVERSE))
+)
 
 # Per-day de-dupe (symbol)
 _alert_date: Optional[date] = None
@@ -257,15 +260,14 @@ async def run_squeeze() -> None:
     alerts_sent = 0
     matched_symbols: set[str] = set()
 
-    # Resolve universe
-    env = os.getenv("SQUEEZE_TICKER_UNIVERSE") or os.getenv("TICKER_UNIVERSE")
-    if env:
-        universe = [t.strip().upper() for t in env.split(",") if t.strip()]
-    else:
-        universe = get_dynamic_top_volume_universe(
-            max_tickers=SQUEEZE_MAX_UNIVERSE,
-            volume_coverage=0.90,
-        )
+    # Resolve universe (underlyings scanned count = number of equities evaluated)
+    universe = resolve_universe_for_bot(
+        bot_name="squeeze",
+        bot_env_var="SQUEEZE_TICKER_UNIVERSE",
+        max_universe_env="SQUEEZE_MAX_UNIVERSE",
+        default_max_universe=DEFAULT_MAX_UNIVERSE,
+        apply_dynamic_filters=True,
+    )
 
     if not universe:
         print("[squeeze] empty universe; skipping.")

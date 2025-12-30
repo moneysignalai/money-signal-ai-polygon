@@ -23,7 +23,7 @@ from bots.shared import (
     MIN_RVOL_GLOBAL,
     MIN_VOLUME_GLOBAL,
     send_alert,
-    get_dynamic_top_volume_universe,
+    resolve_universe_for_bot,
     grade_equity_setup,
     is_etf_blacklisted,
     chart_link,
@@ -36,14 +36,22 @@ eastern = pytz.timezone("US/Eastern")
 
 # ------------------- GLOBAL CONFIG -------------------
 
-TREND_MAX_UNIVERSE = int(os.getenv("TREND_MAX_UNIVERSE", "200"))
+DEFAULT_MAX_UNIVERSE = int(os.getenv("DYNAMIC_MAX_TICKERS", "2000"))
+TREND_MAX_UNIVERSE = int(
+    os.getenv("TREND_MAX_UNIVERSE", str(DEFAULT_MAX_UNIVERSE))
+)
 
 
 def _trend_universe() -> List[str]:
-    env = os.getenv("TREND_TICKER_UNIVERSE")
-    if env:
-        return [x.strip().upper() for x in env.split(",") if x.strip()]
-    return get_dynamic_top_volume_universe(max_tickers=TREND_MAX_UNIVERSE, volume_coverage=0.97)
+    # Shared equity universe: allow TREND_TICKER_UNIVERSE override, otherwise use
+    # TICKER_UNIVERSE capped by TREND_MAX_UNIVERSE and trimmed to liquid names.
+    return resolve_universe_for_bot(
+        bot_name="trend_flow",
+        bot_env_var="TREND_TICKER_UNIVERSE",
+        max_universe_env="TREND_FLOW_MAX_UNIVERSE",
+        default_max_universe=TREND_MAX_UNIVERSE,
+        apply_dynamic_filters=True,
+    )
 
 
 def _time_str() -> str:

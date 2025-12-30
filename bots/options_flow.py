@@ -33,6 +33,7 @@ BOT_NAME = "options_flow"
 
 OPTIONS_FLOW_TICKER_UNIVERSE = os.getenv("OPTIONS_FLOW_TICKER_UNIVERSE")
 OPTIONS_FLOW_MAX_UNIVERSE = int(os.getenv("OPTIONS_FLOW_MAX_UNIVERSE", "2000"))
+DEFAULT_MAX_UNIVERSE = int(os.getenv("DYNAMIC_MAX_TICKERS", "2000"))
 ALLOW_OUTSIDE_RTH = os.getenv("OPTIONS_FLOW_ALLOW_OUTSIDE_RTH", "false").lower() == "true"
 
 OPTIONS_MIN_UNDERLYING_PRICE = float(os.getenv("OPTIONS_MIN_UNDERLYING_PRICE", "5.0"))
@@ -227,19 +228,16 @@ def _resolve_universe() -> List[str]:
       1) OPTIONS_FLOW_TICKER_UNIVERSE env if set.
       2) Else TICKER_UNIVERSE/FALLBACK_TICKER_UNIVERSE via shared helper.
     """
-    if OPTIONS_FLOW_TICKER_UNIVERSE:
-        syms = [s.strip().upper() for s in OPTIONS_FLOW_TICKER_UNIVERSE.split(",") if s.strip()]
-        print(
-            f"[options_flow] Using OPTIONS_FLOW_TICKER_UNIVERSE with {len(syms)} symbols "
-            f"(capped to {OPTIONS_FLOW_MAX_UNIVERSE})."
-        )
-        return syms[:OPTIONS_FLOW_MAX_UNIVERSE]
-
-    universe = resolve_universe_for_bot("options_flow", max_tickers=OPTIONS_FLOW_MAX_UNIVERSE)
-    universe = universe[:OPTIONS_FLOW_MAX_UNIVERSE]
+    universe = resolve_universe_for_bot(
+        bot_name="options_flow",
+        bot_env_var="OPTIONS_FLOW_TICKER_UNIVERSE",
+        max_universe_env="OPTIONS_FLOW_MAX_UNIVERSE",
+        default_max_universe=DEFAULT_MAX_UNIVERSE,
+        apply_dynamic_filters=True,
+    )
     print(
-        f"[options_flow] Using dynamic universe with {len(universe)} symbols (max "
-        f"{OPTIONS_FLOW_MAX_UNIVERSE})."
+        f"[options_flow] Using universe with {len(universe)} underlyings "
+        f"(max {OPTIONS_FLOW_MAX_UNIVERSE})."
     )
     return universe
 

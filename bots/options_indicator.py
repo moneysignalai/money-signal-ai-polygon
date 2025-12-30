@@ -37,7 +37,7 @@ from bots.shared import (
     POLYGON_KEY,
     MIN_RVOL_GLOBAL,
     MIN_VOLUME_GLOBAL,
-    get_dynamic_top_volume_universe,
+    resolve_universe_for_bot,
     send_alert,
     chart_link,
     is_etf_blacklisted,
@@ -52,7 +52,10 @@ _client: Optional[RESTClient] = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY e
 
 LOOKBACK_DAYS = int(os.getenv("OPTIONS_INDICATOR_LOOKBACK_DAYS", "140"))
 
-MAX_UNIVERSE = int(os.getenv("OPTIONS_INDICATOR_MAX_UNIVERSE", "120"))
+DEFAULT_MAX_UNIVERSE = int(os.getenv("DYNAMIC_MAX_TICKERS", "2000"))
+MAX_UNIVERSE = int(
+    os.getenv("OPTIONS_INDICATOR_MAX_UNIVERSE", str(DEFAULT_MAX_UNIVERSE))
+)
 
 # underlying filters
 MIN_PRICE = float(os.getenv("OPTIONS_INDICATOR_MIN_PRICE", "10.0"))
@@ -184,10 +187,15 @@ def _bollinger(values: List[float], window: int = 20, num_std: float = 2.0) -> T
 
 
 def _universe() -> List[str]:
-    env = os.getenv("OPTIONS_INDICATOR_TICKER_UNIVERSE")
-    if env:
-        return [t.strip().upper() for t in env.split(",") if t.strip()]
-    return get_dynamic_top_volume_universe(max_tickers=MAX_UNIVERSE, volume_coverage=0.90)
+    # Underlying equities universe; scanned count is number of underlyings evaluated
+    # for option indicators, not contracts.
+    return resolve_universe_for_bot(
+        bot_name="options_indicator",
+        bot_env_var="OPTIONS_INDICATOR_TICKER_UNIVERSE",
+        max_universe_env="OPTIONS_INDICATOR_MAX_UNIVERSE",
+        default_max_universe=DEFAULT_MAX_UNIVERSE,
+        apply_dynamic_filters=True,
+    )
 
 
 def _fetch_daily_history(sym: str, trading_day: date, lookback_days: int) -> List[Any]:
