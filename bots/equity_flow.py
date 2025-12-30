@@ -30,13 +30,17 @@ from bots.shared import (
     MIN_RVOL_GLOBAL,
     MIN_VOLUME_GLOBAL,
     send_alert,
-    get_dynamic_top_volume_universe,
+    resolve_universe_for_bot,
     is_etf_blacklisted,
     grade_equity_setup,
     chart_link,
     now_est,
 )
 from bots.status_report import record_bot_stats
+
+EQUITY_FLOW_ALLOW_OUTSIDE_RTH = (
+    os.getenv("EQUITY_FLOW_ALLOW_OUTSIDE_RTH", "false").lower() == "true"
+)
 
 eastern = pytz.timezone("US/Eastern")
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
@@ -69,9 +73,13 @@ MIN_PULLBACK_PCT = float(os.getenv("PULLBACK_MIN_PULLBACK_PCT", "3.0"))
 MAX_RED_DAYS = int(os.getenv("PULLBACK_MAX_RED_DAYS", "3"))
 LOOKBACK_DAYS = int(os.getenv("PULLBACK_LOOKBACK_DAYS", "60"))
 
-# Universe control
-EQUITY_FLOW_MAX_UNIVERSE = int(os.getenv("EQUITY_FLOW_MAX_UNIVERSE", "200"))
-EQUITY_FLOW_TICKER_UNIVERSE = os.getenv("EQUITY_FLOW_TICKER_UNIVERSE")
+DEFAULT_MAX_UNIVERSE = int(os.getenv("DYNAMIC_MAX_TICKERS", "2000"))
+# Universe control: base TICKER_UNIVERSE or EQUITY_FLOW_TICKER_UNIVERSE override, capped by
+# EQUITY_FLOW_MAX_UNIVERSE (defaults to DYNAMIC_MAX_TICKERS when unset) and trimmed to the
+# most liquid names using the shared dynamic universe helper.
+EQUITY_FLOW_MAX_UNIVERSE = int(
+    os.getenv("EQUITY_FLOW_MAX_UNIVERSE", str(DEFAULT_MAX_UNIVERSE))
+)
 
 # Per-day de-duplication per-signal
 _alert_date: Optional[date] = None
@@ -114,30 +122,18 @@ def _in_rth_window() -> bool:
     return (9 * 60 + 30) <= mins <= (16 * 60)  # 09:30–16:00 ET
 
 
+def should_run_now() -> tuple[bool, str | None]:
+    if EQUITY_FLOW_ALLOW_OUTSIDE_RTH:
+        return True, None
+    if _in_rth_window():
+        return True, None
+    return False, "outside RTH"
+
+
 def _in_gap_window() -> bool:
     now = datetime.now(eastern)
     mins = now.hour * 60 + now.minute
     return (9 * 60 + 30) <= mins <= GAP_SCAN_END_MIN
-
-
-def _get_universe() -> List[str]:
-    """
-    Universe priority:
-      1) EQUITY_FLOW_TICKER_UNIVERSE env
-      2) TICKER_UNIVERSE env
-      3) Dynamic top-volume universe (shared)
-    """
-    if EQUITY_FLOW_TICKER_UNIVERSE:
-        return [s.strip().upper() for s in EQUITY_FLOW_TICKER_UNIVERSE.split(",") if s.strip()]
-
-    env = os.getenv("TICKER_UNIVERSE")
-    if env:
-        return [s.strip().upper() for s in env.split(",") if s.strip()]
-
-    return get_dynamic_top_volume_universe(
-        max_tickers=EQUITY_FLOW_MAX_UNIVERSE,
-        volume_coverage=0.95,
-    )
 
 
 def _fetch_daily_history(sym: str, trading_day: date) -> List:
@@ -554,10 +550,12 @@ async def run_equity_flow() -> None:
 
     if not POLYGON_KEY or not _client:
         print("[equity_flow] missing POLYGON_KEY or client; skipping.")
+        record_bot_stats("equity_flow", 0, 0, 0, 0.0)
         return
 
-    if not _in_rth_window():
+    if not (EQUITY_FLOW_ALLOW_OUTSIDE_RTH or _in_rth_window()):
         print("[equity_flow] outside RTH; skipping.")
+        record_bot_stats("equity_flow", 0, 0, 0, 0.0)
         return
 
     BOT_NAME = "equity_flow"
@@ -565,13 +563,22 @@ async def run_equity_flow() -> None:
     alerts_sent = 0
     matched_symbols: set[str] = set()
 
-    universe = _get_universe()
+    universe = resolve_universe_for_bot(
+        bot_name="equity_flow",
+        bot_env_var="EQUITY_FLOW_TICKER_UNIVERSE",
+        max_universe_env="EQUITY_FLOW_MAX_UNIVERSE",
+        default_max_universe=DEFAULT_MAX_UNIVERSE,
+        apply_dynamic_filters=True,
+    )
     if not universe:
         print("[equity_flow] empty universe; skipping.")
+        record_bot_stats("equity_flow", 0, 0, 0, 0.0)
         return
 
     trading_day = date.today()
-    print(f"[equity_flow] scanning {len(universe)} symbols for volume/gap/pullback on {trading_day}")
+    print(
+        f"[equity_flow] scanning {len(universe)} symbols for volume/gap/pullback on {trading_day}"
+    )
 
     for sym in universe:
         if is_etf_blacklisted(sym):
