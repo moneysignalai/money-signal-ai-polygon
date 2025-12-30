@@ -149,6 +149,28 @@ def _skip_reason(name: str) -> str | None:
     return None
 
 
+def _time_window_allows(module_path: str) -> Tuple[bool, str | None]:
+    """
+    Ask a bot module if it wants to run right now via an optional should_run_now().
+    This is only used for observability; the bot itself must also guard internally.
+    """
+
+    try:
+        module = importlib.import_module(module_path)
+        fn = getattr(module, "should_run_now", None)
+        if fn is None:
+            return True, None
+
+        result = fn()
+        if isinstance(result, tuple):
+            allowed, reason = result
+            return bool(allowed), reason
+        return bool(result), None
+    except Exception as exc:
+        print(f"[scheduler] warning checking time window for {module_path}: {exc}")
+        return True, None
+
+
 async def _run_single_bot(public_name: str, module_path: str, func_name: str, record_error):
     try:
         module = importlib.import_module(module_path)
@@ -194,18 +216,30 @@ async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS):
         for name, module_path, func_name, interval in BOTS:
             skip = _skip_reason(name)
             if skip:
-                print(f"[main] skipping {name}: {skip}")
+                print(f"[scheduler] bot={name} action=SKIPPED_DISABLED reason={skip}")
+                continue
+
+            allowed, reason = _time_window_allows(module_path)
+            if not allowed:
+                print(
+                    f"[scheduler] bot={name} action=SKIPPED_TIME_WINDOW "
+                    f"reason={reason or 'time window closed'}"
+                )
+                next_run_ts[name] = cycle_start_ts + interval
                 continue
 
             due_ts = next_run_ts.get(name, 0.0)
             if cycle_start_ts >= due_ts:
-                print(f"[main] scheduling bot {name} (interval={interval}s)")
+                print(f"[scheduler] bot={name} action=RUN interval={interval}s")
                 tasks.append(
                     asyncio.create_task(
                         _run_single_bot(name, module_path, func_name, record_error)
                     )
                 )
                 next_run_ts[name] = cycle_start_ts + interval
+            else:
+                wait_for = max(0.0, due_ts - cycle_start_ts)
+                print(f"[scheduler] bot={name} action=WAITING next_in={wait_for:.1f}s")
 
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)

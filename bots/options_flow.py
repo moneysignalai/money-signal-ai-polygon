@@ -242,6 +242,16 @@ def _resolve_universe() -> List[str]:
     return universe
 
 
+def should_run_now() -> tuple[bool, str | None]:
+    """Expose RTH gating to the scheduler for observability."""
+
+    if ALLOW_OUTSIDE_RTH:
+        return True, None
+    if in_rth_window_est():
+        return True, None
+    return False, "outside RTH window"
+
+
 # ---------------- MAIN BOT ----------------
 
 
@@ -251,6 +261,8 @@ async def run_options_flow() -> None:
     Massive/Polygon snapshot chains plus the last-trade endpoint as a fallback.
     """
     start_unix = time.time()
+
+    print("[options_flow] start")
 
     if not ALLOW_OUTSIDE_RTH and not in_rth_window_est():
         print(
