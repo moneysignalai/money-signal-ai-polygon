@@ -2,7 +2,6 @@
 
 import json
 import os
-import statistics
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
@@ -228,29 +227,47 @@ def _send_telegram_status(text: str) -> None:
 # ----------------- HEARTBEAT FORMAT -----------------
 
 
+DISPLAY_NAME_OVERRIDES = {
+    "opening_range_breakout": "ORB",
+    "rsi_signals": "RSI Signals",
+    "dark_pool_radar": "Dark Pool",
+    "options_indicator": "Options Ind",
+}
+
+
 def _display_name(bot_name: str) -> str:
     """
     Convert internal bot name (equity_flow) to a human-readable label ("Equity Flow").
+    Applies short aliases where helpful.
     """
+    if bot_name in DISPLAY_NAME_OVERRIDES:
+        return DISPLAY_NAME_OVERRIDES[bot_name]
     label = bot_name.replace("_", " ").strip()
     if not label:
         return bot_name
     return label.title()
 
 
+def _pad_label(label: str, width: int = 13) -> str:
+    """Pad a label with ellipsis characters to align columns."""
+    if len(label) >= width:
+        return label + " "
+    fill = "…" * (width - len(label))
+    return f"{label} {fill} "
+
+
+def _short_time(ts: str) -> str:
+    """Return the HH:MM AM/PM part from a human-friendly timestamp string."""
+    if not ts:
+        return ts
+    if "·" in ts:
+        return ts.split("·", 1)[0].strip()
+    return ts
+
+
 def _format_heartbeat() -> str:
     """
-    Build the heartbeat message text.
-
-    Sections:
-      • Header (time + global status)
-      • Bot Status (per-bot OK / no recent run)
-      • Scanner Analytics (global totals)
-      • Per-bot metrics (scanned / matches / alerts)
-      • Runtime per bot (median + last runtime)
-      • High-scan, zero-alert bots
-      • Top 3 heaviest by scans
-      • Recent errors (last 60 minutes)
+    Build the heartbeat message text in a compact, sectioned layout.
     """
     data = _load_stats()
     bots_data: Dict[str, Any] = data.get("bots", {})
@@ -299,146 +316,93 @@ def _format_heartbeat() -> str:
             }
         )
 
-    # Sort a copy by scanned volume for "heaviest" section
-    bot_rows_by_scans = sorted(bot_rows, key=lambda r: r["scanned"], reverse=True)
-    top3 = [r for r in bot_rows_by_scans if r["scanned"] > 0][:3]
-
-    # ----------------- Build message lines -----------------
-
-    lines: List[str] = []
-
-    # Header
-    lines.append("📡 *MoneySignalAI Heartbeat* ❤️")
-    lines.append(f"⏰ {now_est()}")
-    lines.append("────────────────")
-    lines.append("✅ ALL SYSTEMS GOOD")
-    lines.append("")
-
-    # Bot status
-    lines.append("🤖 *Bot Status:*")
-    for r in bot_rows:
-        internal = r["internal_name"]
-        display = r["display_name"]
-        last_run_ts = r["last_run_ts"]
-        last_run_str = r["last_run_str"]
-
-        label = display
-        if is_bot_disabled(internal):
-            label = f"{display} (DISABLED)"
-        elif is_bot_test_mode(internal):
-            label = f"{display} (TEST)"
-
-        if last_run_ts > 0:
-            lines.append(f"• ✅ {label}: OK @ {last_run_str}")
-        else:
-            lines.append(f"• ❔ {label}: no recent run")
-
-    # Scanner analytics
-    lines.append("────────────────")
-    lines.append("📊 *Scanner Analytics:*")
-    lines.append(f"• Total scanned: **{total_scanned:,}**")
-    lines.append(f"• Filter matches: **{total_matched:,}**")
-    lines.append(f"• Alerts fired: **{total_alerts:,}**")
-    lines.append("")
-
-    # Per-bot metrics
-    lines.append("📈 *Per-bot metrics:*")
-    for r in bot_rows:
-        display = r["display_name"]
-        lines.append(
-            f"• {display}: scanned={r['scanned']:,} | "
-            f"matches={r['matched']:,} | alerts={r['alerts']:,}"
-        )
-
-    # Runtime / latency section
-    lines.append("────────────────")
-    lines.append("⏱ *Runtime (per bot):*")
-    any_runtime = False
-    # Compute median runtime for each bot that has history
-    def _median_or_none(vals: List[float]) -> Optional[float]:
-        if not vals:
-            return None
-        try:
-            return float(statistics.median(vals))
-        except Exception:
-            return None
-
-    # Sort by median runtime descending for runtime section
-    runtime_rows: List[Dict[str, Any]] = []
-    for r in bot_rows:
-        history = r["runtime_history"]
-        med = _median_or_none(history)
-        if med is not None:
-            runtime_rows.append(
-                {
-                    "display_name": r["display_name"],
-                    "median": med,
-                    "last": r["last_runtime"],
-                    "count": len(history),
-                }
-            )
-
-    runtime_rows.sort(key=lambda x: x["median"], reverse=True)
-
-    for rr in runtime_rows:
-        any_runtime = True
-        lines.append(
-            f"• {rr['display_name']}: median {rr['median']:.2f}s "
-            f"(last {rr['last']:.2f}s, n={rr['count']})"
-        )
-
-    # Bots with no runtime data
-    for r in bot_rows:
-        if not r["runtime_history"]:
-            lines.append(f"• {_display_name(r['internal_name'])}: no runtime data yet")
-
-    if not any_runtime:
-        lines.append("• (no runtime data yet)")
-
-    # High-scan, zero-alert bots
-    high_scan_low_alert = [
-        r for r in bot_rows
-        if r["scanned"] >= 200 and r["alerts"] == 0
-    ]
-    if high_scan_low_alert:
-        lines.append("────────────────")
-        lines.append("🧐 *High-scan, zero-alert bots (tune filters?):*")
-        for r in high_scan_low_alert:
-            lines.append(
-                f"• {r['display_name']}: scanned={r['scanned']:,}, "
-                f"matches={r['matched']:,}, alerts={r['alerts']:,}"
-            )
-
-    # Top 3 heaviest
-    if top3:
-        lines.append("────────────────")
-        lines.append("🥵 *Top 3 Heaviest Bots* (by scans):")
-        max_scans = top3[0]["scanned"] or 1
-        for r in top3:
-            display = r["display_name"]
-            scans = r["scanned"]
-            # Simple relative bar
-            bar_len = max(1, int((scans / max_scans) * 4))
-            bar = "█" * bar_len
-            lines.append(f"• {display}: {scans:,} scanned {bar}")
-
-    # Optional: recent errors within last 60 minutes
     now_ts = time.time()
     recent_errors = [
         e for e in errors_data
         if now_ts - float(e.get("ts", 0.0)) <= 60 * 60
     ]
+    error_bots = {str(e.get("bot", "")).lower() for e in recent_errors}
+
+    # Overall status line
+    status_line = "✅ ALL SYSTEMS GOOD"
     if recent_errors:
-        lines.append("────────────────")
-        lines.append("⚠️ *Recent Errors (last 60 min):*")
-        for e in recent_errors[-5:]:  # show up to last 5
-            bot = _escape_markdown(str(e.get("bot", "?")))
-            when = _escape_markdown(str(e.get("when", "?")))
-            etype = _escape_markdown(str(e.get("type", "?")))
-            msg = _escape_markdown(str(e.get("msg", "")))
-            if len(msg) > 120:
-                msg = msg[:117] + "..."
-            lines.append(f"• {bot} ({etype}) @ {when} → {msg}")
+        status_line = "⚠️ PARTIAL ISSUES" if len(recent_errors) < 3 else "❌ ERRORS DETECTED"
+
+    lines: List[str] = []
+
+    # Header
+    lines.append(f"📡 MoneySignalAI Heartbeat · {now_est()}")
+    lines.append(status_line)
+    lines.append("")
+
+    # Bot overview
+    lines.append("🤖 Bots")
+    for r in bot_rows:
+        internal = r["internal_name"]
+        display = _pad_label(r["display_name"])
+        last_run_ts = r["last_run_ts"]
+        last_run_str = r["last_run_str"] or "no recent run"
+
+        status = "⚪" if last_run_ts <= 0 else "🟢"
+        if internal.lower() in error_bots:
+            status = "🔴"
+
+        last_seen = _short_time(last_run_str) if last_run_ts > 0 else "No recent run"
+        lines.append(f"• {display}{status} {last_seen}")
+
+    # Totals
+    lines.append("")
+    lines.append("📊 Totals")
+    totals_line = f"• Scanned: {total_scanned:,} • Matches: {total_matched:,} • Alerts: {total_alerts:,}"
+    lines.append(totals_line)
+
+    # Per-bot metrics
+    lines.append("")
+    lines.append("📈 Per Bot (scanned | matches | alerts)")
+    for r in bot_rows:
+        display = _pad_label(r["display_name"])
+        scanned = r.get("scanned", "n/a")
+        matched = r.get("matched", "n/a")
+        alerts = r.get("alerts", "n/a")
+        try:
+            scanned_str = f"{int(scanned):,}"
+        except Exception:
+            scanned_str = "n/a"
+        try:
+            matched_str = f"{int(matched):,}"
+        except Exception:
+            matched_str = "n/a"
+        try:
+            alerts_str = f"{int(alerts):,}"
+        except Exception:
+            alerts_str = "n/a"
+        lines.append(f"• {display}{scanned_str} | {matched_str} | {alerts_str}")
+
+    # Diagnostics
+    high_scan_zero_alert = [
+        _display_name(r["internal_name"])
+        for r in bot_rows
+        if r.get("scanned", 0) > 0 and r.get("alerts", 0) == 0
+    ]
+    no_runtime = [
+        _display_name(r["internal_name"])
+        for r in bot_rows
+        if float(r.get("last_run_ts", 0.0)) <= 0.0
+    ]
+
+    lines.append("")
+    lines.append("🛠 Diagnostics")
+    if high_scan_zero_alert:
+        lines.append(
+            "• High scan, zero alerts: " + ", ".join(sorted(high_scan_zero_alert))
+        )
+    else:
+        lines.append("• High scan, zero alerts: none")
+
+    if no_runtime:
+        lines.append("• No runtime yet: " + ", ".join(sorted(no_runtime)))
+    else:
+        lines.append("• No runtime yet: none")
 
     return "\n".join(lines)
 
