@@ -273,6 +273,7 @@ async def run_premarket() -> None:
       - Partial-day RVOL >= max(MIN_PREMARKET_RVOL, MIN_RVOL_GLOBAL)
       - Day volume so far >= MIN_VOLUME_GLOBAL
     """
+    print("[premarket] start")
     _reset_if_new_day()
 
     if not POLYGON_KEY or not _client:

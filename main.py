@@ -12,6 +12,8 @@ import pytz
 import uvicorn
 from fastapi import FastAPI
 
+from bots.shared import in_premarket_window_est, in_rth_window_est, is_trading_day_est
+
 # ----------------- Time helpers -----------------
 
 eastern = pytz.timezone("US/Eastern")
@@ -149,12 +151,56 @@ def _skip_reason(name: str) -> str | None:
     return None
 
 
-def _time_window_allows(module_path: str) -> Tuple[bool, str | None]:
+def _time_window_allows(name: str, module_path: str) -> Tuple[bool, str | None]:
     """
-    Ask a bot module if it wants to run right now via an optional should_run_now().
-    This is only used for observability; the bot itself must also guard internally.
+    Combine trading-day/time-of-day heuristics with a bot-provided should_run_now().
+    This keeps scheduler visibility aligned with per-bot gating.
     """
 
+    lname = name.lower()
+
+    # Trading-day guard (Mon–Fri only)
+    if not is_trading_day_est():
+        return False, "non-trading day"
+
+    # RTH-only bots
+    rth_bots = {
+        "equity_flow",
+        "intraday_flow",
+        "rsi_signals",
+        "options_flow",
+        "options_indicator",
+        "squeeze",
+        "trend_flow",
+        "dark_pool_radar",
+    }
+
+    # Premarket-only
+    if lname == "premarket":
+        if os.getenv("PREMARKET_ALLOW_OUTSIDE_WINDOW", "false").lower() == "true":
+            pass
+        elif not in_premarket_window_est():
+            return False, "outside premarket window"
+
+    if lname in rth_bots:
+        allow_outside = os.getenv(f"{lname.upper()}_ALLOW_OUTSIDE_RTH", "false").lower()
+        if allow_outside != "true" and not in_rth_window_est():
+            return False, "outside RTH window"
+
+    if lname in {"opening_range_breakout", "orb"}:
+        allow_outside = os.getenv("ORB_ALLOW_OUTSIDE_RTH", "false").lower() == "true"
+        if not allow_outside:
+            if not in_rth_window_est():
+                return False, "outside RTH window"
+            try:
+                limit = int(os.getenv("ORB_RANGE_MINUTES", "15"))
+            except Exception:
+                limit = 15
+            # Only allow within the opening range window
+            if not in_rth_window_est(0, limit):
+                return False, "outside ORB window"
+
+    # Delegate to bot-specific should_run_now if available
     try:
         module = importlib.import_module(module_path)
         fn = getattr(module, "should_run_now", None)
@@ -219,7 +265,7 @@ async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS):
                 print(f"[scheduler] bot={name} action=SKIPPED_DISABLED reason={skip}")
                 continue
 
-            allowed, reason = _time_window_allows(module_path)
+            allowed, reason = _time_window_allows(name, module_path)
             if not allowed:
                 print(
                     f"[scheduler] bot={name} action=SKIPPED_TIME_WINDOW "

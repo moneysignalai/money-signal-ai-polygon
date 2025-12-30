@@ -75,6 +75,11 @@ def today_est_date() -> date:
     return datetime.now(eastern).date()
 
 
+def is_trading_day_est() -> bool:
+    """Return True on US/Eastern weekdays (Mon–Fri)."""
+    return today_est_date().weekday() < 5
+
+
 def iso_today() -> str:
     return today_est_date().isoformat()
 
@@ -832,6 +837,11 @@ def is_rth() -> bool:
 
 def is_premarket() -> bool:
     return is_between_times(4, 0, 9, 29, eastern)
+
+
+def in_premarket_window_est() -> bool:
+    """Explicit helper for 04:00–09:30 ET premarket window."""
+    return is_premarket()
 
 
 def is_postmarket() -> bool:

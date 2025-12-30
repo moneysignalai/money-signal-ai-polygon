@@ -445,6 +445,7 @@ async def run_daily_ideas() -> None:
     """
     Build confluence-based daily idea lists (LONG and SHORT).
     """
+    print("[daily_ideas] start")
     _reset_slots_if_new_day()
 
     slot = _current_slot()
