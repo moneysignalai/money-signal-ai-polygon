@@ -29,6 +29,8 @@ from .shared import (
 )
 # ---------------- ENV / CONFIG ----------------
 
+BOT_NAME = "options_flow"
+
 OPTIONS_FLOW_TICKER_UNIVERSE = os.getenv("OPTIONS_FLOW_TICKER_UNIVERSE")
 OPTIONS_FLOW_MAX_UNIVERSE = int(os.getenv("OPTIONS_FLOW_MAX_UNIVERSE", "2000"))
 ALLOW_OUTSIDE_RTH = os.getenv("OPTIONS_FLOW_ALLOW_OUTSIDE_RTH", "false").lower() == "true"
@@ -264,20 +266,6 @@ async def run_options_flow() -> None:
 
     print("[options_flow] start")
 
-    if not ALLOW_OUTSIDE_RTH and not in_rth_window_est():
-        print(
-            "[options_flow] outside RTH window; skipping run (set "
-            "OPTIONS_FLOW_ALLOW_OUTSIDE_RTH=true to debug)."
-        )
-        record_bot_stats("Options Flow", 0, 0, 0, 0.0)
-        return
-
-    universe = _resolve_universe()
-    if not universe:
-        print("[options_flow] universe empty; nothing to scan.")
-        record_bot_stats("Options Flow", 0, 0, 0, 0.0)
-        return
-
     scanned = 0
     matched_contracts: List[OptionFlowRecord] = []
     alerts_sent = 0
@@ -287,129 +275,6 @@ async def run_options_flow() -> None:
         debug_filter_reason("options_flow", symbol, reason)
         if reason_counts is not None:
             reason_counts[reason] = reason_counts.get(reason, 0) + 1
-
-    for sym in universe:
-        scanned += 1
-        try:
-            chain = get_option_chain_cached(sym, ttl_seconds=60)
-            if not chain:
-                _log_reason(sym, "no chain snapshot")
-                continue
-
-            if not isinstance(chain, dict):
-                _log_reason(sym, "bad_chain_data")
-                continue
-
-            results = chain.get("results") or chain.get("options") or []
-            if not isinstance(results, list) or not results:
-                _log_reason(sym, "empty chain results")
-                continue
-
-            underlying = chain.get("underlying") or chain.get("underlying_asset") or {}
-            last_under = underlying.get("last") or underlying.get("last_trade") or {}
-            under_price = _safe_float(
-                last_under.get("price")
-                or last_under.get("p")
-                or underlying.get("last_price")
-                or underlying.get("price")
-                or underlying.get("close")
-            )
-            if under_price is None or under_price < OPTIONS_MIN_UNDERLYING_PRICE:
-                _log_reason(sym, f"underlying price {under_price} < {OPTIONS_MIN_UNDERLYING_PRICE}")
-                continue
-
-            for opt in results:
-                if not isinstance(opt, dict):
-                    _log_reason(sym, "non-dict option record")
-                    continue
-
-                expiry, contract, dte = _parse_option_details(opt)
-                if not contract:
-                    _log_reason(sym, "no contract symbol in snapshot")
-                    continue
-
-                last_trade_obj = (
-                    opt.get("last")
-                    or opt.get("last_trade")
-                    or opt.get("lastTrade")
-                    or {}
-                )
-
-                price = _safe_float(
-                    (last_trade_obj.get("price") if isinstance(last_trade_obj, dict) else None)
-                    or (last_trade_obj.get("p") if isinstance(last_trade_obj, dict) else None)
-                )
-                size = _safe_int(
-                    (last_trade_obj.get("size") if isinstance(last_trade_obj, dict) else None)
-                    or (last_trade_obj.get("s") if isinstance(last_trade_obj, dict) else None)
-                )
-
-                if price is None or size is None:
-                    trade = get_last_option_trades_cached(contract)
-                    if not trade:
-                        _log_reason(sym, f"no last trade for {contract}")
-                        continue
-
-                    t_res = trade.get("results")
-                    if isinstance(t_res, list) and t_res:
-                        last = t_res[0]
-                    elif isinstance(t_res, dict):
-                        last = t_res
-                    else:
-                        last = trade
-
-                    if isinstance(last, dict):
-                        price = _safe_float(last.get("price") or last.get("p"))
-                        size = _safe_int(last.get("size") or last.get("s"))
-
-                if price is None or size is None:
-                    _log_reason(sym, f"missing price/size for {contract}")
-                    continue
-                if price <= 0 or size <= 0:
-                    _log_reason(sym, f"non-positive price/size for {contract}")
-                    continue
-
-                notional = price * size * 100.0
-
-                cp = _contract_type(contract) or "UNKNOWN"
-
-                if dte is None or dte < 0:
-                    _log_reason(sym, f"bad dte={dte} for {contract}")
-                    continue
-                if dte > WHALES_MAX_DTE:
-                    _log_reason(sym, f"dte={dte} beyond whales max={WHALES_MAX_DTE}")
-                    continue
-
-                category, reasons = _categorize(price, size, notional, dte)
-
-                iv_hit, iv_reasons = _maybe_iv_crush(opt)
-                if iv_hit:
-                    reasons.extend(iv_reasons)
-                    if not category:
-                        category = "IVCRUSH"
-
-                if not category:
-                    _log_reason(sym, f"no category for {contract}")
-                    continue
-
-                record = OptionFlowRecord(
-                    symbol=sym,
-                    contract=contract,
-                    category=category,
-                    direction=cp,
-                    price=price,
-                    size=size,
-                    notional=notional,
-                    dte=dte,
-                    expiry=expiry or "N/A",
-                    cp=cp,
-                    reasons=reasons,
-                )
-                matched_contracts.append(record)
-        except Exception as e:
-            _log_reason(sym, f"exception {e}")
-            print(f"[options_flow] Error on {sym}: {e}")
-            continue
 
     def _fmt_record(rec: OptionFlowRecord) -> str:
         direction = "BULL" if rec.cp == "CALL" else "BEAR" if rec.cp == "PUT" else "UNKNOWN"
@@ -435,25 +300,161 @@ async def run_options_flow() -> None:
             f"🔗 Chart: {chart}"
         )
 
-    for rec in matched_contracts:
-        text = _fmt_record(rec)
-        send_alert(
-            bot_name="Options Flow",
-            symbol=rec.symbol,
-            last_price=rec.price,
-            rvol=0.0,
-            extra=text,
+    try:
+        if not ALLOW_OUTSIDE_RTH and not in_rth_window_est():
+            print(
+                "[options_flow] outside RTH window; skipping run (set "
+                "OPTIONS_FLOW_ALLOW_OUTSIDE_RTH=true to debug)."
+            )
+            return
+
+        universe = _resolve_universe()
+        if not universe:
+            print("[options_flow] universe empty; nothing to scan.")
+            return
+
+        for sym in universe:
+            scanned += 1
+            try:
+                chain = get_option_chain_cached(sym, ttl_seconds=60)
+                if not chain:
+                    _log_reason(sym, "no chain snapshot")
+                    continue
+
+                if not isinstance(chain, dict):
+                    _log_reason(sym, "bad_chain_data")
+                    continue
+
+                results = chain.get("results") or chain.get("options") or []
+                if not isinstance(results, list) or not results:
+                    _log_reason(sym, "empty chain results")
+                    continue
+
+                underlying = chain.get("underlying") or chain.get("underlying_asset") or {}
+                last_under = underlying.get("last") or underlying.get("last_trade") or {}
+                under_price = _safe_float(
+                    last_under.get("price")
+                    or last_under.get("p")
+                    or underlying.get("last_price")
+                    or underlying.get("price")
+                    or underlying.get("close")
+                )
+                if under_price is None or under_price < OPTIONS_MIN_UNDERLYING_PRICE:
+                    _log_reason(sym, f"underlying price {under_price} < {OPTIONS_MIN_UNDERLYING_PRICE}")
+                    continue
+
+                for opt in results:
+                    if not isinstance(opt, dict):
+                        _log_reason(sym, "non-dict option record")
+                        continue
+
+                    expiry, contract, dte = _parse_option_details(opt)
+                    if not contract:
+                        _log_reason(sym, "no contract symbol in snapshot")
+                        continue
+
+                    last_trade_obj = (
+                        opt.get("last")
+                        or opt.get("last_trade")
+                        or opt.get("lastTrade")
+                        or {}
+                    )
+
+                    price = _safe_float(
+                        (last_trade_obj.get("price") if isinstance(last_trade_obj, dict) else None)
+                        or (last_trade_obj.get("p") if isinstance(last_trade_obj, dict) else None)
+                    )
+                    size = _safe_int(
+                        (last_trade_obj.get("size") if isinstance(last_trade_obj, dict) else None)
+                        or (last_trade_obj.get("s") if isinstance(last_trade_obj, dict) else None)
+                    )
+
+                    if price is None or size is None:
+                        trade = get_last_option_trades_cached(contract)
+                        if not trade:
+                            _log_reason(sym, f"no last trade for {contract}")
+                            continue
+
+                        t_res = trade.get("results")
+                        if isinstance(t_res, list) and t_res:
+                            last = t_res[0]
+                        elif isinstance(t_res, dict):
+                            last = t_res
+                        else:
+                            last = trade
+
+                        if isinstance(last, dict):
+                            price = _safe_float(last.get("price") or last.get("p"))
+                            size = _safe_int(last.get("size") or last.get("s"))
+
+                    if price is None or size is None:
+                        _log_reason(sym, f"missing price/size for {contract}")
+                        continue
+                    if price <= 0 or size <= 0:
+                        _log_reason(sym, f"non-positive price/size for {contract}")
+                        continue
+
+                    notional = price * size * 100.0
+
+                    cp = _contract_type(contract) or "UNKNOWN"
+
+                    if dte is None or dte < 0:
+                        _log_reason(sym, f"bad dte={dte} for {contract}")
+                        continue
+                    if dte > WHALES_MAX_DTE:
+                        _log_reason(sym, f"dte={dte} beyond whales max={WHALES_MAX_DTE}")
+                        continue
+
+                    category, reasons = _categorize(price, size, notional, dte)
+
+                    iv_hit, iv_reasons = _maybe_iv_crush(opt)
+                    if iv_hit:
+                        reasons.extend(iv_reasons)
+                        if not category:
+                            category = "IVCRUSH"
+
+                    if not category:
+                        _log_reason(sym, f"no category for {contract}")
+                        continue
+
+                    record = OptionFlowRecord(
+                        symbol=sym,
+                        contract=contract,
+                        category=category,
+                        direction=cp,
+                        price=price,
+                        size=size,
+                        notional=notional,
+                        dte=dte,
+                        expiry=expiry or "N/A",
+                        cp=cp,
+                        reasons=reasons,
+                    )
+                    matched_contracts.append(record)
+            except Exception as e:
+                _log_reason(sym, f"exception {e}")
+                print(f"[options_flow] Error on {sym}: {e}")
+                continue
+    finally:
+        run_seconds = time.time() - start_unix
+
+        for rec in matched_contracts:
+            text = _fmt_record(rec)
+            send_alert(
+                bot_name="Options Flow",
+                symbol=rec.symbol,
+                last_price=rec.price,
+                rvol=0.0,
+                extra=text,
+            )
+            alerts_sent += 1
+
+        if reason_counts is not None and not matched_contracts:
+            print(f"[options_flow] No alerts. Filter breakdown: {reason_counts}")
+
+        print(
+            f"[options_flow] done. scanned={scanned} matched={len(matched_contracts)} "
+            f"alerts={alerts_sent} run_seconds={run_seconds:.2f}"
         )
-        alerts_sent += 1
 
-    run_seconds = time.time() - start_unix
-
-    if reason_counts is not None and not matched_contracts:
-        print(f"[options_flow] No alerts. Filter breakdown: {reason_counts}")
-
-    print(
-        f"[options_flow] done. scanned={scanned} matched={len(matched_contracts)} "
-        f"alerts={alerts_sent} run_seconds={run_seconds:.2f}"
-    )
-
-    record_bot_stats("Options Flow", scanned, len(matched_contracts), alerts_sent, run_seconds)
+        record_bot_stats(BOT_NAME, scanned, len(matched_contracts), alerts_sent, run_seconds)
