@@ -419,7 +419,7 @@ def _get_env_universe(env_var: str) -> List[str]:
 
 def get_dynamic_top_volume_universe(
     max_tickers: int = 100,
-    volume_coverage: float = 0.90,
+    volume_coverage: Optional[float] = None,
 ) -> List[str]:
     """
     Use Polygon's previous day's most-active (by dollar volume) to build a liquid universe.
@@ -462,12 +462,16 @@ def get_dynamic_top_volume_universe(
     except Exception:
         pass
 
-    try:
-        env_cov = os.getenv("DYNAMIC_VOLUME_COVERAGE")
-        if env_cov is not None:
-            volume_coverage = float(env_cov)
-    except Exception:
-        pass
+    coverage = volume_coverage
+    if coverage is None:
+        try:
+            env_cov = os.getenv("DYNAMIC_VOLUME_COVERAGE")
+            if env_cov is not None:
+                coverage = float(env_cov)
+        except Exception:
+            coverage = None
+    if coverage is None:
+        coverage = 0.90
 
     today = today_est_date()
     prev = today - timedelta(days=1)
@@ -537,10 +541,10 @@ def get_dynamic_top_volume_universe(
         running += dv
         if len(universe) >= max_tickers:
             break
-        if total_dollar > 0 and running / total_dollar >= volume_coverage:
+        if total_dollar > 0 and running / total_dollar >= coverage:
             break
 
-    print(f"[shared] dynamic universe: {len(universe)} names, covers ~{volume_coverage*100:.0f}% vol.")
+    print(f"[shared] dynamic universe: {len(universe)} names, covers ~{coverage*100:.0f}% vol.")
     _UNIVERSE_CACHE["ts"] = now_ts
     _UNIVERSE_CACHE["data"] = universe
     return universe
@@ -548,44 +552,96 @@ def get_dynamic_top_volume_universe(
 
 def resolve_universe_for_bot(
     bot_name: str,
-    max_tickers: int,
     bot_env_var: Optional[str] = None,
+    base_env_universe: str = "TICKER_UNIVERSE",
+    max_universe_env: Optional[str] = None,
+    default_max_universe: Optional[int] = None,
+    apply_dynamic_filters: bool = True,
+    volume_coverage_env: str = "DYNAMIC_VOLUME_COVERAGE",
 ) -> List[str]:
     """
     Unified universe resolver for all bots.
 
     Priority:
       1) If `bot_env_var` (e.g. OPTIONS_FLOW_TICKER_UNIVERSE) is set → use that.
-      2) Else if global TICKER_UNIVERSE is set → use that.
-      3) Else → fall back to dynamic Polygon universe / FALLBACK_TICKER_UNIVERSE.
+      2) Else if `base_env_universe` (default: TICKER_UNIVERSE) is set → use that.
+      3) Else → fall back to dynamic Polygon/Massive universe or FALLBACK_TICKER_UNIVERSE.
 
-    All steps cap to `max_tickers`.
+    Configuration knobs:
+      • max_universe_env (e.g. EQUITY_FLOW_MAX_UNIVERSE) caps the list if set.
+      • default_max_universe falls back if no max env is set (defaults to
+        DYNAMIC_MAX_TICKERS when omitted).
+      • apply_dynamic_filters trims the chosen universe to the most liquid names
+        using get_dynamic_top_volume_universe. This helps keep counts consistent
+        across bots even when TICKER_UNIVERSE is large.
     """
+
+    def _int_env(name: str) -> Optional[int]:
+        try:
+            return int(os.getenv(name, "")) if os.getenv(name, "").strip() else None
+        except Exception:
+            return None
+
+    dyn_cap = _int_env("DYNAMIC_MAX_TICKERS") or default_max_universe or 2000
+    resolved_max = dyn_cap
+    if max_universe_env:
+        env_cap = _int_env(max_universe_env)
+        if env_cap:
+            resolved_max = min(resolved_max, env_cap)
+
+    coverage_val: Optional[float] = None
+    if volume_coverage_env:
+        try:
+            env_cov = os.getenv(volume_coverage_env)
+            if env_cov:
+                coverage_val = float(env_cov)
+        except Exception:
+            coverage_val = None
+
     # 1) Per-bot override (e.g. OPTIONS_FLOW_TICKER_UNIVERSE)
+    selected_universe: List[str] = []
     if bot_env_var:
         override = _get_env_universe(bot_env_var)
         if override:
-            if len(override) > max_tickers:
-                print(
-                    f"[shared] {bot_name}: capping {bot_env_var} universe "
-                    f"from {len(override)} → {max_tickers}"
-                )
-            return override[:max_tickers]
+            selected_universe = override
 
-    # 2) Global TICKER_UNIVERSE
-    global_u = _get_env_universe("TICKER_UNIVERSE")
-    if global_u:
-        if len(global_u) > max_tickers:
-            print(
-                f"[shared] {bot_name}: capping TICKER_UNIVERSE "
-                f"from {len(global_u)} → {max_tickers}"
-            )
-        return global_u[:max_tickers]
+    # 2) Base env
+    if not selected_universe:
+        base_env = _get_env_universe(base_env_universe)
+        if base_env:
+            selected_universe = base_env
 
-    # 3) Dynamic Polygon-based universe fallback
-    universe = get_dynamic_top_volume_universe(max_tickers=max_tickers)
-    print(f"[shared] {bot_name}: using dynamic universe ({len(universe)} names)")
-    return universe
+    # 3) Dynamic fallback when no env universe is present
+    if not selected_universe:
+        universe = get_dynamic_top_volume_universe(
+            max_tickers=resolved_max,
+            volume_coverage=coverage_val,
+        )
+        print(f"[shared] {bot_name}: using dynamic universe ({len(universe)} names)")
+        return universe
+
+    trimmed = selected_universe
+    if apply_dynamic_filters:
+        liquid = get_dynamic_top_volume_universe(
+            max_tickers=resolved_max,
+            volume_coverage=coverage_val,
+        )
+        if liquid:
+            liquid_set = set(liquid)
+            trimmed = [t for t in selected_universe if t in liquid_set]
+        else:
+            trimmed = selected_universe
+
+    if len(trimmed) > resolved_max:
+        print(
+            f"[shared] {bot_name}: capping universe from {len(trimmed)} → {resolved_max}"
+        )
+    final_universe = trimmed[:resolved_max]
+    print(
+        f"[shared] {bot_name}: universe {len(final_universe)} names "
+        f"(max={resolved_max}, dynamic={'on' if apply_dynamic_filters else 'off'})"
+    )
+    return final_universe
 
 
 # ---------------- ETF BLACKLIST ----------------

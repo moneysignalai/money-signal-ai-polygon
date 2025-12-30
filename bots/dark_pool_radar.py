@@ -17,7 +17,7 @@ from bots.shared import (
     MIN_RVOL_GLOBAL,
     MIN_VOLUME_GLOBAL,
     send_alert,
-    get_dynamic_top_volume_universe,
+    resolve_universe_for_bot,
     chart_link,
     is_etf_blacklisted,
 )
@@ -80,11 +80,16 @@ def _in_dark_window() -> bool:
 
 
 def _universe() -> List[str]:
-    env = os.getenv("TICKER_UNIVERSE")
-    if env:
-        return [x.strip().upper() for x in env.split(",") if x.strip()]
-    # Expand universe for more coverage
-    return get_dynamic_top_volume_universe(max_tickers=200, volume_coverage=0.97)
+    # Universe driven by TICKER_UNIVERSE unless DARK_POOL_MAX_UNIVERSE caps it; apply
+    # dynamic trimming so counts stay aligned with other equity bots.
+    default_max = int(os.getenv("DYNAMIC_MAX_TICKERS", "2000"))
+    return resolve_universe_for_bot(
+        bot_name="dark_pool_radar",
+        bot_env_var="DARK_POOL_TICKER_UNIVERSE",
+        max_universe_env="DARK_POOL_MAX_UNIVERSE",
+        default_max_universe=default_max,
+        apply_dynamic_filters=True,
+    )
 
 
 def _safe(o: Any, name: str, default=None):
