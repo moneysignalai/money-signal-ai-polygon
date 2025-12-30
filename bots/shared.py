@@ -13,6 +13,7 @@ import requests
 # ---------------- BASIC CONFIG ----------------
 
 POLYGON_KEY = os.getenv("POLYGON_KEY") or os.getenv("POLYGON_API_KEY")
+API_BASE = os.getenv("POLYGON_BASE_URL", "https://api.polygon.io")
 
 # Global RVOL / volume floors that other bots can reference
 MIN_RVOL_GLOBAL = float(os.getenv("MIN_RVOL_GLOBAL", "2.0"))
@@ -72,6 +73,11 @@ def now_est() -> str:
 
 def today_est_date() -> date:
     return datetime.now(eastern).date()
+
+
+def is_trading_day_est() -> bool:
+    """Return True on US/Eastern weekdays (Mon–Fri)."""
+    return today_est_date().weekday() < 5
 
 
 def iso_today() -> str:
@@ -467,7 +473,7 @@ def get_dynamic_top_volume_universe(
     prev = today - timedelta(days=1)
     from_ = prev.isoformat()
 
-    url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{from_}"
+    url = f"{API_BASE}/v2/aggs/grouped/locale/us/market/stocks/{from_}"
     params = {"adjusted": "true", "apiKey": POLYGON_KEY}
 
     # Slightly tighter timeout + fewer retries for responsiveness
@@ -632,7 +638,7 @@ def get_last_trade_cached(symbol: str, ttl_seconds: int = 15) -> Tuple[Optional[
     if entry and isinstance(entry.ts, (int, float)) and now_ts - float(entry.ts) < ttl_seconds:
         return entry.last, entry.dollar_vol
 
-    url = f"https://api.polygon.io/v2/last/trade/{symbol.upper()}"
+    url = f"{API_BASE}/v2/last/trade/{symbol.upper()}"
     params = {"apiKey": POLYGON_KEY}
 
     data = _http_get_json(url, params, tag="shared:last_trade", timeout=15.0, retries=1)
@@ -693,7 +699,7 @@ def get_option_chain_cached(
         if now_ts - float(entry.ts) < ttl_seconds:
             return entry.data
 
-    url = f"https://api.polygon.io/v3/snapshot/options/{underlying.upper()}"
+    url = f"{API_BASE}/v3/snapshot/options/{underlying.upper()}"
     params = {"apiKey": POLYGON_KEY}
 
     data = _http_get_json(url, params, tag="shared:option_chain", timeout=20.0, retries=1)
@@ -730,7 +736,7 @@ def get_last_option_trades_cached(
 
     # Polygon-compatible last-trade endpoint for options:
     #    /v2/last/trade/{optionsTicker}
-    url = f"https://api.polygon.io/v2/last/trade/{full_option_symbol}"
+    url = f"{API_BASE}/v2/last/trade/{full_option_symbol}"
     params = {"apiKey": POLYGON_KEY}
 
     timeout = 20.0
@@ -831,6 +837,11 @@ def is_rth() -> bool:
 
 def is_premarket() -> bool:
     return is_between_times(4, 0, 9, 29, eastern)
+
+
+def in_premarket_window_est() -> bool:
+    """Explicit helper for 04:00–09:30 ET premarket window."""
+    return is_premarket()
 
 
 def is_postmarket() -> bool:
