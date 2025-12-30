@@ -119,6 +119,24 @@ async def health():
     return {"status": "healthy", "now_est": now_est_str(), "summary": summary}
 
 
+def _validate_registry() -> None:
+    """Eagerly import bot modules to surface missing entrypoints early."""
+    for name, module_path, func_name, _ in BOTS:
+        try:
+            module = importlib.import_module(module_path)
+            func = getattr(module, "run_bot", None) or getattr(module, func_name, None)
+            if func is None:
+                print(
+                    f"[main] WARNING registry mismatch: {module_path} missing run_bot/{func_name}"
+                )
+            elif not asyncio.iscoroutinefunction(func):
+                print(
+                    f"[main] WARNING registry mismatch: {module_path}.{func_name} is not async"
+                )
+        except Exception as exc:
+            print(f"[main] WARNING failed to validate {name} ({module_path}): {exc}")
+
+
 # ----------------- Scheduler logic -----------------
 
 def _skip_reason(name: str) -> str | None:
@@ -210,6 +228,7 @@ def _start_background_scheduler() -> None:
 @app.on_event("startup")
 async def startup_event():
     print(f"[main] startup_event fired at {now_est_str()}")
+    _validate_registry()
     print(
         f"[main] launching background scheduler thread "
         f"(base_interval={SCAN_INTERVAL_SECONDS}s, bot_timeout={BOT_TIMEOUT_SECONDS}s)"
