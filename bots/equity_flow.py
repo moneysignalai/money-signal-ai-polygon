@@ -38,6 +38,10 @@ from bots.shared import (
 )
 from bots.status_report import record_bot_stats
 
+EQUITY_FLOW_ALLOW_OUTSIDE_RTH = (
+    os.getenv("EQUITY_FLOW_ALLOW_OUTSIDE_RTH", "false").lower() == "true"
+)
+
 eastern = pytz.timezone("US/Eastern")
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
@@ -112,6 +116,14 @@ def _in_rth_window() -> bool:
     now = datetime.now(eastern)
     mins = now.hour * 60 + now.minute
     return (9 * 60 + 30) <= mins <= (16 * 60)  # 09:30–16:00 ET
+
+
+def should_run_now() -> tuple[bool, str | None]:
+    if EQUITY_FLOW_ALLOW_OUTSIDE_RTH:
+        return True, None
+    if _in_rth_window():
+        return True, None
+    return False, "outside RTH"
 
 
 def _in_gap_window() -> bool:
@@ -554,10 +566,12 @@ async def run_equity_flow() -> None:
 
     if not POLYGON_KEY or not _client:
         print("[equity_flow] missing POLYGON_KEY or client; skipping.")
+        record_bot_stats("equity_flow", 0, 0, 0, 0.0)
         return
 
-    if not _in_rth_window():
+    if not (EQUITY_FLOW_ALLOW_OUTSIDE_RTH or _in_rth_window()):
         print("[equity_flow] outside RTH; skipping.")
+        record_bot_stats("equity_flow", 0, 0, 0, 0.0)
         return
 
     BOT_NAME = "equity_flow"
@@ -568,10 +582,13 @@ async def run_equity_flow() -> None:
     universe = _get_universe()
     if not universe:
         print("[equity_flow] empty universe; skipping.")
+        record_bot_stats("equity_flow", 0, 0, 0, 0.0)
         return
 
     trading_day = date.today()
-    print(f"[equity_flow] scanning {len(universe)} symbols for volume/gap/pullback on {trading_day}")
+    print(
+        f"[equity_flow] scanning {len(universe)} symbols for volume/gap/pullback on {trading_day}"
+    )
 
     for sym in universe:
         if is_etf_blacklisted(sym):

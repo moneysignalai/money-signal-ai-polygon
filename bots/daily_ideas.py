@@ -64,6 +64,10 @@ AM_SLOT_END   = 11 * 60 + 0   # 11:00
 PM_SLOT_START = 15 * 60 + 15  # 15:15
 PM_SLOT_END   = 15 * 60 + 30  # 15:30
 
+DAILY_IDEAS_ALLOW_OUTSIDE_WINDOW = (
+    os.getenv("DAILY_IDEAS_ALLOW_OUTSIDE_WINDOW", "false").lower() == "true"
+)
+
 # Track which slots have already run for the day
 _last_run_day: Optional[date] = None
 _ran_am: bool = False
@@ -87,6 +91,15 @@ def _current_slot() -> Optional[str]:
     if PM_SLOT_START <= mins <= PM_SLOT_END:
         return "pm"
     return None
+
+
+def should_run_now() -> tuple[bool, str | None]:
+    if DAILY_IDEAS_ALLOW_OUTSIDE_WINDOW:
+        return True, None
+    slot = _current_slot()
+    if slot:
+        return True, None
+    return False, "outside daily idea window"
 
 
 def _safe_float(x: Any) -> Optional[float]:
@@ -437,18 +450,24 @@ async def run_daily_ideas() -> None:
     slot = _current_slot()
     global _ran_am, _ran_pm
 
-    if slot is None:
+    if slot is None and not DAILY_IDEAS_ALLOW_OUTSIDE_WINDOW:
         print("[daily_ideas] outside idea windows; skipping.")
+        record_bot_stats("Daily Ideas", 0, 0, 0, 0.0)
         return
+    if slot is None and DAILY_IDEAS_ALLOW_OUTSIDE_WINDOW:
+        slot = "override"
     if slot == "am" and _ran_am:
         print("[daily_ideas] AM slot already ran; skipping.")
+        record_bot_stats("Daily Ideas", 0, 0, 0, 0.0)
         return
     if slot == "pm" and _ran_pm:
         print("[daily_ideas] PM slot already ran; skipping.")
+        record_bot_stats("Daily Ideas", 0, 0, 0, 0.0)
         return
 
     if not POLYGON_KEY or not _client:
         print("[daily_ideas] missing POLYGON_KEY or client; skipping.")
+        record_bot_stats("Daily Ideas", 0, 0, 0, 0.0)
         return
 
     BOT_NAME = "daily_ideas"
@@ -466,9 +485,10 @@ async def run_daily_ideas() -> None:
     )
     if not universe:
         print("[daily_ideas] empty universe; skipping.")
+        record_bot_stats("Daily Ideas", 0, 0, 0, 0.0)
         return
 
-    print(f"[daily_ideas] scanning {len(universe)} symbols")
+    print(f"[daily_ideas] start slot={slot} universe_size={len(universe)}")
 
     long_ideas: List[Dict[str, Any]] = []
     short_ideas: List[Dict[str, Any]] = []
