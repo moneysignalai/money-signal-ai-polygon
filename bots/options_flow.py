@@ -1,4 +1,12 @@
 # bots/options_flow.py
+"""Options flow scanner.
+
+Scans a universe of underlyings, pulls option chain snapshots from the data
+provider, and emits flow buckets (CHEAP / UNUSUAL / WHALE / IVCRUSH).
+
+The bot is gated to regular trading hours by default but can be forced to run
+outside RTH via the ``OPTIONS_FLOW_ALLOW_OUTSIDE_RTH`` env for debugging.
+"""
 
 import os
 import time
@@ -7,14 +15,15 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from .shared import (
-    now_est,
-    in_rth_window_est,
-    debug_filter_reason,
-    resolve_universe_for_bot,
-    get_option_chain_cached,
-    get_last_option_trades_cached,
-    record_bot_stats,
+    DEBUG_FLOW_REASONS,
     chart_link,
+    debug_filter_reason,
+    get_last_option_trades_cached,
+    get_option_chain_cached,
+    in_rth_window_est,
+    now_est,
+    record_bot_stats,
+    resolve_universe_for_bot,
     send_alert,
     DEBUG_FLOW_REASONS,
 )
@@ -403,7 +412,7 @@ async def run_options_flow() -> None:
         chart = chart_link(rec.symbol)
 
         return (
-            f"{emoji} {rec.category} — {rec.symbol}\n"
+            f"{emoji} {rec.category}\n"
             f"🕒 {now_est()}\n"
             f"📌 Contract: {rec.contract}\n"
             f"📦 Size: {rec.size}\n"
@@ -416,7 +425,13 @@ async def run_options_flow() -> None:
 
     for rec in matched_contracts:
         text = _fmt_record(rec)
-        send_alert(text)
+        send_alert(
+            bot_name="Options Flow",
+            symbol=rec.symbol,
+            last_price=rec.price,
+            rvol=0.0,
+            extra=text,
+        )
         alerts_sent += 1
 
     run_seconds = time.time() - start_unix

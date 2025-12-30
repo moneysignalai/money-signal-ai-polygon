@@ -19,6 +19,7 @@ Key traits:
 - **Async bot runner:** `main.py` schedules each bot with per-bot intervals and timeouts.
 - **Shared data layer:** `bots/shared.py` handles time utilities, universe resolution, caching, and market data access.
 - **Telegram delivery:** Alerts and status pings use Telegram bots configured via environment variables.
+- **Clear scheduling visibility:** Disabled or test-mode gating is logged so you can see why a bot did not run during a cycle.
 
 ## Active bots
 
