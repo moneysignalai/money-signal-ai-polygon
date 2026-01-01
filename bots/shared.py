@@ -444,9 +444,9 @@ def _get_top_volume_universe_sync(
 
     try:
         env_cap = int(os.getenv("DYNAMIC_MAX_TICKERS", str(max_tickers)))
-        max_tickers = max(1, min(max_tickers, env_cap))
+        max_tickers = max(1, min(max_tickers, env_cap, 1500))
     except Exception:
-        max_tickers = max(1, max_tickers)
+        max_tickers = max(1, min(max_tickers, 1500))
 
     tickers: List[Tuple[str, float]] = []
     if POLYGON_KEY:
@@ -612,6 +612,8 @@ def resolve_universe_for_bot(
             return None
 
     dyn_cap = _int_env("DYNAMIC_MAX_TICKERS") or default_max_universe or 2000
+    # Hard cap to 1500 per requirements to avoid overly wide scans.
+    dyn_cap = min(dyn_cap, 1500)
     resolved_max = dyn_cap
     if max_universe_env:
         env_cap = _int_env(max_universe_env)
@@ -870,7 +872,16 @@ def getLastOptionTradesCached(full_option_symbol: str, ttl_seconds: int = 30):
 # ---------------- CHART LINK ----------------
 
 
-def chart_link(symbol: str) -> str:
+def chart_link(symbol: str, timeframe: str = "D", provider: Optional[str] = None) -> str:
+    """Return a TradingView chart link.
+
+    The optional ``timeframe`` and ``provider`` parameters are accepted for
+    backwards compatibility with existing bot calls; they do not change the
+    returned URL but allow callers to pass named arguments without raising.
+    """
+
+    _ = timeframe  # kept for signature compatibility / clarity
+    _ = provider
     return f"https://www.tradingview.com/chart/?symbol={symbol.upper()}"
 
 
