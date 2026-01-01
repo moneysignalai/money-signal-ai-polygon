@@ -419,6 +419,20 @@ def _get_env_universe(env_var: str) -> List[str]:
     return tickers
 
 
+def _get_options_override_universe() -> List[str]:
+    """Return an explicit options override universe if provided via env."""
+
+    override = os.getenv("OPTIONS_FLOW_TICKER_UNIVERSE", "")
+    if not override.strip():
+        return []
+    tickers = _parse_ticker_env(override)
+    if tickers:
+        print(
+            f"[universe] using OPTIONS_FLOW_TICKER_UNIVERSE override size={len(tickers)}"
+        )
+    return tickers
+
+
 def _get_top_volume_universe_sync(
     max_tickers: int = 1500, volume_coverage: Optional[float] = None
 ) -> List[str]:
@@ -512,6 +526,57 @@ def get_dynamic_top_volume_universe(
     """Backwards-compatible wrapper for older callers (uses top-volume resolver)."""
 
     return _get_top_volume_universe_sync(max_tickers, volume_coverage)
+
+
+async def resolve_options_underlying_universe(
+    bot_name: str,
+    *,
+    max_tickers: Optional[int] = None,
+    allow_top_volume_fallback: bool = True,
+) -> List[str]:
+    """Resolve an options underlying universe with layered fallbacks.
+
+    Priority:
+    1) OPTIONS_FLOW_TICKER_UNIVERSE override (if set)
+    2) Top-volume universe from Massive/Polygon (cached)
+    3) ENV TICKER_UNIVERSE (or FALLBACK_TICKER_UNIVERSE)
+    4) Emergency minimal list to avoid empty scans
+    """
+
+    try:
+        env_cap = int(os.getenv("OPTIONS_FLOW_MAX_UNIVERSE", "2000"))
+    except Exception:
+        env_cap = 2000
+    if max_tickers is None:
+        max_tickers = env_cap
+    else:
+        max_tickers = min(max_tickers, env_cap)
+
+    override = _get_options_override_universe()
+    if override:
+        final_override = override[:max_tickers]
+        print(
+            f"[universe:{bot_name}] options_underlying_universe_size={len(final_override)} (source=override)"
+        )
+        return final_override
+
+    if allow_top_volume_fallback:
+        universe = await get_top_volume_universe(limit=max_tickers)
+        if universe:
+            return universe[:max_tickers]
+
+    env_universe = _get_env_universe("TICKER_UNIVERSE")
+    if not env_universe:
+        env_universe = _get_env_universe("FALLBACK_TICKER_UNIVERSE")
+    if env_universe:
+        trimmed = env_universe[:max_tickers]
+        print(
+            f"[universe:{bot_name}] massive volume feed unavailable, using ENV TICKER_UNIVERSE size={len(trimmed)}"
+        )
+        return trimmed
+
+    print("[universe] CRITICAL: universe empty — using emergency minimal fallback set")
+    return _EMERGENCY_UNIVERSE[:max_tickers]
 
 
 def resolve_universe_for_bot(
