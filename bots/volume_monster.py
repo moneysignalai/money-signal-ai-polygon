@@ -10,7 +10,7 @@ recorded for heartbeat visibility.
 
 import os
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from statistics import mean
 from typing import List, Tuple
 
@@ -26,9 +26,10 @@ from bots.shared import (
     POLYGON_KEY,
     chart_link,
     debug_filter_reason,
+    format_est_timestamp,
     in_rth_window_est,
     resolve_universe_for_bot,
-    send_alert,
+    send_alert_text,
 )
 from bots.status_report import record_bot_stats, record_error
 
@@ -75,10 +76,43 @@ def _extract_ohlcv(bar: any) -> Tuple[float, float, float, float, float]:
     return open_, high, low, close, volume
 
 
-def _current_day_stats(sym: str) -> Tuple[float, float, float, float, float]:
+def _fmt_price(val: float) -> str:
+    return f"${val:,.2f}" if val > 0 else "N/A"
+
+
+def _format_volume_monster_alert(
+    symbol: str,
+    price: float,
+    open_: float,
+    high: float,
+    low: float,
+    rvol: float,
+    day_vol: float,
+    dollar_vol: float,
+    move_pct: float,
+    ts: datetime,
+) -> str:
+    ts_str = format_est_timestamp(ts)
+    rvol_text = f"{rvol:.1f}x" if rvol > 0 else "N/A"
+    volume_text = f"{day_vol:,.0f}" if day_vol > 0 else "N/A"
+    dollar_text = f"${dollar_vol:,.0f}" if dollar_vol > 0 else "N/A"
+
+    lines = [
+        f"🚨 VOLUME MONSTER — {symbol} ({ts_str})",
+        "────────────",
+        f"• 💵 Last: {_fmt_price(price)} (O: {_fmt_price(open_)}, H: {_fmt_price(high)}, L: {_fmt_price(low)})",
+        f"• 📊 RVOL: {rvol_text} | Volume: {volume_text} ({rvol_text} avg)",
+        f"• 💰 Dollar Vol: {dollar_text}",
+        f"• 📈 Chart: {chart_link(symbol, timeframe='D')}",
+    ]
+
+    return "\n".join(lines)
+
+
+def _current_day_stats(sym: str) -> Tuple[float, float, float, float, float, float, float, float]:
     daily = _fetch_daily(sym, max(_lookback_days, 30))
     if len(daily) < 2:
-        return 0.0, 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
     today_bar = daily[-1]
     prev_bar = daily[-2]
@@ -95,7 +129,7 @@ def _current_day_stats(sym: str) -> Tuple[float, float, float, float, float]:
     rvol = vol / avg_vol if avg_vol > 0 else 0.0
     dollar_vol = close * vol
     change_pct = ((close - prev_close) / prev_close * 100) if prev_close > 0 else 0.0
-    return close, dollar_vol, rvol, change_pct, vol
+    return close, dollar_vol, rvol, change_pct, vol, open_, high, low
 
 
 async def run_volume_monster() -> None:
@@ -121,7 +155,7 @@ async def run_volume_monster() -> None:
         for sym in universe:
             scanned += 1
             try:
-                price, dollar_vol, rvol, move_pct, day_vol = _current_day_stats(sym)
+                price, dollar_vol, rvol, move_pct, day_vol, open_, high, low = _current_day_stats(sym)
             except Exception as exc:
                 print(f"[volume_monster] data error for {sym}: {exc}")
                 record_error("volume_monster", exc)
@@ -154,15 +188,20 @@ async def run_volume_monster() -> None:
                 continue
 
             matches += 1
-            direction = "UP" if move_pct >= 0 else "DOWN"
-            body = (
-                f"• Last: ${price:.2f} ({move_pct:+.1f}% {direction})\n"
-                f"• Volume: {day_vol:,.0f} ({rvol:.1f}× avg)\n"
-                f"• Dollar Vol: ${dollar_vol:,.0f}\n"
-                f"• Link: {chart_link(sym, timeframe='D')}"
-            )
             try:
-                send_alert(BOT_NAME, sym, price, rvol, extra=body)
+                alert_text = _format_volume_monster_alert(
+                    symbol=sym,
+                    price=price,
+                    open_=open_,
+                    high=high,
+                    low=low,
+                    rvol=rvol,
+                    day_vol=day_vol,
+                    dollar_vol=dollar_vol,
+                    move_pct=move_pct,
+                    ts=datetime.now(),
+                )
+                send_alert_text(alert_text)
                 alerts += 1
             except Exception as exc:  # pragma: no cover - alert failures shouldn’t crash
                 print(f"[volume_monster] alert error for {sym}: {exc}")
@@ -175,3 +214,19 @@ async def run_volume_monster() -> None:
     finally:
         runtime = time.perf_counter() - start
         record_bot_stats(BOT_NAME, scanned, matches, alerts, runtime)
+
+
+if __name__ == "__main__":  # formatter demo
+    demo = _format_volume_monster_alert(
+        symbol="AXSM",
+        price=182.64,
+        open_=158.49,
+        high=184.40,
+        low=158.49,
+        rvol=6.3,
+        day_vol=3_059_410,
+        dollar_vol=558_770_642,
+        move_pct=22.8,
+        ts=datetime(2025, 12, 30, 14, 21),
+    )
+    print(demo)

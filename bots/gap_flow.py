@@ -8,7 +8,7 @@ symbols.
 
 import os
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from statistics import mean
 from typing import List, Tuple
 
@@ -24,9 +24,10 @@ from bots.shared import (
     POLYGON_KEY,
     chart_link,
     debug_filter_reason,
+    format_est_timestamp,
     in_rth_window_est,
     resolve_universe_for_bot,
-    send_alert,
+    send_alert_text,
 )
 from bots.status_report import record_bot_stats, record_error
 
@@ -80,6 +81,44 @@ def _extract_ohlcv(bar: any) -> Tuple[float, float, float, float, float]:
     close = float(getattr(bar, "close", getattr(bar, "c", 0.0)) or 0.0)
     volume = float(getattr(bar, "volume", getattr(bar, "v", 0.0)) or 0.0)
     return open_, high, low, close, volume
+
+
+def _fmt_price(val: float) -> str:
+    return f"${val:,.2f}" if val > 0 else "N/A"
+
+
+def _format_gap_alert(
+    symbol: str,
+    gap_pct: float,
+    rvol: float,
+    open_: float,
+    high: float,
+    low: float,
+    close: float,
+    intraday_volume: float,
+    dollar_vol: float,
+    ts: datetime,
+) -> str:
+    direction_up = gap_pct > 0
+    header_emoji = "🚀" if direction_up else "🔻"
+    arrow = "🔼" if direction_up else "🔻"
+    ts_str = format_est_timestamp(ts)
+    header = f"{header_emoji} GAP FLOW — {symbol} ({ts_str})"
+
+    rvol_text = f"{rvol:.1f}x" if rvol > 0 else "N/A"
+    volume_text = f"{intraday_volume:,.0f}" if intraday_volume > 0 else "N/A"
+    dollar_text = f"${dollar_vol:,.0f}" if dollar_vol > 0 else "N/A"
+
+    lines = [
+        header,
+        "────────────",
+        f"• Direction: {'Gap Up' if direction_up else 'Gap Down'} ({arrow} {gap_pct:+.1f}% vs prior close)",
+        f"• 💵 Last: {_fmt_price(close)} (O: {_fmt_price(open_)}, H: {_fmt_price(high)}, L: {_fmt_price(low)})",
+        f"• 📊 RVOL: {rvol_text} | Volume: {volume_text}",
+        f"• 💰 Dollar Vol: {dollar_text}",
+        f"• 📈 Chart: {chart_link(symbol)}",
+    ]
+    return "\n".join(lines)
 
 
 async def run_gap_flow() -> None:
@@ -167,16 +206,20 @@ async def run_gap_flow() -> None:
                 continue
 
             matches += 1
-            direction = "Gap Up" if gap_pct > 0 else "Gap Down"
             try:
-                body = (
-                    f"{direction} detected on {sym}\n"
-                    f"Open vs prior close: {gap_pct:.1f}%\n"
-                    f"Last: ${close:.2f} (O: ${open_:.2f}, H: ${high:.2f}, L: ${low:.2f})\n"
-                    f"Volume: {intraday_volume:,.0f} ({rvol:.1f}x avg) · Dollar Vol: ${dollar_vol:,.0f}\n"
-                    f"Chart: {chart_link(sym)}"
+                alert_text = _format_gap_alert(
+                    symbol=sym,
+                    gap_pct=gap_pct,
+                    rvol=rvol,
+                    open_=open_,
+                    high=high,
+                    low=low,
+                    close=close,
+                    intraday_volume=intraday_volume,
+                    dollar_vol=dollar_vol,
+                    ts=datetime.now(),
                 )
-                send_alert(BOT_NAME, sym, close, rvol, extra=body)
+                send_alert_text(alert_text)
                 alerts += 1
             except Exception as exc:
                 print(f"[gap_flow] alert error for {sym}: {exc}")
@@ -198,6 +241,22 @@ async def run_gap_flow() -> None:
 
 async def run_bot() -> None:  # legacy alias
     await run_gap_flow()
+
+
+if __name__ == "__main__":  # simple formatter demo
+    example = _format_gap_alert(
+        symbol="AXSM",
+        gap_pct=6.5,
+        rvol=6.3,
+        open_=158.49,
+        high=184.40,
+        low=158.49,
+        close=182.64,
+        intraday_volume=3_059_410,
+        dollar_vol=484_885_891,
+        ts=datetime(2025, 12, 30, 9, 45),
+    )
+    print(example)
 
 
 # Backward compatibility alias for any lingering imports

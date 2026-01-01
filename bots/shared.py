@@ -72,6 +72,17 @@ def now_est() -> str:
     return datetime.now(eastern).strftime("%I:%M %p EST · %b %d").lstrip("0")
 
 
+def format_est_timestamp(ts: Optional[datetime] = None) -> str:
+    """Return an Eastern timestamp in MM-DD-YYYY · HH:MM AM/PM EST format."""
+
+    if ts:
+        dt = ts if ts.tzinfo else eastern.localize(ts)
+        dt = dt.astimezone(eastern)
+    else:
+        dt = datetime.now(eastern)
+    return dt.strftime("%m-%d-%Y · %I:%M %p EST")
+
+
 def today_est_date() -> date:
     return datetime.now(eastern).date()
 
