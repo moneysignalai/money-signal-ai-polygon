@@ -1,9 +1,16 @@
-# bots/squeeze.py — Stock SHORT-SQUEEZE style bot (price + volume only)
+"""
+Squeeze bot
+------------
+Price + volume-only short-squeeze radar. With no direct short-interest feed, it
+flags names that are screaming on the tape: large up moves, heavy relative
+volume, strong drive from the open, and closes near the high of day.
+"""
 
+from collections import defaultdict
 import os
 import time
-from datetime import datetime, date, timedelta
-from typing import List, Dict, Any, Optional
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, List, Optional
 
 import pytz
 
@@ -13,14 +20,16 @@ except ImportError:
     from polygon import RESTClient
 
 from bots.shared import (
-    POLYGON_KEY,
     MIN_RVOL_GLOBAL,
     MIN_VOLUME_GLOBAL,
-    send_alert,
+    POLYGON_KEY,
     chart_link,
-    get_dynamic_top_volume_universe,
+    debug_filter_reason,
+    in_rth_window_est,
     is_etf_blacklisted,
     now_est,
+    resolve_universe_for_bot,
+    send_alert,
 )
 from bots.status_report import record_bot_stats
 
@@ -28,41 +37,33 @@ eastern = pytz.timezone("US/Eastern")
 _client: Optional[RESTClient] = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
 # ---------------- CONFIG ----------------
-#
-# These are tunable via env if you want more / less aggression.
 
-# RTH window (squeeze bot is intraday, focuses on regular hours only)
-RTH_START_MIN = 9 * 60 + 30      # 09:30
-RTH_END_MIN   = 16 * 60          # 16:00
+BOT_NAME = "Squeeze"
 
-# Price filters
-SQUEEZE_MIN_PRICE        = float(os.getenv("SQUEEZE_MIN_PRICE", "3.0"))
-SQUEEZE_MAX_PRICE        = float(os.getenv("SQUEEZE_MAX_PRICE", "200.0"))
+SQUEEZE_MAX_UNIVERSE = int(os.getenv("SQUEEZE_MAX_UNIVERSE", "2000"))
+SQUEEZE_ALLOW_OUTSIDE_RTH = (
+    os.getenv("SQUEEZE_ALLOW_OUTSIDE_RTH", "false").lower() == "true"
+)
+SQUEEZE_LOOKBACK_DAYS = int(os.getenv("SQUEEZE_LOOKBACK_DAYS", "5"))
 
-# Move filters (vs prior close + from today’s open)
-SQUEEZE_MIN_MOVE_PCT     = float(os.getenv("SQUEEZE_MIN_MOVE_PCT", "15.0"))       # vs yesterday close
-SQUEEZE_MIN_INTRADAY_PCT = float(os.getenv("SQUEEZE_MIN_INTRADAY_PCT", "8.0"))    # from today open
+SQUEEZE_MIN_PRICE = float(os.getenv("SQUEEZE_MIN_PRICE", "5"))
+SQUEEZE_MIN_DAY_MOVE_PCT = float(os.getenv("SQUEEZE_MIN_DAY_MOVE_PCT", "8"))
+SQUEEZE_MIN_INTRADAY_FROM_OPEN_PCT = float(
+    os.getenv("SQUEEZE_MIN_INTRADAY_FROM_OPEN_PCT", "5")
+)
+SQUEEZE_MIN_RVOL_EQUITY = float(os.getenv("SQUEEZE_MIN_RVOL_EQUITY", "2"))
+SQUEEZE_MIN_DOLLAR_VOL = float(os.getenv("SQUEEZE_MIN_DOLLAR_VOL", "5000000"))
+SQUEEZE_MAX_FROM_HIGH_PCT = float(os.getenv("SQUEEZE_MAX_FROM_HIGH_PCT", "3"))
 
-# Volume / RVOL filters
-SQUEEZE_MIN_RVOL         = float(os.getenv("SQUEEZE_MIN_RVOL", "3.0"))            # day RVOL vs 20d avg
-SQUEEZE_MIN_DOLLAR_VOL   = float(os.getenv("SQUEEZE_MIN_DOLLAR_VOL", "20000000")) # $20M+
-SQUEEZE_LOOKBACK_DAYS    = int(os.getenv("SQUEEZE_LOOKBACK_DAYS", "40"))          # daily history window
+# ---------------- STATE ----------------
 
-# Breakout context: require price near recent range highs
-SQUEEZE_RECENT_WINDOW    = int(os.getenv("SQUEEZE_RECENT_WINDOW", "20"))          # days for recent high
-SQUEEZE_NEAR_HIGH_PCT    = float(os.getenv("SQUEEZE_NEAR_HIGH_PCT", "10.0"))      # within 10% of recent high
-
-# Universe size
-SQUEEZE_MAX_UNIVERSE     = int(os.getenv("SQUEEZE_MAX_UNIVERSE", "80"))
-
-# Per-day de-dupe (symbol)
 _alert_date: Optional[date] = None
 _alerted_syms: set[str] = set()
 
 
-# ---------------- STATE ----------------
-
 def _reset_day() -> None:
+    """Reset per-day de-duplication for alerts."""
+
     global _alert_date, _alerted_syms
     today = date.today()
     if _alert_date != today:
@@ -78,79 +79,63 @@ def _mark(sym: str) -> None:
     _alerted_syms.add(sym)
 
 
-def _in_rth_window() -> bool:
-    now = datetime.now(eastern)
-    mins = now.hour * 60 + now.minute
-    return RTH_START_MIN <= mins <= RTH_END_MIN
-
-
-# ---------------- HELPERS ----------------
-
-def _safe_float(x: Any) -> Optional[float]:
+def _safe_float(val: Any) -> Optional[float]:
     try:
-        if x is None:
-            return None
-        return float(x)
+        return float(val) if val is not None else None
     except (TypeError, ValueError):
         return None
 
 
-def _fetch_daily_history(sym: str, trading_day: date) -> List[Any]:
-    """Fetch recent daily bars for the symbol."""
+def _bar_date(bar: Any) -> Optional[date]:
+    ts = getattr(bar, "timestamp", getattr(bar, "t", None))
+    if ts is None:
+        return None
+    if ts > 1e12:
+        ts /= 1000.0
+    try:
+        dt_utc = datetime.utcfromtimestamp(ts).replace(tzinfo=pytz.utc)
+        return dt_utc.astimezone(eastern).date()
+    except Exception:
+        return None
+
+
+def _fetch_daily_bars(sym: str, days: int) -> List[Any]:
+    """Fetch recent daily bars (ascending order)."""
+
     if not _client:
         return []
-
     try:
-        start = (trading_day - timedelta(days=SQUEEZE_LOOKBACK_DAYS + 5)).isoformat()
-        end = trading_day.isoformat()
-        daily = list(
+        end = date.today()
+        start = end - timedelta(days=days + 3)
+        bars = list(
             _client.list_aggs(
                 ticker=sym,
                 multiplier=1,
                 timespan="day",
-                from_=start,
-                to=end,
-                limit=SQUEEZE_LOOKBACK_DAYS + 10,
+                from_=start.isoformat(),
+                to=end.isoformat(),
+                limit=days + 5,
                 sort="asc",
             )
         )
-        return daily
-    except Exception as e:
-        print(f"[squeeze] daily agg error for {sym}: {e}")
+        return bars
+    except Exception as exc:
+        print(f"[squeeze] daily agg error for {sym}: {exc}")
         return []
 
 
-def _compute_rvol_and_stats(sym: str, trading_day: date):
-    """
-    Compute price/volume stats and RVOL for today.
+def _compute_metrics(sym: str, trading_day: date) -> Optional[Dict[str, float]]:
+    """Compute price/volume metrics required for squeeze detection."""
 
-    Returns dict or None:
-      {
-        "prev_close", "open_today", "last_price",
-        "day_high", "day_low",
-        "vol_today", "rvol", "dollar_vol",
-        "move_pct", "intraday_pct",
-        "recent_high"
-      }
-    """
-    daily = _fetch_daily_history(sym, trading_day)
-    if len(daily) < 5:
+    daily = _fetch_daily_bars(sym, SQUEEZE_LOOKBACK_DAYS + 1)
+    if len(daily) < 2:
         return None
 
-    # Today = last bar that matches trading_day
     today_bar = daily[-1]
-    # try to ensure it's actually today's bar (Polygon daily sometimes lags when closed)
-    ts = getattr(today_bar, "timestamp", getattr(today_bar, "t", None))
-    if ts is not None:
-        if ts > 1e12:  # ms → s
-            ts = ts / 1000.0
-        dt_utc = datetime.utcfromtimestamp(ts).replace(tzinfo=pytz.utc)
-        if dt_utc.astimezone(eastern).date() != trading_day:
-            # No current-day bar yet (pre-market / weekend)
-            return None
+    if _bar_date(today_bar) != trading_day:
+        return None
 
     prev_bar = daily[-2]
-
     last_price = _safe_float(getattr(today_bar, "close", getattr(today_bar, "c", None)))
     open_today = _safe_float(getattr(today_bar, "open", getattr(today_bar, "o", None)))
     day_high = _safe_float(getattr(today_bar, "high", getattr(today_bar, "h", None)))
@@ -158,217 +143,180 @@ def _compute_rvol_and_stats(sym: str, trading_day: date):
     vol_today = _safe_float(getattr(today_bar, "volume", getattr(today_bar, "v", None)))
     prev_close = _safe_float(getattr(prev_bar, "close", getattr(prev_bar, "c", None)))
 
-    if (
-        last_price is None
-        or open_today is None
-        or prev_close is None
-        or vol_today is None
-        or day_high is None
-        or day_low is None
-    ):
+    if None in (last_price, open_today, day_high, day_low, vol_today, prev_close):
+        return None
+    if any(val <= 0 for val in (last_price, open_today, prev_close, vol_today)):
         return None
 
-    if prev_close <= 0 or open_today <= 0 or last_price <= 0:
-        return None
-
-    # Move % vs yesterday close and vs today's open
     move_pct = (last_price - prev_close) / prev_close * 100.0
-    intraday_pct = (last_price - open_today) / open_today * 100.0
+    from_open_pct = (last_price - open_today) / open_today * 100.0
+    dollar_vol = last_price * vol_today
 
-    # RVOL vs last ~20 days (excluding today)
     hist = daily[:-1]
-    recent_hist = hist[-20:] if len(hist) > 20 else hist
+    recent_hist = hist[-SQUEEZE_LOOKBACK_DAYS :]
     if recent_hist:
         avg_vol = sum(
-            float(getattr(d, "volume", getattr(d, "v", 0.0)))
-            for d in recent_hist
+            float(getattr(bar, "volume", getattr(bar, "v", 0.0))) for bar in recent_hist
         ) / float(len(recent_hist))
     else:
         avg_vol = vol_today
+    rvol = vol_today / avg_vol if avg_vol > 0 else 1.0
 
-    if avg_vol <= 0:
-        rvol = 1.0
-    else:
-        rvol = vol_today / avg_vol
-
-    dollar_vol = last_price * vol_today
-
-    # Recent high (for breakout / squeeze context)
-    recent_window = hist[-SQUEEZE_RECENT_WINDOW:] if len(hist) > SQUEEZE_RECENT_WINDOW else hist
-    if recent_window:
-        recent_high = max(
-            float(getattr(d, "close", getattr(d, "c", 0.0)))
-            for d in recent_window
-        )
-    else:
-        recent_high = last_price
+    high_close_distance_pct = ((day_high - last_price) / day_high * 100.0) if day_high else 100.0
 
     return {
-        "prev_close": prev_close,
-        "open_today": open_today,
         "last_price": last_price,
+        "open_today": open_today,
         "day_high": day_high,
         "day_low": day_low,
         "vol_today": vol_today,
-        "rvol": rvol,
-        "dollar_vol": dollar_vol,
         "move_pct": move_pct,
-        "intraday_pct": intraday_pct,
-        "recent_high": recent_high,
+        "from_open_pct": from_open_pct,
+        "dollar_vol": dollar_vol,
+        "rvol": rvol,
+        "high_close_distance_pct": high_close_distance_pct,
     }
 
 
 def _format_time() -> str:
-    try:
-        ts = now_est()
-        if isinstance(ts, str):
-            return ts
+    ts = now_est()
+    if isinstance(ts, datetime):
         return ts.strftime("%I:%M %p EST · %b %d").lstrip("0")
-    except Exception:
-        return datetime.now(eastern).strftime("%I:%M %p EST · %b %d").lstrip("0")
+    return str(ts)
 
 
 # ---------------- MAIN BOT ----------------
 
 async def run_squeeze() -> None:
     """
-    Short SQUEEZE-style stock bot (no options).
-
-    Looks for:
-      • Big % move vs yesterday close (default ≥ 15%)
-      • Strong move from today's open (default ≥ 8%)
-      • Huge RVOL (default ≥ 3x 20-day avg)
-      • Solid dollar volume (default ≥ $20M)
-      • Price near recent range highs (within 10% of last ~20-day high)
-      • 1 alert per symbol per day.
+    Scan liquid equities for short-squeeze style moves:
+      • Big day move from prior close and from open
+      • High RVOL and dollar volume
+      • Closing near the high of day
     """
+
     _reset_day()
+    start_ts = time.perf_counter()
+    scanned = 0
+    matches = 0
+    alerts = 0
+    reason_counts: Dict[str, int] = defaultdict(int)
 
-    if not POLYGON_KEY or not _client:
-        print("[squeeze] missing POLYGON_KEY or REST client; skipping.")
+    if not _client:
+        print("[squeeze] missing data client; skipping run")
+        record_bot_stats(BOT_NAME, scanned, matches, alerts, 0.0)
         return
 
-    if not _in_rth_window():
-        print("[squeeze] outside RTH; skipping.")
+    if not SQUEEZE_ALLOW_OUTSIDE_RTH and not in_rth_window_est():
+        print("[squeeze] outside RTH; skipping")
+        runtime = time.perf_counter() - start_ts
+        record_bot_stats(BOT_NAME, scanned, matches, alerts, runtime)
         return
 
-    BOT_NAME = "squeeze"
-    start_ts = time.time()
-    alerts_sent = 0
-    matched_symbols: set[str] = set()
-
-    # Resolve universe
-    env = os.getenv("SQUEEZE_TICKER_UNIVERSE") or os.getenv("TICKER_UNIVERSE")
-    if env:
-        universe = [t.strip().upper() for t in env.split(",") if t.strip()]
-    else:
-        universe = get_dynamic_top_volume_universe(
-            max_tickers=SQUEEZE_MAX_UNIVERSE,
-            volume_coverage=0.90,
-        )
-
+    universe = resolve_universe_for_bot(
+        bot_name=BOT_NAME,
+        bot_env_var="SQUEEZE_TICKER_UNIVERSE",
+        base_env_universe="TICKER_UNIVERSE",
+        max_universe_env="SQUEEZE_MAX_UNIVERSE",
+        default_max_universe=SQUEEZE_MAX_UNIVERSE,
+        apply_dynamic_filters=True,
+    )
     if not universe:
-        print("[squeeze] empty universe; skipping.")
+        print("[squeeze] empty universe; skipping")
+        runtime = time.perf_counter() - start_ts
+        record_bot_stats(BOT_NAME, scanned, matches, alerts, runtime)
         return
 
-    print(f"[squeeze] scanning {len(universe)} symbols for squeeze-style moves")
+    print(f"[squeeze] universe_size={len(universe)}")
 
-    trading_day = date.today()
+    ts_now = now_est()
+    trading_day = ts_now.date() if isinstance(ts_now, datetime) else date.today()
+    min_dollar_vol = max(SQUEEZE_MIN_DOLLAR_VOL, float(os.getenv("TREND_RIDER_MIN_DOLLAR_VOL", "0")))
 
     for sym in universe:
-        if is_etf_blacklisted(sym):
+        scanned += 1
+        try:
+            if is_etf_blacklisted(sym):
+                debug_filter_reason(BOT_NAME, sym, "etf_blacklist")
+                reason_counts["etf_blacklist"] += 1
+                continue
+            if _already_alerted(sym):
+                debug_filter_reason(BOT_NAME, sym, "already_alerted")
+                reason_counts["already_alerted"] += 1
+                continue
+
+            metrics = _compute_metrics(sym, trading_day)
+            if not metrics:
+                debug_filter_reason(BOT_NAME, sym, "no_data")
+                reason_counts["no_data"] += 1
+                continue
+
+            price = metrics["last_price"]
+            if price < SQUEEZE_MIN_PRICE:
+                debug_filter_reason(BOT_NAME, sym, "price_below_min")
+                reason_counts["price_below_min"] += 1
+                continue
+
+            dollar_vol = metrics["dollar_vol"]
+            if dollar_vol < min_dollar_vol:
+                debug_filter_reason(BOT_NAME, sym, "dollar_vol_too_low")
+                reason_counts["dollar_vol_too_low"] += 1
+                continue
+
+            if metrics["vol_today"] < MIN_VOLUME_GLOBAL:
+                debug_filter_reason(BOT_NAME, sym, "share_volume_too_low")
+                reason_counts["share_volume_too_low"] += 1
+                continue
+
+            rvol = metrics["rvol"]
+            if rvol < max(MIN_RVOL_GLOBAL, SQUEEZE_MIN_RVOL_EQUITY):
+                debug_filter_reason(BOT_NAME, sym, "rvol_too_low")
+                reason_counts["rvol_too_low"] += 1
+                continue
+
+            move_pct = metrics["move_pct"]
+            if move_pct < SQUEEZE_MIN_DAY_MOVE_PCT:
+                debug_filter_reason(BOT_NAME, sym, "day_move_too_small")
+                reason_counts["day_move_too_small"] += 1
+                continue
+
+            from_open = metrics["from_open_pct"]
+            if from_open < SQUEEZE_MIN_INTRADAY_FROM_OPEN_PCT:
+                debug_filter_reason(BOT_NAME, sym, "intraday_move_too_small")
+                reason_counts["intraday_move_too_small"] += 1
+                continue
+
+            if metrics["high_close_distance_pct"] > SQUEEZE_MAX_FROM_HIGH_PCT:
+                debug_filter_reason(BOT_NAME, sym, "far_from_high_of_day")
+                reason_counts["far_from_high_of_day"] += 1
+                continue
+
+            matches += 1
+            body_lines = [
+                f"SQUEEZE RADAR — {sym}",
+                f"• Last: ${price:.2f} (+{move_pct:.1f}% vs close, +{from_open:.1f}% from open)",
+                f"• Volume: {int(metrics['vol_today']):,} ({rvol:.1f}× avg) — Dollar Vol: ${dollar_vol:,.0f}",
+                f"• Near HOD: {metrics['high_close_distance_pct']:.1f}% off high",
+                "• Context: Strong up move with heavy volume; potential squeeze continuation.",
+                f"• Chart: {chart_link(sym)}",
+            ]
+            send_alert(BOT_NAME, sym, price, rvol, extra="\n".join(body_lines))
+            alerts += 1
+            _mark(sym)
+        except Exception as exc:
+            debug_filter_reason(BOT_NAME, sym, "error")
+            reason_counts["error"] += 1
+            print(f"[squeeze] ERROR for {sym}: {exc}")
             continue
-        if _already_alerted(sym):
-            continue
 
-        stats = _compute_rvol_and_stats(sym, trading_day)
-        if not stats:
-            continue
-
-        last_price = stats["last_price"]
-        prev_close = stats["prev_close"]
-        open_today = stats["open_today"]
-        day_high = stats["day_high"]
-        day_low = stats["day_low"]
-        vol_today = stats["vol_today"]
-        rvol = stats["rvol"]
-        dollar_vol = stats["dollar_vol"]
-        move_pct = stats["move_pct"]
-        intraday_pct = stats["intraday_pct"]
-        recent_high = stats["recent_high"]
-
-        # Basic price filters
-        if last_price < SQUEEZE_MIN_PRICE or last_price > SQUEEZE_MAX_PRICE:
-            continue
-
-        # Big % pop vs yesterday
-        if move_pct < SQUEEZE_MIN_MOVE_PCT:
-            continue
-
-        # Strong continuation from the open (gap-and-go type behavior)
-        if intraday_pct < SQUEEZE_MIN_INTRADAY_PCT:
-            continue
-
-        # RVOL + Dollar volume gates
-        if rvol < max(SQUEEZE_MIN_RVOL, MIN_RVOL_GLOBAL):
-            continue
-
-        if vol_today < MIN_VOLUME_GLOBAL:
-            continue
-
-        if dollar_vol < SQUEEZE_MIN_DOLLAR_VOL:
-            continue
-
-        # Breakout context: price near recent highs (not just dead-cat bounces)
-        if recent_high > 0:
-            distance_from_high_pct = (recent_high - last_price) / recent_high * 100.0
-        else:
-            distance_from_high_pct = 0.0
-
-        if distance_from_high_pct > SQUEEZE_NEAR_HIGH_PCT:
-            # Too far below recent highs → more likely generic bounce than squeeze-style breakout
-            continue
-
-        # If we reach here: strong squeeze-style profile
-        time_str = _format_time()
-        emoji = "🧨"
-        rocket = "🚀"
-        divider = "────────────"
-
-        body_lines = [
-            f"{emoji} SHORT SQUEEZE PROFILE — {sym}",
-            f"🕒 {time_str}",
-            f"💰 Price: ${last_price:.2f}",
-            divider,
-            f"{rocket} Move vs prior close: {move_pct:.1f}%",
-            f"📈 From open: {intraday_pct:.1f}%  (Open ${open_today:.2f} → Last ${last_price:.2f})",
-            f"📊 RVOL: {rvol:.1f}x · Day Vol: {int(vol_today):,}",
-            f"💵 Dollar Volume: ≈ ${dollar_vol:,.0f}",
-            f"📏 Day Range: Low ${day_low:.2f} – High ${day_high:.2f}",
-            f"🏁 Recent High (~{SQUEEZE_RECENT_WINDOW}d): ${recent_high:.2f} "
-            f"(distance {distance_from_high_pct:.1f}% below)",
-            "📌 Bias: potential short/gamma squeeze style breakout",
-            f"🔗 Chart: {chart_link(sym)}",
-        ]
-
-        extra_text = "\n".join(body_lines)
-
-        send_alert("squeeze", sym, last_price, rvol, extra=extra_text)
-        _mark(sym)
-
-        matched_symbols.add(sym)
-        alerts_sent += 1
-
-    run_seconds = time.time() - start_ts
+    runtime = time.perf_counter() - start_ts
     try:
-        record_bot_stats(
-            BOT_NAME,
-            scanned=len(universe),
-            matched=len(matched_symbols),
-            alerts=alerts_sent,
-            runtime=run_seconds,
-        )
-    except Exception as e:
-        print(f"[squeeze] record_bot_stats error: {e}")
+        record_bot_stats(BOT_NAME, scanned, matches, alerts, runtime)
+    except Exception as exc:
+        print(f"[squeeze] record_bot_stats error: {exc}")
 
-    print("[squeeze] scan complete.")
+    if matches == 0:
+        print(f"[squeeze] No alerts. Filter breakdown: {dict(reason_counts)}")
+    print(
+        f"[squeeze] done scanned={scanned} matches={matches} alerts={alerts} runtime={runtime:.2f}s"
+    )
