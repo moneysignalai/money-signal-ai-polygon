@@ -23,7 +23,6 @@ from bots.shared import (
 # ----------------- CONFIG -----------------
 
 HEARTBEAT_INTERVAL_MIN = float(os.getenv("STATUS_HEARTBEAT_INTERVAL_MIN", "5"))
-DEBUG_STATUS_PING_ENABLED = os.getenv("DEBUG_STATUS_PING_ENABLED", "false").lower() == "true"
 TELEGRAM_CHAT_ALL = os.getenv("TELEGRAM_CHAT_ALL")
 TELEGRAM_TOKEN_STATUS = os.getenv("TELEGRAM_TOKEN_STATUS")
 TELEGRAM_TOKEN_ALERTS = os.getenv("TELEGRAM_TOKEN_ALERTS")
@@ -343,16 +342,9 @@ async def run_status() -> None:
     now_ts = time.time()
     min_interval_sec = HEARTBEAT_INTERVAL_MIN * 60.0
     if now_ts - last_hb < min_interval_sec:
-        if DEBUG_STATUS_PING_ENABLED:
-            print(
-                f"[status_report] Heartbeat skipped (interval). "
-                f"since_last={now_ts - last_hb:.1f}s, min={min_interval_sec:.1f}s"
-            )
         return
 
     text = _format_heartbeat()
-    if DEBUG_STATUS_PING_ENABLED:
-        print(f"[status_report] Sending heartbeat (len={len(text)} chars)")
 
     _send_telegram_status(text)
     data["last_heartbeat_ts"] = now_ts

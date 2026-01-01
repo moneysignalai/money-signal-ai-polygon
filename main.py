@@ -76,8 +76,6 @@ BOT_DEFS: List[Tuple[str, str, str, int]] = [
     ("earnings", "bots.earnings", "run_earnings", 300),
     ("daily_ideas", "bots.daily_ideas", "run_daily_ideas", 900),
     ("status_report", "bots.status_report", "run_status", int(STATUS_HEARTBEAT_INTERVAL_MIN * 60)),
-    ("debug_ping", "bots.debug_ping", "run_debug_ping", 300),
-    ("debug_status_ping", "bots.debug_status_ping", "run_debug_status_ping", 300),
 ]
 
 # Precompute effective intervals
