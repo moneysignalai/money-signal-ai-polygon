@@ -1,123 +1,132 @@
 # bots/rsi_signals.py
 #
-# RSI-based intraday signals:
-#   • Oversold bounce candidates (RSI < RSI_OVERSOLD, turning up)
-#   • Overbought fade / take-profit candidates (RSI > RSI_OVERBOUGHT, turning down)
-#
-# Uses intraday 5-min candles for RSI plus basic price/volume filters.
+# Intraday RSI scanner for overbought / oversold signals with upgraded, human-readable
+# alerts. Uses intraday minute aggregates (default 5-min) plus daily history to add
+# context on trend, RVOL, and dollar volume. Alerts are sent once per symbol per
+# side (overbought/oversold) per trading day.
 
+from __future__ import annotations
+
+import math
 import os
+import statistics
 import time
-from datetime import datetime, date
-from typing import Any, Dict, List
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
-import pytz
-from polygon import RESTClient
+try:
+    from massive import RESTClient
+except ImportError:  # pragma: no cover
+    from polygon import RESTClient
 
 from bots.shared import (
+    DEBUG_FLOW_REASONS,
+    MIN_RVOL_GLOBAL,
+    MIN_VOLUME_GLOBAL,
     POLYGON_KEY,
-    resolve_universe_for_bot,
-    is_etf_blacklisted,
-    minutes_since_midnight_est,
-    send_alert,
     chart_link,
-    now_est,
+    debug_filter_reason,
+    format_est_timestamp,
+    in_rth_window_est,
+    send_alert_text,
+    resolve_universe_for_bot,
 )
-from bots.status_report import record_bot_stats
+from bots.status_report import record_bot_stats, record_error
 
-eastern = pytz.timezone("US/Eastern")
+BOT_NAME = "rsi_signals"
+
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
+
 
 # ---------------- CONFIG ----------------
 
 RSI_MIN_PRICE = float(os.getenv("RSI_MIN_PRICE", "5.0"))
 RSI_MIN_DOLLAR_VOL = float(os.getenv("RSI_MIN_DOLLAR_VOL", "200000"))
-DEFAULT_MAX_UNIVERSE = int(os.getenv("DYNAMIC_MAX_TICKERS", "2000"))
-RSI_MAX_UNIVERSE = int(os.getenv("RSI_MAX_UNIVERSE", str(DEFAULT_MAX_UNIVERSE)))
+RSI_MAX_UNIVERSE = int(os.getenv("RSI_MAX_UNIVERSE", os.getenv("DYNAMIC_MAX_TICKERS", "2000")))
 
-RSI_TIMEFRAME_MIN = int(os.getenv("RSI_TIMEFRAME_MIN", "5"))  # 5-min candles
+RSI_TIMEFRAME_MIN = int(os.getenv("RSI_TIMEFRAME_MIN", "5"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 
 RSI_OVERSOLD = float(os.getenv("RSI_OVERSOLD", "30.0"))
 RSI_OVERBOUGHT = float(os.getenv("RSI_OVERBOUGHT", "70.0"))
 
-INTRADAY_START_MIN = 9 * 60 + 35  # 09:35 (after first few candles)
-INTRADAY_END_MIN = 16 * 60       # 16:00
-
-# Per-day de-dupe
-_alert_date: date | None = None
-_seen_oversold: set[str] = set()
-_seen_overbought: set[str] = set()
+RSI_LOOKBACK_DAYS = int(os.getenv("RSI_LOOKBACK_DAYS", "50"))
+_allow_outside_rth = os.getenv("RSI_ALLOW_OUTSIDE_RTH", "false").lower() == "true"
 
 
-def _reset_if_new_day() -> None:
-    global _alert_date, _seen_oversold, _seen_overbought
-    today = date.today()
-    if _alert_date != today:
-        _alert_date = today
-        _seen_oversold = set()
-        _seen_overbought = set()
-        print("[rsi_signals] New trading day – reset seen sets.")
+# ---------------- Helpers ----------------
 
 
-def _in_intraday_window() -> bool:
-    mins = minutes_since_midnight_est()
-    return INTRADAY_START_MIN <= mins <= INTRADAY_END_MIN
+def _fmt_price(val: float) -> str:
+    return f"${val:,.2f}" if val > 0 else "N/A"
 
 
-def _fetch_intraday_bars(sym: str, minutes: int) -> List[Dict[str, Any]]:
-    """
-    Fetch intraday aggregate bars for today for the given minute timeframe.
-    Uses Polygon's v2 aggregates endpoint via RESTClient.
-    """
+def _fmt_pct(val: float) -> str:
+    return f"{val:+.1f}%"
+
+
+def _fetch_daily(sym: str, days: int) -> List[Any]:
+    """Return daily aggregates sorted asc (oldest → newest)."""
+
+    if not _client:
+        return []
+    start = (date.today() - timedelta(days=days + 5)).isoformat()
+    end = date.today().isoformat()
+    try:
+        return list(
+            _client.list_aggs(
+                sym,
+                1,
+                "day",
+                start,
+                end,
+                limit=days + 10,
+                sort="asc",
+            )
+        )
+    except Exception as exc:  # pragma: no cover - network/REST issues
+        print(f"[rsi_signals] daily agg error for {sym}: {exc}")
+        return []
+
+
+def _fetch_intraday(sym: str, minutes: int) -> List[Dict[str, Any]]:
     if not _client:
         return []
 
-    today = datetime.now(eastern).date()
-    start = datetime(today.year, today.month, today.day, 9, 30, tzinfo=eastern)
-    end = datetime.now(eastern)
-
-    start_ms = int(start.timestamp() * 1000)
-    end_ms = int(end.timestamp() * 1000)
-
+    start = date.today().isoformat()
+    end = date.today().isoformat()
     try:
-        resp = _client.list_aggs(
-            ticker=sym,
-            multiplier=minutes,
-            timespan="minute",
-            from_=start_ms,
-            to=end_ms,
-            adjusted=True,
-            sort="asc",
-            limit=500,
-        )
-        bars = [a.__dict__ for a in resp]
-        out: List[Dict[str, Any]] = []
-        for b in bars:
-            out.append(
-                {
-                    "t": b.get("timestamp") or b.get("t"),
-                    "o": b.get("open") or b.get("o"),
-                    "h": b.get("high") or b.get("h"),
-                    "l": b.get("low") or b.get("l"),
-                    "c": b.get("close") or b.get("c"),
-                    "v": b.get("volume") or b.get("v"),
-                    "vw": b.get("vwap") or b.get("vw"),
-                }
+        bars = list(
+            _client.list_aggs(
+                sym,
+                minutes,
+                "minute",
+                start,
+                end,
+                limit=5000,
+                sort="asc",
             )
-        return out
-    except Exception as e:
-        print(f"[rsi_signals] error fetching aggs for {sym}: {e}")
+        )
+    except Exception as exc:  # pragma: no cover
+        print(f"[rsi_signals] intraday agg error for {sym}: {exc}")
         return []
+
+    out: List[Dict[str, Any]] = []
+    for b in bars:
+        out.append(
+            {
+                "t": getattr(b, "timestamp", getattr(b, "t", None)),
+                "o": float(getattr(b, "open", getattr(b, "o", 0.0)) or 0.0),
+                "h": float(getattr(b, "high", getattr(b, "h", 0.0)) or 0.0),
+                "l": float(getattr(b, "low", getattr(b, "l", 0.0)) or 0.0),
+                "c": float(getattr(b, "close", getattr(b, "c", 0.0)) or 0.0),
+                "v": float(getattr(b, "volume", getattr(b, "v", 0.0)) or 0.0),
+            }
+        )
+    return out
 
 
 def _compute_rsi(closes: List[float], period: int) -> List[float]:
-    """
-    Simple RSI implementation aligned to closes.
-    First `period` values are NaN (no RSI yet).
-    """
-    import math
-
     if len(closes) < period + 1:
         return []
 
@@ -125,15 +134,10 @@ def _compute_rsi(closes: List[float], period: int) -> List[float]:
     gains: List[float] = []
     losses: List[float] = []
 
-    # First period
     for i in range(1, period + 1):
         delta = closes[i] - closes[i - 1]
-        if delta >= 0:
-            gains.append(delta)
-            losses.append(0.0)
-        else:
-            gains.append(0.0)
-            losses.append(-delta)
+        gains.append(max(delta, 0.0))
+        losses.append(max(-delta, 0.0))
     avg_gain = sum(gains) / period
     avg_loss = sum(losses) / period
 
@@ -143,11 +147,9 @@ def _compute_rsi(closes: List[float], period: int) -> List[float]:
         rs = avg_gain / avg_loss
         rsi = 100.0 - (100.0 / (1.0 + rs))
 
-    for _ in range(period):
-        rsis.append(math.nan)
+    rsis.extend([math.nan] * period)
     rsis.append(rsi)
 
-    # Subsequent
     for i in range(period + 1, len(closes)):
         delta = closes[i] - closes[i - 1]
         gain = max(delta, 0.0)
@@ -165,137 +167,242 @@ def _compute_rsi(closes: List[float], period: int) -> List[float]:
     return rsis
 
 
-async def run_rsi_signals():
-    """
-    Scan dynamic universe for intraday RSI extremes and emit:
-      • 🟢 RSI OVERSOLD — potential bounce/entry
-      • 🔴 RSI OVERBOUGHT — potential fade/take-profit/short
-    One alert per symbol per side per day.
-    """
-    if not POLYGON_KEY:
+def _calc_rvol(day_vol: float, history: List[Any]) -> float:
+    volumes = []
+    for bar in history:
+        vol = float(getattr(bar, "volume", getattr(bar, "v", 0.0)) or 0.0)
+        if vol > 0:
+            volumes.append(vol)
+    avg = statistics.mean(volumes) if volumes else 0.0
+    return day_vol / avg if avg > 0 else 0.0
+
+
+def _regime(price: float, ma20: float, ma50: float) -> str:
+    if price > ma20 > ma50:
+        return "Uptrend (price > MA20 > MA50)"
+    if price < ma20 < ma50 and ma20 > 0 and ma50 > 0:
+        return "Downtrend (price < MA20 < MA50)"
+    return "Range-bound / mixed MAs"
+
+
+def _format_rsi_alert(
+    symbol: str,
+    rsi_val: float,
+    last: float,
+    open_: float,
+    high: float,
+    low: float,
+    rvol: float,
+    dollar_vol: float,
+    day_move_pct: float,
+    signal: str,
+    ma20: float,
+    ma50: float,
+    regime_text: str,
+    ts: datetime,
+) -> str:
+    header = f"{'🟢' if signal == 'oversold' else '🔴'} RSI {'OVERSOLD' if signal == 'oversold' else 'OVERBOUGHT'} — {symbol} ({format_est_timestamp(ts)})"
+    rvol_text = f"{rvol:.1f}x" if rvol > 0 else "N/A"
+    vol_text = f"${dollar_vol:,.0f}" if dollar_vol > 0 else "N/A"
+    lines = [
+        header,
+        "────────────",
+        f"• Last: {_fmt_price(last)} (O: {_fmt_price(open_)}, H: {_fmt_price(high)}, L: {_fmt_price(low)})",
+        f"• RSI({RSI_PERIOD}, {RSI_TIMEFRAME_MIN}-min): {rsi_val:.1f} ({'oversold < ' + str(RSI_OVERSOLD) if signal == 'oversold' else 'overbought > ' + str(RSI_OVERBOUGHT)})",
+        f"• RVOL: {rvol_text} · Dollar Vol: {vol_text}",
+        f"• Day Move: {_fmt_pct(day_move_pct)} vs prior close",
+        f"• Regime: {regime_text}",
+        f"• Chart: {chart_link(symbol)}",
+    ]
+    return "\n".join(lines)
+
+
+def _safe_float(val: Any) -> float:
+    try:
+        return float(val)
+    except Exception:
+        return 0.0
+
+
+def _extract_daily_fields(bar: Any) -> Tuple[float, float, float, float, float]:
+    return (
+        _safe_float(getattr(bar, "open", getattr(bar, "o", 0.0))),
+        _safe_float(getattr(bar, "high", getattr(bar, "h", 0.0))),
+        _safe_float(getattr(bar, "low", getattr(bar, "l", 0.0))),
+        _safe_float(getattr(bar, "close", getattr(bar, "c", 0.0))),
+        _safe_float(getattr(bar, "volume", getattr(bar, "v", 0.0))),
+    )
+
+
+# ---------------- MAIN BOT ----------------
+
+
+async def run_rsi_signals() -> None:
+    if not POLYGON_KEY or not _client:
         print("[rsi_signals] POLYGON_KEY missing; skipping.")
         return
-    if not _client:
-        print("[rsi_signals] Polygon REST client not initialized; skipping.")
-        return
-    if not _in_intraday_window():
-        print("[rsi_signals] outside intraday window; skipping.")
-        return
 
-    _reset_if_new_day()
+    start_ts = time.perf_counter()
+    scanned = matches = alerts = 0
+    reason_counts: dict[str, int] = {}
 
-    BOT_NAME = "rsi_signals"
-    start_ts = time.time()
-    alerts_sent = 0
-    matched_syms: set[str] = set()
-
-    universe = resolve_universe_for_bot(
-        bot_name="rsi_signals",
-        bot_env_var="RSI_TICKER_UNIVERSE",
-        max_universe_env="RSI_MAX_UNIVERSE",
-        default_max_universe=DEFAULT_MAX_UNIVERSE,
-        apply_dynamic_filters=True,
-        volume_coverage_env="DYNAMIC_VOLUME_COVERAGE",
-    )
-    if not universe:
-        print("[rsi_signals] empty universe; skipping.")
-        return
-
-    print(f"[rsi_signals] scanning {len(universe)} symbols")
-
-    now_str = now_est()
-
-    for sym in universe:
-        if is_etf_blacklisted(sym):
-            continue
-
-        bars = _fetch_intraday_bars(sym, RSI_TIMEFRAME_MIN)
-        if not bars or len(bars) < RSI_PERIOD + 5:
-            continue
-
-        closes = [float(b["c"]) for b in bars if b.get("c") is not None]
-        vols = [float(b["v"]) for b in bars if b.get("v") is not None]
-
-        if len(closes) < RSI_PERIOD + 5 or len(vols) != len(closes):
-            continue
-
-        last_close = closes[-1]
-        total_dollar_vol = sum(closes[i] * vols[i] for i in range(len(closes)))
-        if last_close < RSI_MIN_PRICE or total_dollar_vol < RSI_MIN_DOLLAR_VOL:
-            continue
-
-        rsis = _compute_rsi(closes, RSI_PERIOD)
-        if not rsis or len(rsis) != len(closes):
-            continue
-
-        rsi_last = rsis[-1]
-        rsi_prev = rsis[-2]
-
-        # filter out NaNs
-        if rsi_last != rsi_last or rsi_prev != rsi_prev:
-            continue
-
-        # 🟢 Oversold bounce
-        if (
-            rsi_last <= RSI_OVERSOLD
-            and rsi_last > rsi_prev  # turning up
-            and sym not in _seen_oversold
-        ):
-            header = f"🟢 RSI OVERSOLD — {sym}"
-            body_lines = [
-                header,
-                f"🕒 {now_str}",
-                "────────────",
-                f"📊 RSI: {rsi_last:.1f} (prev {rsi_prev:.1f})",
-                f"💰 Price: ${last_close:.2f}",
-                f"💵 Intraday dollar volume (approx): ${total_dollar_vol:,.0f}",
-                f"⏱ Timeframe: {RSI_TIMEFRAME_MIN}-min",
-                f"🔗 Chart: {chart_link(sym)}",
-                "",
-                "Potential oversold bounce / entry candidate. Combine with ORB, support, and options flow before acting.",
-            ]
-            extra = "\n".join(body_lines)
-            send_alert("rsi_oversold", sym, last_close, 0.0, extra=extra)
-            _seen_oversold.add(sym)
-            matched_syms.add(sym)
-            alerts_sent += 1
-            continue
-
-        # 🔴 Overbought fade
-        if (
-            rsi_last >= RSI_OVERBOUGHT
-            and rsi_last < rsi_prev  # turning down
-            and sym not in _seen_overbought
-        ):
-            header = f"🔴 RSI OVERBOUGHT — {sym}"
-            body_lines = [
-                header,
-                f"🕒 {now_str}",
-                "────────────",
-                f"📊 RSI: {rsi_last:.1f} (prev {rsi_prev:.1f})",
-                f"💰 Price: ${last_close:.2f}",
-                f"💵 Intraday dollar volume (approx): ${total_dollar_vol:,.0f}",
-                f"⏱ Timeframe: {RSI_TIMEFRAME_MIN}-min",
-                f"🔗 Chart: {chart_link(sym)}",
-                "",
-                "Potential overbought fade / take-profit / short candidate. Combine with ORB, resistance, and options flow.",
-            ]
-            extra = "\n".join(body_lines)
-            send_alert("rsi_overbought", sym, last_close, 0.0, extra=extra)
-            _seen_overbought.add(sym)
-            matched_syms.add(sym)
-            alerts_sent += 1
-
-    run_seconds = time.time() - start_ts
     try:
-        record_bot_stats(
-            BOT_NAME,
-            scanned=len(universe),
-            matched=len(matched_syms),
-            alerts=alerts_sent,
-            runtime_seconds=run_seconds,
-        )
-    except Exception as e:
-        print(f"[rsi_signals] record_bot_stats error: {e}")
+        if not _allow_outside_rth and not in_rth_window_est():
+            print("[rsi_signals] outside RTH window; skipping run")
+            record_bot_stats(BOT_NAME, 0, 0, 0, time.perf_counter() - start_ts)
+            return
 
-    print("[rsi_signals] scan complete.")
+        universe = resolve_universe_for_bot(
+            bot_name=BOT_NAME,
+            bot_env_var="RSI_TICKER_UNIVERSE",
+            max_universe_env="RSI_MAX_UNIVERSE",
+            default_max_universe=RSI_MAX_UNIVERSE,
+        )
+        if not universe:
+            print("[rsi_signals] universe empty; skipping")
+            record_bot_stats(BOT_NAME, 0, 0, 0, time.perf_counter() - start_ts)
+            return
+
+        print(f"[rsi_signals] scanning {len(universe)} symbols")
+
+        for sym in universe:
+            scanned += 1
+            try:
+                daily = _fetch_daily(sym, max(RSI_LOOKBACK_DAYS, 50))
+                if len(daily) < 2:
+                    if DEBUG_FLOW_REASONS:
+                        debug_filter_reason(BOT_NAME, sym, "insufficient_daily_history")
+                    reason_counts["insufficient_daily_history"] = reason_counts.get(
+                        "insufficient_daily_history", 0
+                    ) + 1
+                    continue
+
+                intraday = _fetch_intraday(sym, RSI_TIMEFRAME_MIN)
+                if len(intraday) < RSI_PERIOD + 5:
+                    if DEBUG_FLOW_REASONS:
+                        debug_filter_reason(BOT_NAME, sym, "insufficient_intraday")
+                    reason_counts["insufficient_intraday"] = reason_counts.get(
+                        "insufficient_intraday", 0
+                    ) + 1
+                    continue
+
+                closes = [b["c"] for b in intraday if b.get("c") is not None]
+                vols = [b["v"] for b in intraday if b.get("v") is not None]
+                if len(closes) < RSI_PERIOD + 5 or len(closes) != len(vols):
+                    if DEBUG_FLOW_REASONS:
+                        debug_filter_reason(BOT_NAME, sym, "bad_intraday_series")
+                    reason_counts["bad_intraday_series"] = reason_counts.get("bad_intraday_series", 0) + 1
+                    continue
+
+                open_, high, low, last = intraday[0]["o"], max(b["h"] for b in intraday), min(b["l"] for b in intraday), closes[-1]
+                day_vol = sum(vols)
+                dollar_vol = last * day_vol
+
+                if last < RSI_MIN_PRICE:
+                    if DEBUG_FLOW_REASONS:
+                        debug_filter_reason(BOT_NAME, sym, "price_below_min")
+                    reason_counts["price_below_min"] = reason_counts.get("price_below_min", 0) + 1
+                    continue
+
+                if dollar_vol < max(RSI_MIN_DOLLAR_VOL, MIN_VOLUME_GLOBAL):
+                    if DEBUG_FLOW_REASONS:
+                        debug_filter_reason(BOT_NAME, sym, "dollar_vol_too_low")
+                    reason_counts["dollar_vol_too_low"] = reason_counts.get("dollar_vol_too_low", 0) + 1
+                    continue
+
+                history = daily[:-1]
+                rvol = _calc_rvol(day_vol, history[-20:])
+                if rvol < max(MIN_RVOL_GLOBAL, 0.0):
+                    if DEBUG_FLOW_REASONS:
+                        debug_filter_reason(BOT_NAME, sym, "rvol_below_floor")
+                    reason_counts["rvol_below_floor"] = reason_counts.get("rvol_below_floor", 0) + 1
+                    continue
+
+                rsis = _compute_rsi(closes, RSI_PERIOD)
+                if len(rsis) != len(closes):
+                    continue
+                rsi_last = rsis[-1]
+                if math.isnan(rsi_last):
+                    continue
+
+                prev_close = _extract_daily_fields(daily[-2])[3]
+                day_move_pct = ((last - prev_close) / prev_close * 100) if prev_close > 0 else 0.0
+
+                ma20_vals = [
+                    _extract_daily_fields(b)[3]
+                    for b in daily[-21:-1]
+                    if _extract_daily_fields(b)[3] > 0
+                ]
+                ma50_vals = [
+                    _extract_daily_fields(b)[3]
+                    for b in daily[-51:-1]
+                    if _extract_daily_fields(b)[3] > 0
+                ]
+                ma20 = statistics.mean(ma20_vals) if ma20_vals else 0.0
+                ma50 = statistics.mean(ma50_vals) if ma50_vals else 0.0
+                regime_text = _regime(last, ma20, ma50)
+
+                signal: Optional[str] = None
+                if rsi_last <= RSI_OVERSOLD:
+                    signal = "oversold"
+                elif rsi_last >= RSI_OVERBOUGHT:
+                    signal = "overbought"
+
+                if not signal:
+                    if DEBUG_FLOW_REASONS:
+                        debug_filter_reason(BOT_NAME, sym, "rsi_neutral")
+                    reason_counts["rsi_neutral"] = reason_counts.get("rsi_neutral", 0) + 1
+                    continue
+
+                alert_text = _format_rsi_alert(
+                    symbol=sym,
+                    rsi_val=rsi_last,
+                    last=last,
+                    open_=open_,
+                    high=high,
+                    low=low,
+                    rvol=rvol,
+                    dollar_vol=dollar_vol,
+                    day_move_pct=day_move_pct,
+                    signal=signal,
+                    ma20=ma20,
+                    ma50=ma50,
+                    regime_text=regime_text,
+                    ts=datetime.now(),
+                )
+                send_alert_text(alert_text)
+                matches += 1
+                alerts += 1
+            except Exception as exc:  # pragma: no cover - per-symbol resilience
+                print(f"[rsi_signals] error processing {sym}: {exc}")
+                record_error(BOT_NAME, exc)
+                continue
+
+        if matches == 0 and DEBUG_FLOW_REASONS:
+            print(f"[rsi_signals] No alerts. Filter breakdown: {reason_counts}")
+    except Exception as exc:
+        print(f"[rsi_signals] runtime error: {exc}")
+        record_error(BOT_NAME, exc)
+    finally:
+        runtime = time.perf_counter() - start_ts
+        record_bot_stats(BOT_NAME, scanned, matches, alerts, runtime)
+
+
+if __name__ == "__main__":  # simple formatter demo
+    demo = _format_rsi_alert(
+        symbol="AMD",
+        rsi_val=28.4,
+        last=102.4,
+        open_=105.1,
+        high=106.3,
+        low=100.8,
+        rvol=1.7,
+        dollar_vol=842_000_000,
+        day_move_pct=-4.6,
+        signal="oversold",
+        ma20=110.0,
+        ma50=105.0,
+        regime_text="Uptrend (price > MA20 > MA50)",
+        ts=datetime(2026, 1, 1, 10, 32),
+    )
+    print(demo)
