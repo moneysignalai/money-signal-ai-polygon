@@ -31,11 +31,12 @@ from bots.shared import (
     POLYGON_KEY,
     chart_link,
     debug_filter_reason,
+    format_est_timestamp,
     in_rth_window_est,
     resolve_universe_for_bot,
-    send_alert,
+    send_alert_text,
 )
-from bots.status_report import record_bot_stats
+from bots.status_report import record_bot_stats, record_error
 
 BOT_NAME = "panic_flush"
 
@@ -61,6 +62,7 @@ if _min_drop_pct > -2:
 @dataclass
 class DailyStats:
     prev_close: float
+    prev_low: float
     open: float
     high: float
     low: float
@@ -138,6 +140,7 @@ def _compute_daily_stats(sym: str) -> DailyStats | None:
 
     open_, high, low, close, volume = _extract_ohlcv(today_bar)
     prev_close = float(getattr(prev_bar, "close", getattr(prev_bar, "c", 0.0)) or 0.0)
+    prev_low = float(getattr(prev_bar, "low", getattr(prev_bar, "l", 0.0)) or 0.0)
     if any(x <= 0 for x in (open_, high, low, close, volume, prev_close)):
         return None
 
@@ -150,6 +153,7 @@ def _compute_daily_stats(sym: str) -> DailyStats | None:
 
     return DailyStats(
         prev_close=prev_close,
+        prev_low=prev_low,
         open=open_,
         high=high,
         low=low,
@@ -157,6 +161,118 @@ def _compute_daily_stats(sym: str) -> DailyStats | None:
         volume=volume,
         avg_volume=avg_volume,
     )
+
+
+def _fetch_intraday(sym: str) -> List:
+    """Fetch same-day 5m bars filtered to RTH."""
+    if not _client:
+        return []
+    start = date.today().isoformat()
+    try:
+        bars = list(
+            _client.list_aggs(
+                sym,
+                5,
+                "minute",
+                start,
+                start,
+                limit=500,
+                sort="asc",
+            )
+        )
+    except Exception as exc:
+        print(f"[panic_flush] intraday agg error for {sym}: {exc}")
+        return []
+
+    filtered: List = []
+    for b in bars:
+        ts = getattr(b, "timestamp", getattr(b, "t", None))
+        if ts is None:
+            continue
+        if ts > 1e12:
+            ts = ts / 1000.0
+        dt = datetime.utcfromtimestamp(ts)
+        if dt.date() != date.today():
+            continue
+        minutes = dt.hour * 60 + dt.minute
+        if minutes < 9 * 60 + 30 or minutes > 16 * 60:
+            continue
+        filtered.append(b)
+    return filtered
+
+
+def _compute_vwap(bars: List) -> float:
+    if not bars:
+        return 0.0
+    cumulative_pv = 0.0
+    cumulative_v = 0.0
+    for b in bars:
+        price = float(getattr(b, "vw", None) or getattr(b, "close", getattr(b, "c", 0.0)) or 0.0)
+        vol = float(getattr(b, "volume", getattr(b, "v", 0.0)) or 0.0)
+        if price > 0 and vol > 0:
+            cumulative_pv += price * vol
+            cumulative_v += vol
+    return cumulative_pv / cumulative_v if cumulative_v > 0 else 0.0
+
+
+def _format_relative_vwap(last: float, vwap: float) -> str:
+    if last <= 0 or vwap <= 0:
+        return "n/a"
+    diff_pct = (last - vwap) / vwap * 100
+    if diff_pct <= -1.5:
+        return f"trading well below VWAP ({diff_pct:.1f}%)"
+    if diff_pct < 0:
+        return f"slightly below VWAP ({diff_pct:.1f}%)"
+    if diff_pct < 1.5:
+        return f"hugging VWAP ({diff_pct:.1f}%)"
+    return f"firmly above VWAP (+{diff_pct:.1f}%)"
+
+
+def _day_structure(summary: DailyStats, dist_from_low_pct: float, vwap_diff: float) -> str:
+    if summary.day_change_pct <= _min_drop_pct * 1.2 and dist_from_low_pct < 1.5 and vwap_diff < -1.5:
+        return "heavy intraday selloff, near session lows with capitulation-style volume"
+    if dist_from_low_pct < 3 and vwap_diff < 0:
+        return "flush off the open, stabilizing slightly above lows with tentative bids"
+    return "downtrend day with elevated volume"
+
+
+def _format_panic_alert(sym: str, stats: DailyStats, intraday: List) -> str:
+    vwap = _compute_vwap(intraday)
+    dist_from_low_pct = (stats.close - stats.low) / stats.low * 100 if stats.low > 0 else 0.0
+    vwap_text = _format_relative_vwap(stats.close, vwap) if vwap else "n/a"
+    vwap_diff = ((stats.close - vwap) / vwap * 100) if vwap else 0.0
+    structure_text = _day_structure(stats, dist_from_low_pct, vwap_diff)
+    prior_low_text = f"${stats.prev_low:.2f}" if stats.prev_low > 0 else "n/a"
+    bounce_high = None
+    if intraday:
+        lows = [(_extract_ohlcv(b)[2], idx) for idx, b in enumerate(intraday)]
+        if lows:
+            _, low_idx = min(lows, key=lambda x: x[0])
+            highs_after_low = [_extract_ohlcv(b)[1] for b in intraday[low_idx:]]
+            bounce_high_val = max(highs_after_low) if highs_after_low else 0.0
+            bounce_high = bounce_high_val if bounce_high_val > 0 else None
+
+    header = f"😱 PANIC FLUSH — {sym} ({format_est_timestamp()})"
+    lines = [
+        header,
+        "────────────",
+        f"• Last: ${stats.close:.2f} ({stats.day_change_pct:.1f}% vs prior close, {stats.from_open_pct:.1f}% from open)",
+        f"• Intraday range: O: ${stats.open:.2f} · H: ${stats.high:.2f} · L: ${stats.low:.2f} ({dist_from_low_pct:.1f}% above low)",
+        f"• RVOL: {stats.rvol:.1f}× · Volume: {int(stats.volume):,} · Dollar Vol ≈ ${stats.dollar_vol:,.0f}",
+    ]
+    if vwap:
+        lines.append(f"• VWAP: ${vwap:.2f} ({vwap_text})")
+    lines.append(f"• Day structure: {structure_text}")
+    lines.append("• Reference levels:")
+    lines.append(f"  - Support: today’s low ${stats.low:.2f} and prior day low {prior_low_text}")
+    if vwap:
+        resistance_parts = [f"VWAP ${vwap:.2f}"]
+        if bounce_high:
+            resistance_parts.append(f"bounce high ${bounce_high:.2f}")
+        lines.append(f"  - Resistance: {', '.join(resistance_parts)}")
+    lines.append("• Bias: Short-term downside exhaustion / potential bounce zone")
+    lines.append(f"• Chart: {chart_link(sym)}")
+    return "\n".join(lines)
 
 
 async def run_panic_flush() -> None:
@@ -222,18 +338,13 @@ async def run_panic_flush() -> None:
                     continue
 
                 matches += 1
-                body = (
-                    f"• Last: ${stats.close:.2f} ({stats.day_change_pct:.1f}% vs prior close,"
-                    f" {stats.from_open_pct:.1f}% from open)\n"
-                    f"• Volume: {int(stats.volume):,} ({stats.rvol:.1f}× avg) — Dollar Vol: ${stats.dollar_vol:,.0f}\n"
-                    f"• Near low: {stats.low_close_distance_pct:.1f}% off LOD\n"
-                    f"• Context: Capitulation-style selloff with heavy volume.\n"
-                    f"• Chart: {chart_link(sym)}"
-                )
-                send_alert("panic_flush", sym, stats.close, stats.rvol, extra=body)
+                intraday = _fetch_intraday(sym)
+                alert_text = _format_panic_alert(sym, stats, intraday)
+                send_alert_text(alert_text)
                 alerts += 1
             except Exception as exc:  # pragma: no cover - defensive
                 print(f"[panic_flush] error for {sym}: {exc}")
+                record_error(BOT_NAME, exc)
                 continue
     finally:
         runtime = time.perf_counter() - start
