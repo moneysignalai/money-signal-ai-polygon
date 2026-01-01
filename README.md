@@ -28,8 +28,11 @@ The scheduler loads bots from the `bots/` directory (excluding the legacy `oldco
 | Bot | Purpose | Cadence (default) |
 | --- | --- | --- |
 | `premarket` | Surface pre-market movers that meet dollar volume and RVOL floors. | 60s |
-| `equity_flow` | Track notable equity prints and summarize directional flow. | 20s |
-| `intraday_flow` | Monitor intraday prints with RVOL context. | 20s |
+| `volume_monster` | Track extreme volume spikes with meaningful price swings. | 20s |
+| `gap_scanner` | Surface gap-up and gap-down setups with liquidity filters. | 20s |
+| `swing_pullback` | Find pullbacks within established uptrends. | 20s |
+| `panic_flush` | Flag capitulation-style selloffs near lows with heavy volume. | 20s |
+| `momentum_reversal` | Detect intraday reversals after strong directional moves. | 20s |
 | `opening_range_breakout` | Identify opening-range breakouts with RVOL confirmation. | 20s |
 | `options_flow` | Scan option chain snapshots and last trades for cheap, unusual, whale, and IV crush contracts. | 20s |
 | `options_indicator` | Compute option-related indicators and alerts. | 60s |
