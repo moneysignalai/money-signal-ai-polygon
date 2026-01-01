@@ -20,12 +20,12 @@
 #     liquid part of the chain *right now*, not a 12-month historical rank.
 #   It still answers: “Is this options board relatively expensive or cheap today?”
 
+import math
 import os
 import time
-from datetime import date, datetime, timedelta
-from typing import List, Tuple, Optional, Dict, Any
+from datetime import date, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
-import math
 import pytz
 
 try:
@@ -33,15 +33,17 @@ try:
 except ImportError:
     from polygon import RESTClient
 
+from bots.options_common import options_flow_allow_outside_rth
 from bots.shared import (
     POLYGON_KEY,
     MIN_RVOL_GLOBAL,
     MIN_VOLUME_GLOBAL,
-    resolve_universe_for_bot,
-    send_alert,
     chart_link,
+    in_rth_window_est,
     is_etf_blacklisted,
     now_est,
+    resolve_options_underlying_universe,
+    send_alert,
 )
 from bots.status_report import record_bot_stats
 
@@ -83,17 +85,6 @@ MAX_DTE = int(os.getenv("OPTIONS_INDICATOR_MAX_DTE", "60"))
 MONEYNESS_PCT = float(os.getenv("OPTIONS_INDICATOR_MONEYNESS_PCT", "0.15"))  # ±15% around spot
 
 BOT_NAME = "options_indicator"
-
-
-# ------------ TIME WINDOW (RTH) ------------
-
-def _in_rth_window() -> bool:
-    """
-    Run only during regular trading hours 09:30–16:00 ET.
-    """
-    now = datetime.now(eastern)
-    mins = now.hour * 60 + now.minute
-    return 9 * 60 + 30 <= mins <= 16 * 60
 
 
 # ------------ SMALL HELPERS ------------
@@ -186,16 +177,25 @@ def _bollinger(values: List[float], window: int = 20, num_std: float = 2.0) -> T
     return lower, mean, upper
 
 
-def _universe() -> List[str]:
-    # Underlying equities universe; scanned count is number of underlyings evaluated
-    # for option indicators, not contracts.
-    return resolve_universe_for_bot(
-        bot_name="options_indicator",
-        bot_env_var="OPTIONS_INDICATOR_TICKER_UNIVERSE",
-        max_universe_env="OPTIONS_INDICATOR_MAX_UNIVERSE",
-        default_max_universe=DEFAULT_MAX_UNIVERSE,
-        apply_dynamic_filters=True,
-    )
+async def _universe() -> List[str]:
+    """Resolve the options-underlying universe with top-volume + env fallbacks."""
+
+    override = os.getenv("OPTIONS_INDICATOR_TICKER_UNIVERSE", "")
+    if override.strip():
+        tickers = [s.strip().upper() for s in override.split(",") if s.strip()]
+        trimmed = tickers[:MAX_UNIVERSE]
+        print(
+            f"[options_indicator] options_underlying_universe_size={len(trimmed)} (source=override)"
+        )
+        return trimmed
+
+    try:
+        return await resolve_options_underlying_universe(
+            BOT_NAME, max_tickers=MAX_UNIVERSE
+        )
+    except Exception as exc:
+        print(f"[options_indicator] universe resolution failed: {exc}")
+        return []
 
 
 def _fetch_daily_history(sym: str, trading_day: date, lookback_days: int) -> List[Any]:
@@ -468,106 +468,116 @@ async def run_options_indicator() -> None:
           – LOW_IV_REVERSAL
         …fire a single, clean alert describing the regime and indicators.
     """
-    if not POLYGON_KEY or not _client:
-        print("[options_indicator] POLYGON_KEY or client missing; skipping.")
-        return
-
-    if not _in_rth_window():
-        print("[options_indicator] Outside RTH window; skipping.")
-        return
-
-    universe = _universe()
-    if not universe:
-        print("[options_indicator] empty universe; skipping.")
-        return
-
-    trading_day = date.today()
     start_ts = time.time()
     alerts_sent = 0
     matches: List[str] = []
+    scanned = 0
 
-    print(f"[options_indicator] scanning {len(universe)} symbols @ {now_est()}")
-
-    for sym in universe:
-        if is_etf_blacklisted(sym):
-            continue
-
-        days = _fetch_daily_history(sym, trading_day, LOOKBACK_DAYS)
-        if not days:
-            continue
-
-        info = _evaluate_symbol(sym, days)
-        if not info:
-            continue
-
-        matches.append(sym)
-        alerts_sent += 1
-
-        # Build alert
-        regime = info["regime"]
-        close = info["close"]
-        rvol = info["rvol"]
-        rsi = info["rsi"]
-        macd_line = info["macd"]
-        signal_line = info["signal"]
-        bb_lower = info["bb_lower"]
-        bb_mid = info["bb_mid"]
-        bb_upper = info["bb_upper"]
-        iv_rank = info["iv_rank"]
-        total_oi = info["total_oi"]
-        max_oi = info["max_oi"]
-        dollar_vol = info["dollar_vol"]
-        move_pct = info["move_pct"]
-        bias_text = info["bias_text"]
-
-        timestamp = now_est()
-        if not isinstance(timestamp, str):
-            timestamp = timestamp.strftime("%I:%M %p EST · %b %d").lstrip("0")
-
-        if regime == "HIGH_IV_MOMENTUM":
-            header_emoji = "📈"
-            header_text = "HIGH-IV MOMENTUM"
-        else:
-            header_emoji = "📉"
-            header_text = "LOW-IV REVERSAL"
-
-        extra_lines = [
-            f"{header_emoji} OPTIONS INDICATOR — {sym}",
-            f"🕒 {timestamp}",
-            f"💰 Underlying: ${close:.2f} · RVOL {rvol:.1f}x",
-            "────────────",
-            f"🎯 Regime: {header_text}",
-            f"📊 IV Rank (intra-chain): {iv_rank:.0f}",
-            f"📉 RSI(14): {rsi:.1f}",
-            f"📈 MACD: {macd_line:.3f} vs Signal {signal_line:.3f}",
-            f"📎 Bollinger 20/2: Lower {bb_lower:.2f} · Mid {bb_mid:.2f} · Upper {bb_upper:.2f}",
-            f"💵 Dollar Volume (today): ≈ ${dollar_vol:,.0f}",
-            f"📦 Options OI: total {total_oi:,} · max strike {max_oi:,}",
-            f"📊 Day Move: {move_pct:.1f}%",
-            "",
-            f"🧠 Bias: {bias_text}",
-            f"🔗 Chart: {chart_link(sym)}",
-        ]
-
-        extra_text = "\n".join(extra_lines)
-
-        # rvol is the underlying RVOL; we surface it in status bot as usual
-        send_alert(BOT_NAME, sym, close, rvol, extra=extra_text)
-
-    run_seconds = time.time() - start_ts
     try:
-        record_bot_stats(
-            BOT_NAME,
-            scanned=len(universe),
-            matched=len(matches),
-            alerts=alerts_sent,
-            runtime=run_seconds,
-        )
-    except Exception as e:
-        print(f"[options_indicator] record_bot_stats error: {e}")
+        if not POLYGON_KEY or not _client:
+            print("[options_indicator] POLYGON_KEY or client missing; skipping.")
+            return
 
-    print(
-        f"[options_indicator] scan complete: "
-        f"scanned={len(universe)} matched={len(matches)} alerts={alerts_sent} "
-        f"runtime={run_seconds:.2f}s"
-    )
+        if not options_flow_allow_outside_rth() and not in_rth_window_est():
+            print("[options_indicator] Outside RTH window; skipping.")
+            return
+
+        universe = await _universe()
+        if not universe:
+            print("[options_indicator] empty universe; skipping.")
+            return
+
+        print(f"[options_indicator] scanning {len(universe)} symbols @ {now_est()}")
+
+        trading_day = date.today()
+
+        for sym in universe:
+            scanned += 1
+            try:
+                if is_etf_blacklisted(sym):
+                    continue
+
+                days = _fetch_daily_history(sym, trading_day, LOOKBACK_DAYS)
+                if not days:
+                    continue
+
+                info = _evaluate_symbol(sym, days)
+                if not info:
+                    continue
+
+                matches.append(sym)
+                alerts_sent += 1
+
+                # Build alert
+                regime = info["regime"]
+                close = info["close"]
+                rvol = info["rvol"]
+                rsi = info["rsi"]
+                macd_line = info["macd"]
+                signal_line = info["signal"]
+                bb_lower = info["bb_lower"]
+                bb_mid = info["bb_mid"]
+                bb_upper = info["bb_upper"]
+                iv_rank = info["iv_rank"]
+                total_oi = info["total_oi"]
+                max_oi = info["max_oi"]
+                dollar_vol = info["dollar_vol"]
+                move_pct = info["move_pct"]
+                bias_text = info["bias_text"]
+
+                timestamp = now_est()
+                if not isinstance(timestamp, str):
+                    timestamp = timestamp.strftime("%I:%M %p EST · %b %d").lstrip("0")
+
+                if regime == "HIGH_IV_MOMENTUM":
+                    header_emoji = "📈"
+                    header_text = "HIGH-IV MOMENTUM"
+                else:
+                    header_emoji = "📉"
+                    header_text = "LOW-IV REVERSAL"
+
+                extra_lines = [
+                    f"{header_emoji} OPTIONS INDICATOR — {sym}",
+                    f"🕒 {timestamp}",
+                    f"💰 Underlying: ${close:.2f} · RVOL {rvol:.1f}x",
+                    "────────────",
+                    f"🎯 Regime: {header_text}",
+                    f"📊 IV Rank (intra-chain): {iv_rank:.0f}",
+                    f"📉 RSI(14): {rsi:.1f}",
+                    f"📈 MACD: {macd_line:.3f} vs Signal {signal_line:.3f}",
+                    f"📎 Bollinger 20/2: Lower {bb_lower:.2f} · Mid {bb_mid:.2f} · Upper {bb_upper:.2f}",
+                    f"💵 Dollar Volume (today): ≈ ${dollar_vol:,.0f}",
+                    f"📦 Options OI: total {total_oi:,} · max strike {max_oi:,}",
+                    f"📊 Day Move: {move_pct:.1f}%",
+                    "",
+                    f"🧠 Bias: {bias_text}",
+                    f"🔗 Chart: {chart_link(sym)}",
+                ]
+
+                extra_text = "\n".join(extra_lines)
+
+                # rvol is the underlying RVOL; we surface it in status bot as usual
+                send_alert(BOT_NAME, sym, close, rvol, extra=extra_text)
+            except Exception as exc:
+                print(f"[options_indicator] error on {sym}: {exc}")
+                continue
+    except Exception as exc:
+        print(f"[options_indicator] unexpected error: {exc}")
+    finally:
+        run_seconds = time.time() - start_ts
+        try:
+            record_bot_stats(
+                BOT_NAME,
+                scanned=scanned,
+                matched=len(matches),
+                alerts=alerts_sent,
+                runtime=run_seconds,
+            )
+        except Exception as e:
+            print(f"[options_indicator] record_bot_stats error: {e}")
+
+        print(
+            f"[options_indicator] scan complete: "
+            f"scanned={scanned} matched={len(matches)} alerts={alerts_sent} "
+            f"runtime={run_seconds:.2f}s"
+        )

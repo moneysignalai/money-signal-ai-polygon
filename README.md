@@ -34,9 +34,12 @@ The scheduler loads bots from the `bots/` directory (excluding the legacy `oldco
 | `panic_flush` | Flag capitulation-style selloffs near lows with heavy volume. | 20s |
 | `momentum_reversal` | Detect intraday reversals after strong directional moves. | 20s |
 | `opening_range_breakout` | Identify opening-range breakouts with RVOL confirmation. | 20s |
-| `options_flow` | Scan option chain snapshots and last trades for cheap, unusual, whale, and IV crush contracts. | 20s |
+| `options_cheap_flow` | Low-premium contracts with meaningful size/notional. | 60s |
+| `options_unusual_flow` | Notable options trades that stand out on size/notional. | 60s |
+| `options_whales` | Very large whale-style option orders. | 60s |
+| `options_iv_crush` | Contracts experiencing large implied-volatility drops. | 60s |
 | `options_indicator` | Compute option-related indicators and alerts. | 60s |
-| `squeeze` | Flag potential squeeze setups using option flow thresholds. | 60s |
+| `squeeze` | Price/volume squeeze radar for equities. | 60s |
 | `rsi_signals` | Generate RSI-based signals across the dynamic universe. | 20s |
 | `trend_rider` | Breakout continuation setups in strong uptrends. | 60s |
 | `earnings` | Surface upcoming earnings names with activity context. | 300s |
@@ -97,7 +100,7 @@ Refer to `.env` or Render dashboard settings for the full list of supported vari
 main.py              # FastAPI app + asyncio scheduler
 bots/
   shared.py          # Shared helpers (time, universe, data access, Telegram, caching)
-  options_flow.py    # Options flow scanner (cheap / unusual / whale / IV crush)
+  options_*.py       # Dedicated option flow bots (cheap / unusual / whales / IV crush)
   ...                # Additional bots listed above
 ```
 
