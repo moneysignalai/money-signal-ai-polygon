@@ -571,7 +571,7 @@ async def run_options_indicator() -> None:
                 scanned=scanned,
                 matched=len(matches),
                 alerts=alerts_sent,
-                runtime=run_seconds,
+                runtime_seconds=run_seconds,
             )
         except Exception as e:
             print(f"[options_indicator] record_bot_stats error: {e}")

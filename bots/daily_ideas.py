@@ -42,6 +42,8 @@ from bots.status_report import record_bot_stats
 
 eastern = pytz.timezone("US/Eastern")
 
+BOT_NAME = "daily_ideas"
+
 _client: Optional[RESTClient] = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
 # -------- ENV CONFIG --------
@@ -456,25 +458,24 @@ async def run_daily_ideas() -> None:
 
     if slot is None and not DAILY_IDEAS_ALLOW_OUTSIDE_WINDOW:
         print("[daily_ideas] outside idea windows; skipping.")
-        record_bot_stats("Daily Ideas", 0, 0, 0, 0.0)
+        record_bot_stats(BOT_NAME, 0, 0, 0, 0.0)
         return
     if slot is None and DAILY_IDEAS_ALLOW_OUTSIDE_WINDOW:
         slot = "override"
     if slot == "am" and _ran_am:
         print("[daily_ideas] AM slot already ran; skipping.")
-        record_bot_stats("Daily Ideas", 0, 0, 0, 0.0)
+        record_bot_stats(BOT_NAME, 0, 0, 0, 0.0)
         return
     if slot == "pm" and _ran_pm:
         print("[daily_ideas] PM slot already ran; skipping.")
-        record_bot_stats("Daily Ideas", 0, 0, 0, 0.0)
+        record_bot_stats(BOT_NAME, 0, 0, 0, 0.0)
         return
 
     if not POLYGON_KEY or not _client:
         print("[daily_ideas] missing POLYGON_KEY or client; skipping.")
-        record_bot_stats("Daily Ideas", 0, 0, 0, 0.0)
+        record_bot_stats(BOT_NAME, 0, 0, 0, 0.0)
         return
 
-    BOT_NAME = "daily_ideas"
     start_ts = time.time()
     alerts_sent = 0
     scanned = 0
@@ -492,7 +493,7 @@ async def run_daily_ideas() -> None:
     )
     if not universe:
         print("[daily_ideas] empty universe; skipping.")
-        record_bot_stats("Daily Ideas", 0, 0, 0, 0.0)
+        record_bot_stats(BOT_NAME, 0, 0, 0, 0.0)
         return
 
     print(f"[daily_ideas] start slot={slot} universe_size={len(universe)}")
@@ -697,11 +698,11 @@ async def run_daily_ideas() -> None:
     runtime = time.time() - start_ts
     try:
         record_bot_stats(
-            "daily_ideas",
+            BOT_NAME,
             scanned=scanned,
             matched=matched,
             alerts=alerts_sent,
-            runtime=runtime,
+            runtime_seconds=runtime,
         )
     except Exception as e:
         print(f"[daily_ideas] record_bot_stats error: {e}")

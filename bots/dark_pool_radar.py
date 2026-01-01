@@ -250,7 +250,7 @@ async def run_dark_pool_radar():
             scanned=len(universe),
             matched=len(matches),
             alerts=alerts_sent,
-            runtime=run_seconds,
+            runtime_seconds=run_seconds,
         )
     except Exception as e:
         print(f"[dark_pool] record_bot_stats error: {e}")

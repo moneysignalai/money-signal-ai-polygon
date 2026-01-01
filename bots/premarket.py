@@ -38,6 +38,8 @@ _client: Optional[RESTClient] = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY e
 
 # ---------------- CONFIG ----------------
 
+BOT_NAME = "premarket"
+
 MIN_PREMARKET_PRICE       = float(os.getenv("MIN_PREMARKET_PRICE", "5.0"))
 MIN_PREMARKET_MOVE_PCT    = float(os.getenv("MIN_PREMARKET_MOVE_PCT", "3.0"))
 MIN_PREMARKET_DOLLAR_VOL  = float(os.getenv("MIN_PREMARKET_DOLLAR_VOL", "500000"))   # $500k+
@@ -281,15 +283,14 @@ async def run_premarket() -> None:
 
     if not POLYGON_KEY or not _client:
         print("[premarket] POLYGON_KEY or client missing; skipping.")
-        record_bot_stats("Premarket", 0, 0, 0, 0.0)
+        record_bot_stats(BOT_NAME, 0, 0, 0, 0.0)
         return
 
     if not PREMARKET_ALLOW_OUTSIDE_WINDOW and not _in_premarket_window():
         print("[premarket] Outside premarket window; skipping.")
-        record_bot_stats("Premarket", 0, 0, 0, 0.0)
+        record_bot_stats(BOT_NAME, 0, 0, 0, 0.0)
         return
 
-    BOT_NAME = "premarket"
     start_ts = time.time()
     alerts_sent = 0
     matched_symbols: set[str] = set()
@@ -297,7 +298,7 @@ async def run_premarket() -> None:
     universe = _get_universe()
     if not universe:
         print("[premarket] empty universe; skipping.")
-        record_bot_stats("Premarket", 0, 0, 0, 0.0)
+        record_bot_stats(BOT_NAME, 0, 0, 0, 0.0)
         return
 
     trading_day = date.today()
@@ -399,7 +400,7 @@ async def run_premarket() -> None:
             scanned=len(universe),
             matched=len(matched_symbols),
             alerts=alerts_sent,
-            runtime=run_seconds,
+            runtime_seconds=run_seconds,
         )
     except Exception as e:
         print(f"[premarket] record_bot_stats error: {e}")

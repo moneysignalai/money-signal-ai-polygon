@@ -232,7 +232,7 @@ async def run_earnings():
         scanned=len(universe),
         matched=len(matches),
         alerts=alerts_sent,
-        runtime=run_seconds,
+        runtime_seconds=run_seconds,
     )
 
     print(

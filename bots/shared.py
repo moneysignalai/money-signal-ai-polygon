@@ -72,6 +72,12 @@ def now_est() -> str:
     return datetime.now(eastern).strftime("%I:%M %p EST · %b %d").lstrip("0")
 
 
+def now_est_dt() -> datetime:
+    """Timezone-aware Eastern datetime for consistent trading-day math."""
+
+    return datetime.now(eastern)
+
+
 def format_est_timestamp(ts: Optional[datetime] = None) -> str:
     """Return an Eastern timestamp in MM-DD-YYYY · HH:MM AM/PM EST format."""
 
@@ -326,39 +332,63 @@ def record_bot_stats(
     matched: int,
     alerts: int,
     runtime_seconds: Optional[float] = None,
+    *,
+    started_at: Optional[datetime] = None,
+    finished_at: Optional[datetime] = None,
 ) -> None:
-    """
-    Shared helper used by bots to record their stats for the heartbeat.
+    """Record per-bot stats with trading-day scoping.
 
-    Stores per-bot:
-      • last scanned / matched / alerts
-      • list of recent runtimes (used for medians)
-      • last_run_ts (epoch seconds)
+    The signature remains backward compatible (runtime_seconds positional) so
+    existing bots keep working, but callers are encouraged to pass explicit
+    ``started_at``/``finished_at`` datetimes for better accuracy.
     """
+
     bot_name = str(bot_name)
+
+    finished = finished_at or now_est_dt()
+    # Infer start time if missing
+    if started_at is None and runtime_seconds is not None:
+        started_at = finished - timedelta(seconds=float(runtime_seconds))
+    started = started_at or finished
+    runtime = runtime_seconds
+    if runtime is None:
+        runtime = max((finished - started).total_seconds(), 0.0)
+
+    trading_day = finished.astimezone(eastern).date().isoformat()
+
+    entry = {
+        "bot_name": bot_name,
+        "scanned": int(scanned),
+        "matched": int(matched),
+        "alerts": int(alerts),
+        "runtime": float(runtime),
+        "started_at": started.isoformat(),
+        "finished_at": finished.isoformat(),
+        "finished_at_ts": finished.timestamp(),
+        "finished_at_str": format_est_timestamp(finished),
+        "trading_day": trading_day,
+    }
 
     data = _load_stats_file()
     bots = data.setdefault("bots", {})
 
-    entry: Dict[str, Any] = bots.get(bot_name, {})
-    entry["scanned"] = int(scanned)
-    entry["matched"] = int(matched)
-    entry["alerts"] = int(alerts)
-    entry["last_run_ts"] = time.time()
+    prev = bots.get(bot_name, {}) or {}
+    history: List[Dict[str, Any]] = []
+    if isinstance(prev, dict):
+        hist_obj = prev.get("history")
+        if isinstance(hist_obj, list):
+            for item in hist_obj:
+                if isinstance(item, dict):
+                    history.append(item)
+        # If the legacy structure only had a flat latest record, preserve it
+        if not history and {"scanned", "matched", "alerts"}.issubset(prev.keys()):
+            history.append(prev)
 
-    # Keep a rolling window of runtimes for median calc
-    runtimes = entry.get("runtimes") or []
-    if runtime_seconds is not None:
-        try:
-            runtimes.append(float(runtime_seconds))
-        except Exception:
-            pass
-        # cap history to last 50 runs
-        if len(runtimes) > 50:
-            runtimes = runtimes[-50:]
-    entry["runtimes"] = runtimes
+    history.append(entry)
+    if len(history) > 100:
+        history = history[-100:]
 
-    bots[bot_name] = entry
+    bots[bot_name] = {"latest": entry, "history": history}
     data["bots"] = bots
 
     _save_stats_file(data)

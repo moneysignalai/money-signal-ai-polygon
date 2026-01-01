@@ -349,12 +349,12 @@ async def run_opening_range_breakout() -> None:
 
     if not POLYGON_KEY or not _client:
         print("[opening_range_breakout] missing POLYGON_KEY or client; skipping.")
-        record_bot_stats("Opening Range Breakout", 0, 0, 0, 0.0)
+        record_bot_stats(BOT_NAME, 0, 0, 0, 0.0)
         return
 
     if not _in_orb_window():
         print("[opening_range_breakout] outside ORB scan window; skipping.")
-        record_bot_stats("Opening Range Breakout", 0, 0, 0, 0.0)
+        record_bot_stats(BOT_NAME, 0, 0, 0, 0.0)
         return
 
     BOT_NAME = "opening_range_breakout"
@@ -493,7 +493,7 @@ async def run_opening_range_breakout() -> None:
             scanned=len(universe),
             matched=len(matched_syms),
             alerts=alerts_sent,
-            runtime=runtime,
+            runtime_seconds=runtime,
         )
     except Exception as e:
         print(f"[opening_range_breakout] record_bot_stats error: {e}")

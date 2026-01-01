@@ -293,7 +293,7 @@ async def run_rsi_signals():
             scanned=len(universe),
             matched=len(matched_syms),
             alerts=alerts_sent,
-            runtime=run_seconds,
+            runtime_seconds=run_seconds,
         )
     except Exception as e:
         print(f"[rsi_signals] record_bot_stats error: {e}")
