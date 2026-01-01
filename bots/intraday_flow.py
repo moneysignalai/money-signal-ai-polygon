@@ -24,7 +24,7 @@ from bots.shared import (
     MIN_RVOL_GLOBAL,
     MIN_VOLUME_GLOBAL,
     send_alert,
-    get_dynamic_top_volume_universe,
+    resolve_universe_for_bot,
     is_etf_blacklisted,
     grade_equity_setup,
     chart_link,
@@ -35,13 +35,20 @@ from bots.status_report import record_bot_stats
 eastern = pytz.timezone("US/Eastern")
 _client: Optional[RESTClient] = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
+INTRADAY_FLOW_ALLOW_OUTSIDE_RTH = (
+    os.getenv("INTRADAY_FLOW_ALLOW_OUTSIDE_RTH", "false").lower() == "true"
+)
+
 # ---------------- GLOBAL CONFIG ----------------
 
 INTRADAY_START_MIN = 9 * 60 + 30   # 09:30
 INTRADAY_END_MIN   = 16 * 60       # 16:00
 
-# Universe
-INTRADAY_MAX_UNIVERSE = int(os.getenv("INTRADAY_MAX_UNIVERSE", "120"))
+DEFAULT_MAX_UNIVERSE = int(os.getenv("DYNAMIC_MAX_TICKERS", "2000"))
+# Universe: prefer INTRADAY_FLOW_TICKER_UNIVERSE/TICKER_UNIVERSE, capped by
+# INTRADAY_MAX_UNIVERSE (defaults to DYNAMIC_MAX_TICKERS) and optionally trimmed to
+# liquid names using shared dynamic coverage.
+INTRADAY_MAX_UNIVERSE = int(os.getenv("INTRADAY_MAX_UNIVERSE", str(DEFAULT_MAX_UNIVERSE)))
 
 # -------- Volume Monster config --------
 VM_MIN_MONSTER_BAR_SHARES = float(os.getenv("VM_MIN_MONSTER_BAR_SHARES", "2000000"))
@@ -89,6 +96,14 @@ def _in_intraday_window() -> bool:
     return INTRADAY_START_MIN <= mins <= INTRADAY_END_MIN
 
 
+def should_run_now() -> tuple[bool, str | None]:
+    if INTRADAY_FLOW_ALLOW_OUTSIDE_RTH:
+        return True, None
+    if _in_intraday_window():
+        return True, None
+    return False, "outside intraday window"
+
+
 def _in_mr_window() -> bool:
     now = datetime.now(eastern)
     mins = now.hour * 60 + now.minute
@@ -104,16 +119,6 @@ def _safe_float(x: Any) -> Optional[float]:
         return float(x)
     except (TypeError, ValueError):
         return None
-
-
-def _get_universe() -> List[str]:
-    env = os.getenv("INTRADAY_FLOW_TICKER_UNIVERSE") or os.getenv("TICKER_UNIVERSE")
-    if env:
-        return [s.strip().upper() for s in env.split(",") if s.strip()]
-    return get_dynamic_top_volume_universe(
-        max_tickers=INTRADAY_MAX_UNIVERSE,
-        volume_coverage=0.95,
-    )
 
 
 def _fetch_intraday(sym: str, trading_day: date) -> List[Any]:
@@ -496,10 +501,12 @@ async def run_intraday_flow() -> None:
 
     if not POLYGON_KEY or not _client:
         print("[intraday_flow] missing POLYGON_KEY or REST client; skipping.")
+        record_bot_stats("intraday_flow", 0, 0, 0, 0.0)
         return
 
-    if not _in_intraday_window():
+    if not (INTRADAY_FLOW_ALLOW_OUTSIDE_RTH or _in_intraday_window()):
         print("[intraday_flow] outside intraday window; skipping.")
+        record_bot_stats("intraday_flow", 0, 0, 0, 0.0)
         return
 
     BOT_NAME = "intraday_flow"
@@ -507,9 +514,16 @@ async def run_intraday_flow() -> None:
     alerts_sent = 0
     matched_symbols: set[str] = set()
 
-    universe = _get_universe()
+    universe = resolve_universe_for_bot(
+        bot_name="intraday_flow",
+        bot_env_var="INTRADAY_FLOW_TICKER_UNIVERSE",
+        max_universe_env="INTRADAY_MAX_UNIVERSE",
+        default_max_universe=DEFAULT_MAX_UNIVERSE,
+        apply_dynamic_filters=True,
+    )
     if not universe:
         print("[intraday_flow] empty universe; skipping.")
+        record_bot_stats("intraday_flow", 0, 0, 0, 0.0)
         return
 
     trading_day = date.today()
