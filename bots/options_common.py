@@ -10,9 +10,12 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from bots.shared import (
+    chart_link,
     debug_filter_reason,
+    eastern,
     get_last_option_trades_cached,
     get_option_chain_cached,
+    send_alert_text,
 )
 
 
@@ -46,6 +49,39 @@ def _contract_type(contract: str) -> Optional[str]:
     if "P" in base and "C" not in base:
         return "PUT"
     return None
+
+
+def _parse_occ(contract: str) -> Dict[str, Optional[Any]]:
+    """Parse an OCC formatted contract code into components."""
+
+    if not contract:
+        return {"underlying": None, "expiry": None, "cp": None, "strike": None}
+
+    base = contract.replace("O:", "")
+    if len(base) < 15:
+        return {"underlying": None, "expiry": None, "cp": None, "strike": None}
+
+    underlying = base[:-15]
+    date_part = base[-15:-9]
+    cp_letter = base[-9]
+    strike_part = base[-8:]
+
+    expiry: Optional[str] = None
+    try:
+        dt_exp = datetime.strptime(date_part, "%y%m%d").date()
+        expiry = dt_exp.strftime("%Y-%m-%d")
+    except Exception:
+        expiry = None
+
+    strike: Optional[float] = None
+    try:
+        strike = int(strike_part) / 1000.0
+    except Exception:
+        strike = None
+
+    cp = "CALL" if cp_letter.upper() == "C" else "PUT" if cp_letter.upper() == "P" else None
+
+    return {"underlying": underlying, "expiry": expiry, "cp": cp, "strike": strike}
 
 
 def _parse_option_details(opt: Dict[str, Any]) -> tuple[Optional[str], Optional[str], Optional[int]]:
@@ -93,6 +129,7 @@ class OptionContract:
     size: Optional[int]
     notional: Optional[float]
     volume: Optional[int]
+    open_interest: Optional[int]
     iv: Optional[float]
     underlying_price: Optional[float]
 
@@ -134,12 +171,28 @@ def iter_option_contracts(symbol: str, *, ttl_seconds: int = 60) -> List[OptionC
             debug_filter_reason("options_common", symbol, "missing_contract_symbol")
             continue
 
-        cp = opt.get("type") or opt.get("contract_type") or _contract_type(contract)
+        occ_parts = _parse_occ(contract)
+
+        cp = (
+            opt.get("type")
+            or opt.get("contract_type")
+            or _contract_type(contract)
+            or occ_parts.get("cp")
+        )
         strike = _safe_float(
             (opt.get("details") or {}).get("strike_price")
             or opt.get("strike_price")
             or opt.get("strike")
+            or occ_parts.get("strike")
         )
+        if not expiry:
+            expiry = occ_parts.get("expiry")
+        if dte is None and occ_parts.get("expiry"):
+            try:
+                dt_exp = datetime.strptime(occ_parts["expiry"], "%Y-%m-%d").date()
+                dte = (dt_exp - datetime.now().date()).days
+            except Exception:
+                dte = None
 
         last_trade_obj = opt.get("last_trade") or opt.get("lastTrade") or opt.get("last") or {}
         premium = _safe_float(
@@ -168,6 +221,11 @@ def iter_option_contracts(symbol: str, *, ttl_seconds: int = 60) -> List[OptionC
             premium = (bid + ask) / 2.0
 
         volume = _safe_int(opt.get("volume") or opt.get("v") or size)
+        open_interest = _safe_int(
+            opt.get("open_interest")
+            or opt.get("oi")
+            or (opt.get("details") or {}).get("open_interest")
+        )
         notional = None
         if premium is not None and size is not None:
             notional = premium * size * OPTION_MULTIPLIER
@@ -184,6 +242,7 @@ def iter_option_contracts(symbol: str, *, ttl_seconds: int = 60) -> List[OptionC
                 size=size,
                 notional=notional,
                 volume=volume,
+                open_interest=open_interest,
                 iv=_option_iv(opt),
                 underlying_price=underlying_price,
             )
@@ -193,3 +252,95 @@ def iter_option_contracts(symbol: str, *, ttl_seconds: int = 60) -> List[OptionC
 
 def options_flow_allow_outside_rth() -> bool:
     return os.getenv("OPTIONS_FLOW_ALLOW_OUTSIDE_RTH", "false").lower() == "true"
+
+
+def _format_strike(strike: Optional[float]) -> str:
+    if strike is None:
+        return "?"
+    text = f"{strike:.2f}".rstrip("0").rstrip(".")
+    return text
+
+
+def _format_expiry(expiry: Optional[str]) -> str:
+    if not expiry:
+        return "n/a"
+    try:
+        fmt = "%Y-%m-%d" if "-" in expiry else "%Y%m%d"
+        dt_exp = datetime.strptime(expiry, fmt)
+        return dt_exp.strftime("%m-%d-%Y")
+    except Exception:
+        return expiry
+
+
+def format_option_contract_display(contract: OptionContract) -> str:
+    parsed = _parse_occ(contract.contract)
+    expiry = contract.expiry or parsed.get("expiry")
+    strike_val = contract.strike if contract.strike is not None else parsed.get("strike")
+    cp_val = contract.cp or parsed.get("cp")
+    cp_letter = "C" if cp_val and cp_val.upper().startswith("C") else "P" if cp_val and cp_val.upper().startswith("P") else "?"
+    ticker = contract.symbol or parsed.get("underlying") or "?"
+    return f"{ticker.upper()} {_format_strike(strike_val)}{cp_letter} {_format_expiry(expiry)}"
+
+
+def _format_currency(value: Optional[float], *, decimals: int = 2) -> str:
+    if value is None or value <= 0:
+        return "N/A"
+    return f"${value:,.{decimals}f}"
+
+
+def format_option_alert(
+    *,
+    emoji: str,
+    label: str,
+    contract: OptionContract,
+    iv_line: Optional[str] = None,
+    chart_symbol: Optional[str] = None,
+) -> str:
+    """Return a human-readable option alert body used by all option flow bots."""
+
+    now = datetime.now(eastern)
+    timestamp = now.strftime("%m-%d-%Y · %I:%M %p EST")
+    dte_text = f"{contract.dte} DTE" if contract.dte is not None else "n/a"
+    premium_text = _format_currency(contract.premium)
+    size_text = str(contract.size) if contract.size is not None else "n/a"
+    notional_text = _format_currency(contract.notional, decimals=0)
+    underlying_text = _format_currency(contract.underlying_price)
+    iv_value = f"{contract.iv:.1f}%" if contract.iv is not None else "n/a"
+    volume_text = str(contract.volume) if contract.volume is not None else "n/a"
+    oi_text = (
+        str(contract.open_interest)
+        if contract.open_interest is not None
+        else "n/a"
+    )
+    iv_display = iv_line if iv_line is not None else f"IV: {iv_value} | Volume: {volume_text} | OI: {oi_text}"
+
+    header_symbol = (chart_symbol or contract.symbol or "?").upper()
+    header = f"{emoji} {label} — {header_symbol} ({timestamp})"
+    separator = "────────────"
+    contract_line = (
+        f"• Contract: {format_option_contract_display(contract)} (⏳ {dte_text})"
+    )
+    underlying_line = f"• 💵 Underlying: {underlying_text}"
+    money_line = (
+        f"• 💰 Premium: {premium_text} | Size: {size_text} | Notional: {notional_text}"
+    )
+    iv_line_fmt = f"• 📊 {iv_display}"
+    chart_line = f"• 📈 Chart: {chart_link(header_symbol)}"
+
+    return "\n".join(
+        [
+            header,
+            separator,
+            contract_line,
+            underlying_line,
+            money_line,
+            iv_line_fmt,
+            chart_line,
+        ]
+    )
+
+
+def send_option_alert(text: str) -> None:
+    """Send the formatted option alert via Telegram."""
+
+    send_alert_text(text)

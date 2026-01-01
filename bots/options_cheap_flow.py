@@ -9,15 +9,20 @@ import os
 import time
 from typing import Dict
 
-from bots.options_common import OptionContract, iter_option_contracts, options_flow_allow_outside_rth
+from bots.options_common import (
+    OptionContract,
+    format_option_alert,
+    iter_option_contracts,
+    options_flow_allow_outside_rth,
+    send_option_alert,
+)
 from bots.shared import (
     DEBUG_FLOW_REASONS,
-    chart_link,
     debug_filter_reason,
     in_rth_window_est,
     resolve_options_underlying_universe,
 )
-from bots.status_report import record_bot_stats
+from bots.status_report import record_bot_stats, record_error
 
 BOT_NAME = "options_cheap_flow"
 
@@ -96,18 +101,17 @@ async def run_options_cheap_flow() -> None:
                     continue
 
                 matches += 1
-                text = (
-                    f"• Contract: {c.contract}\n"
-                    f"• Premium: ${c.premium:.2f} | Size: {c.size} | Notional: ${c.notional:,.0f}\n"
-                    f"• DTE: {c.dte if c.dte is not None else 'n/a'} | Underlying: ${c.underlying_price or 0:.2f}\n"
-                    f"• {chart_link(symbol)}"
+                alert_text = format_option_alert(
+                    emoji="💰",
+                    label="CHEAP FLOW",
+                    contract=c,
+                    chart_symbol=symbol,
                 )
                 alerts += 1
-                from bots.shared import send_alert  # local import to avoid cycles
-
-                send_alert("CHEAP FLOW", symbol, c.underlying_price or 0.0, 0.0, extra=text)
+                send_option_alert(alert_text)
         except Exception as exc:
             debug_filter_reason(BOT_NAME, symbol, f"error {exc}")
+            record_error(BOT_NAME, exc)
             continue
 
     runtime = time.perf_counter() - start

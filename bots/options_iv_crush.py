@@ -9,15 +9,20 @@ import os
 import time
 from typing import Dict
 
-from bots.options_common import OptionContract, iter_option_contracts, options_flow_allow_outside_rth
+from bots.options_common import (
+    OptionContract,
+    format_option_alert,
+    iter_option_contracts,
+    options_flow_allow_outside_rth,
+    send_option_alert,
+)
 from bots.shared import (
     DEBUG_FLOW_REASONS,
-    chart_link,
     debug_filter_reason,
     in_rth_window_est,
     resolve_options_underlying_universe,
 )
-from bots.status_report import record_bot_stats
+from bots.status_report import record_bot_stats, record_error
 
 BOT_NAME = "options_iv_crush"
 
@@ -108,19 +113,22 @@ async def run_options_iv_crush() -> None:
                     continue
 
                 matches += 1
-                from bots.shared import send_alert
-
-                text = (
-                    f"• Contract: {c.contract}\n"
-                    f"• IV: {prev_iv:.1f}% → {c.iv:.1f}% (drop {iv_drop_pct:.1f}%)\n"
-                    f"• Volume: {c.volume or 0} | DTE: {c.dte if c.dte is not None else 'n/a'}\n"
-                    f"• Underlying: ${c.underlying_price or 0:.2f}\n"
-                    f"• {chart_link(symbol)}"
+                iv_line = (
+                    f"IV: {prev_iv:.1f}% → {c.iv:.1f}% (drop {iv_drop_pct:.1f}%) | "
+                    f"Volume: {c.volume or 'n/a'} | OI: {c.open_interest or 'n/a'}"
+                )
+                alert_text = format_option_alert(
+                    emoji="🔥",
+                    label="IV CRUSH",
+                    contract=c,
+                    iv_line=iv_line,
+                    chart_symbol=symbol,
                 )
                 alerts += 1
-                send_alert("IV CRUSH", symbol, c.underlying_price or 0.0, 0.0, extra=text)
+                send_option_alert(alert_text)
         except Exception as exc:
             debug_filter_reason(BOT_NAME, symbol, f"error {exc}")
+            record_error(BOT_NAME, exc)
             continue
 
     runtime = time.perf_counter() - start
