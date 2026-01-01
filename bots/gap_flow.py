@@ -28,7 +28,7 @@ from bots.shared import (
     resolve_universe_for_bot,
     send_alert,
 )
-from bots.status_report import record_bot_stats
+from bots.status_report import record_bot_stats, record_error
 
 BOT_NAME = "gap_flow"
 
@@ -90,7 +90,7 @@ async def run_gap_flow() -> None:
     try:
         if not _allow_outside_rth and not in_rth_window_est():
             print("[gap_flow] outside RTH; skipping")
-            return
+            return record_bot_stats(BOT_NAME, 0, 0, 0, time.perf_counter() - start)
 
         universe = resolve_universe_for_bot(
             bot_name=BOT_NAME,
@@ -108,6 +108,7 @@ async def run_gap_flow() -> None:
                 daily = _fetch_daily(sym, max(_lookback_days, 30))
             except Exception as exc:
                 print(f"[gap_flow] data error for {sym}: {exc}")
+                record_error(BOT_NAME, exc)
                 continue
 
             if len(daily) < 2:
@@ -183,6 +184,9 @@ async def run_gap_flow() -> None:
 
         if DEBUG_FLOW_REASONS and alerts == 0 and matches == 0:
             print(f"[gap_flow] No alerts. Filter breakdown: {reason_counts}")
+    except Exception as exc:
+        print(f"[gap_flow] error: {exc}")
+        record_error(BOT_NAME, exc)
     finally:
         runtime = time.perf_counter() - start
         record_bot_stats(BOT_NAME, scanned, matches, alerts, runtime)

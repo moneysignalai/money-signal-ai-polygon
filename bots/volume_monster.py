@@ -27,10 +27,10 @@ from bots.shared import (
     chart_link,
     debug_filter_reason,
     in_rth_window_est,
-    send_alert,
     resolve_universe_for_bot,
+    send_alert,
 )
-from bots.status_report import record_bot_stats
+from bots.status_report import record_bot_stats, record_error
 
 BOT_NAME = "volume_monster"
 
@@ -106,7 +106,7 @@ async def run_volume_monster() -> None:
     try:
         if not _allow_outside_rth and not in_rth_window_est():
             print("[volume_monster] outside RTH; skipping")
-            return
+            return record_bot_stats(BOT_NAME, 0, 0, 0, time.perf_counter() - start)
 
         universe = resolve_universe_for_bot(
             bot_name="volume_monster",
@@ -124,6 +124,7 @@ async def run_volume_monster() -> None:
                 price, dollar_vol, rvol, move_pct, day_vol = _current_day_stats(sym)
             except Exception as exc:
                 print(f"[volume_monster] data error for {sym}: {exc}")
+                record_error("volume_monster", exc)
                 continue
 
             if price <= 0 or day_vol <= 0:
@@ -154,21 +155,23 @@ async def run_volume_monster() -> None:
 
             matches += 1
             direction = "UP" if move_pct >= 0 else "DOWN"
-            text = (
-                f"VOLUME MONSTER — {sym}\n"
+            body = (
                 f"• Last: ${price:.2f} ({move_pct:+.1f}% {direction})\n"
                 f"• Volume: {day_vol:,.0f} ({rvol:.1f}× avg)\n"
                 f"• Dollar Vol: ${dollar_vol:,.0f}\n"
                 f"• Link: {chart_link(sym, timeframe='D')}"
             )
             try:
-                send_alert(text)
+                send_alert(BOT_NAME, sym, price, rvol, extra=body)
                 alerts += 1
             except Exception as exc:  # pragma: no cover - alert failures shouldn’t crash
                 print(f"[volume_monster] alert error for {sym}: {exc}")
 
         if matches == 0 and DEBUG_FLOW_REASONS:
             print(f"[volume_monster] No alerts. Filter breakdown: {reason_counts}")
+    except Exception as exc:
+        print(f"[volume_monster] error: {exc}")
+        record_error("volume_monster", exc)
     finally:
         runtime = time.perf_counter() - start
         record_bot_stats(BOT_NAME, scanned, matches, alerts, runtime)

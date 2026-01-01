@@ -29,7 +29,7 @@ from bots.shared import (
     resolve_universe_for_bot,
     send_alert,
 )
-from bots.status_report import record_bot_stats
+from bots.status_report import record_bot_stats, record_error
 
 BOT_NAME = "trend_rider"
 
@@ -93,7 +93,7 @@ async def run_trend_rider() -> None:
     try:
         if not _allow_outside_rth and not in_rth_window_est():
             print("[trend_rider] outside RTH; skipping")
-            return
+            return record_bot_stats(BOT_NAME, 0, 0, 0, time.perf_counter() - start)
 
         universe = resolve_universe_for_bot(
             bot_name=BOT_NAME,
@@ -111,6 +111,7 @@ async def run_trend_rider() -> None:
                 daily = _fetch_daily(sym, max(_lookback_days, 60))
             except Exception as exc:
                 print(f"[trend_rider] data error for {sym}: {exc}")
+                record_error(BOT_NAME, exc)
                 continue
 
             if len(daily) < 50:
@@ -194,8 +195,7 @@ async def run_trend_rider() -> None:
                 continue
 
             matches += 1
-            text = (
-                f"TREND RIDER — {sym}\n"
+            body = (
                 f"• Last: ${close_today:.2f} (+{day_change_pct:.1f}% today)\n"
                 f"• Breakout: new {_breakout_lookback}-day high ({recent_high:.2f})\n"
                 f"• Trend: MA20 {ma20:.2f} > MA50 {ma50:.2f}\n"
@@ -203,13 +203,16 @@ async def run_trend_rider() -> None:
                 f"• Link: {chart_link(sym, timeframe='D')}"
             )
             try:
-                send_alert(text)
+                send_alert(BOT_NAME, sym, close_today, rvol, extra=body)
                 alerts += 1
             except Exception as exc:
                 print(f"[trend_rider] alert error for {sym}: {exc}")
 
         if matches == 0 and DEBUG_FLOW_REASONS:
             print(f"[trend_rider] No alerts. Filter breakdown: {reason_counts}")
+    except Exception as exc:
+        print(f"[trend_rider] error: {exc}")
+        record_error(BOT_NAME, exc)
     finally:
         runtime = time.perf_counter() - start
         record_bot_stats(BOT_NAME, scanned, matches, alerts, runtime)
