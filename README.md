@@ -295,21 +295,20 @@ SQUEEZE RADAR — GME
 
 #### Dark Pool Radar
 - **Purpose**: Highlights unusual dark-pool activity (aggregate and largest prints).
-- **Env**: uses shared MIN_VOLUME_GLOBAL / RVOL and internal dark-pool thresholds.
-- **Schedule**: RTH dark-pool window defined in code.
-- **Alert format**:
+- **Env**: `DARK_POOL_LOOKBACK_MINUTES`, `DARK_POOL_MIN_NOTIONAL`, `DARK_POOL_MIN_LARGEST_PRINT`, `DARK_POOL_MIN_PRINTS`, `DARK_POOL_MIN_DOLLAR_VOL`, `DARK_POOL_MIN_RVOL`, plus global `MIN_VOLUME_GLOBAL`/`MIN_RVOL_GLOBAL`. Uses the shared dynamic universe (top ~1,500 by volume) with `TICKER_UNIVERSE` fallback.
+- **Schedule**: RTH by default (set `DARK_POOL_ALLOW_OUTSIDE_RTH=true` to override).
+- **Alert format** (today-only window):
 ```text
-🧠 DARK_POOL — MSFT
-💰 Last: $375.20
-📊 RVOL: 1.4x
+🕳️ DARK POOL RADAR — MSFT
+01-01-2026 · 02:15 PM EST
+💰 Underlying: $375.20 · Day Move: +1.8% · RVOL: 1.4x
 ────────────
-🕒 02:15 PM EST · Jan 01
-📡 Dark pool prints (last 30 min)
-────────────
+🧊 Window: last 30 min (today only)
 📦 Prints: 42
-💰 Total Notional: ≈ $310,000,000
-🏦 Largest Print: ≈ $58,000,000
-📊 Day Move: 1.8% · Dollar Vol: ≈ $8,200,000,000
+💵 Dark Pool Notional (window): ≈ $310,000,000
+🐋 Largest Print: ≈ $58,000,000 @ $373.25
+📊 Dark Pool vs Full-Day Volume: 12.4% of today’s $ volume
+🔍 Context: Cluster of large mid-day blocks below VWAP; watch for accumulation.
 🔗 Chart: https://www.tradingview.com/chart/?symbol=MSFT
 ```
 
