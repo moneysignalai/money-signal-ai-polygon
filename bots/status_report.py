@@ -29,7 +29,7 @@ TELEGRAM_TOKEN_STATUS = os.getenv("TELEGRAM_TOKEN_STATUS")
 TELEGRAM_TOKEN_ALERTS = os.getenv("TELEGRAM_TOKEN_ALERTS")
 _TELEGRAM_STATUS_TOKEN = TELEGRAM_TOKEN_STATUS or TELEGRAM_TOKEN_ALERTS
 
-# Primary bots shown in the heartbeat (options_indicator is excluded by design)
+# Primary bots shown in the heartbeat
 BOT_DISPLAY_ORDER: List[str] = [
     "premarket",
     "volume_monster",
@@ -44,6 +44,7 @@ BOT_DISPLAY_ORDER: List[str] = [
     "options_unusual_flow",
     "options_whales",
     "options_iv_crush",
+    "options_indicator",
     "squeeze",
     "earnings",
     "dark_pool_radar",

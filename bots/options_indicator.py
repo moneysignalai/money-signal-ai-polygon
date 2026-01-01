@@ -39,11 +39,13 @@ from bots.shared import (
     MIN_RVOL_GLOBAL,
     MIN_VOLUME_GLOBAL,
     chart_link,
+    format_est_timestamp,
     in_rth_window_est,
     is_etf_blacklisted,
-    now_est,
+    now_est_dt,
     resolve_options_underlying_universe,
-    send_alert,
+    send_alert_text,
+    today_est_date,
 )
 from bots.status_report import record_bot_stats
 
@@ -249,7 +251,7 @@ def _calc_iv_rank_and_oi(sym: str, spot: float) -> Tuple[Optional[float], int, i
     if not isinstance(opts, list) or not opts:
         return None, 0, 0
 
-    today = date.today()
+    today = today_est_date()
     iv_values: List[float] = []
     atm_candidates: List[Tuple[float, float, int]] = []  # (abs_moneyness, iv, oi)
     total_oi = 0
@@ -468,6 +470,7 @@ async def run_options_indicator() -> None:
           – LOW_IV_REVERSAL
         …fire a single, clean alert describing the regime and indicators.
     """
+    start_dt = now_est_dt()
     start_ts = time.time()
     alerts_sent = 0
     matches: List[str] = []
@@ -487,9 +490,9 @@ async def run_options_indicator() -> None:
             print("[options_indicator] empty universe; skipping.")
             return
 
-        print(f"[options_indicator] scanning {len(universe)} symbols @ {now_est()}")
+        print(f"[options_indicator] scanning {len(universe)} symbols @ {format_est_timestamp()}")
 
-        trading_day = date.today()
+        trading_day = today_est_date()
 
         for sym in universe:
             scanned += 1
@@ -525,18 +528,22 @@ async def run_options_indicator() -> None:
                 move_pct = info["move_pct"]
                 bias_text = info["bias_text"]
 
-                timestamp = now_est()
-                if not isinstance(timestamp, str):
-                    timestamp = timestamp.strftime("%I:%M %p EST · %b %d").lstrip("0")
+                timestamp = format_est_timestamp()
 
                 if regime == "HIGH_IV_MOMENTUM":
                     header_emoji = "📈"
                     header_text = "HIGH-IV MOMENTUM"
+                    bias_label = "Bullish momentum"
                 else:
                     header_emoji = "📉"
                     header_text = "LOW-IV REVERSAL"
+                    bias_label = "Potential reversal"
 
-                extra_lines = [
+                alert_lines = [
+                    f"🧠 OPTIONS_INDICATOR — {sym}",
+                    f"💰 Last: ${close:.2f}",
+                    f"📊 RVOL: {rvol:.1f}x",
+                    "────────────",
                     f"{header_emoji} OPTIONS INDICATOR — {sym}",
                     f"🕒 {timestamp}",
                     f"💰 Underlying: ${close:.2f} · RVOL {rvol:.1f}x",
@@ -550,20 +557,18 @@ async def run_options_indicator() -> None:
                     f"📦 Options OI: total {total_oi:,} · max strike {max_oi:,}",
                     f"📊 Day Move: {move_pct:.1f}%",
                     "",
-                    f"🧠 Bias: {bias_text}",
+                    f"🧠 Bias: {bias_label} — {bias_text}",
                     f"🔗 Chart: {chart_link(sym)}",
                 ]
 
-                extra_text = "\n".join(extra_lines)
-
-                # rvol is the underlying RVOL; we surface it in status bot as usual
-                send_alert(BOT_NAME, sym, close, rvol, extra=extra_text)
+                send_alert_text("\n".join(alert_lines))
             except Exception as exc:
                 print(f"[options_indicator] error on {sym}: {exc}")
                 continue
     except Exception as exc:
         print(f"[options_indicator] unexpected error: {exc}")
     finally:
+        finished_dt = now_est_dt()
         run_seconds = time.time() - start_ts
         try:
             record_bot_stats(
@@ -572,6 +577,8 @@ async def run_options_indicator() -> None:
                 matched=len(matches),
                 alerts=alerts_sent,
                 runtime_seconds=run_seconds,
+                started_at=start_dt,
+                finished_at=finished_dt,
             )
         except Exception as e:
             print(f"[options_indicator] record_bot_stats error: {e}")
