@@ -33,7 +33,7 @@ _TELEGRAM_STATUS_TOKEN = TELEGRAM_TOKEN_STATUS or TELEGRAM_TOKEN_ALERTS
 BOT_DISPLAY_ORDER: List[str] = [
     "premarket",
     "volume_monster",
-    "gap_scanner",
+    "gap_flow",
     "swing_pullback",
     "trend_rider",
     "panic_flush",

@@ -54,7 +54,7 @@ TEST_MODE_BOTS = _parse_bot_list("TEST_MODE_BOTS")
 BOT_DEFS: List[Tuple[str, str, str, int]] = [
     ("premarket", "bots.premarket", "run_premarket", 60),
     ("volume_monster", "bots.volume_monster", "run_volume_monster", 60),
-    ("gap_scanner", "bots.gap_scanner", "run_gap_scanner", 60),
+    ("gap_flow", "bots.gap_flow", "run_gap_flow", 60),
     ("swing_pullback", "bots.swing_pullback", "run_swing_pullback", 60),
     ("panic_flush", "bots.panic_flush", "run_panic_flush", 60),
     ("momentum_reversal", "bots.momentum_reversal", "run_momentum_reversal", 60),
@@ -172,7 +172,7 @@ def _time_window_allows(name: str, module_path: str) -> Tuple[bool, str | None]:
     # RTH-only bots
     rth_bots = {
         "volume_monster",
-        "gap_scanner",
+        "gap_flow",
         "swing_pullback",
         "trend_rider",
         "panic_flush",

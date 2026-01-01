@@ -2,7 +2,7 @@
 
 All logic now lives in dedicated bots:
 • Volume Monster (bots.volume_monster)
-• Gap Scanner (bots.gap_scanner)
+• Gap Flow (bots.gap_flow)
 • Swing Pullback (bots.swing_pullback)
 
 This stub remains only for backward compatibility before the file moves to
@@ -16,5 +16,5 @@ from bots.status_report import record_bot_stats
 
 async def run_equity_flow() -> None:
     start = time.perf_counter()
-    print("[equity_flow] DEPRECATED – use Volume Monster / Gap Scanner / Swing Pullback")
+    print("[equity_flow] DEPRECATED – use Volume Monster / Gap Flow / Swing Pullback")
     record_bot_stats("equity_flow", 0, 0, 0, time.perf_counter() - start)

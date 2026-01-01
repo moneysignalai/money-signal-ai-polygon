@@ -29,7 +29,7 @@ The scheduler loads bots from the `bots/` directory (excluding the legacy `oldco
 | --- | --- | --- |
 | `premarket` | Surface pre-market movers that meet dollar volume and RVOL floors. | 60s |
 | `volume_monster` | Track extreme volume spikes with meaningful price swings. | 20s |
-| `gap_scanner` | Surface gap-up and gap-down setups with liquidity filters. | 20s |
+| `gap_flow` | Surface gap-up and gap-down setups with liquidity filters. | 20s |
 | `swing_pullback` | Find pullbacks within established uptrends. | 20s |
 | `panic_flush` | Flag capitulation-style selloffs near lows with heavy volume. | 20s |
 | `momentum_reversal` | Detect intraday reversals after strong directional moves. | 20s |
