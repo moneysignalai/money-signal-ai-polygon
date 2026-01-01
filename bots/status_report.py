@@ -32,7 +32,9 @@ _TELEGRAM_STATUS_TOKEN = TELEGRAM_TOKEN_STATUS or TELEGRAM_TOKEN_ALERTS
 # Human-friendly display order (must match bot names used in main.py / bots)
 BOT_DISPLAY_ORDER: List[str] = [
     "premarket",
-    "equity_flow",
+    "volume_monster",
+    "gap_scanner",
+    "swing_pullback",
     "intraday_flow",
     "rsi_signals",
     "opening_range_breakout",
