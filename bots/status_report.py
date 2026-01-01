@@ -29,6 +29,7 @@ TELEGRAM_TOKEN_STATUS = os.getenv("TELEGRAM_TOKEN_STATUS")
 TELEGRAM_TOKEN_ALERTS = os.getenv("TELEGRAM_TOKEN_ALERTS")
 _TELEGRAM_STATUS_TOKEN = TELEGRAM_TOKEN_STATUS or TELEGRAM_TOKEN_ALERTS
 
+# Primary bots shown in the heartbeat (options_indicator is excluded by design)
 BOT_DISPLAY_ORDER: List[str] = [
     "premarket",
     "volume_monster",
@@ -43,7 +44,6 @@ BOT_DISPLAY_ORDER: List[str] = [
     "options_unusual_flow",
     "options_whales",
     "options_iv_crush",
-    "options_indicator",
     "squeeze",
     "earnings",
     "dark_pool_radar",
@@ -54,7 +54,6 @@ DISPLAY_NAME_OVERRIDES = {
     "opening_range_breakout": "ORB",
     "rsi_signals": "RSI Signals",
     "dark_pool_radar": "Dark Pool",
-    "options_indicator": "Options Ind",
 }
 
 RUNTIME_HISTORY_MAX = 20
@@ -165,6 +164,16 @@ def _display_name(bot_name: str) -> str:
     return label.title() if label else bot_name
 
 
+def _pad_label(name: str, width: int = 18) -> str:
+    """Return a dotted label padded for alignment."""
+
+    clean = name.strip()
+    if len(clean) >= width:
+        return clean
+    dots = "…" * max(2, width - len(clean))
+    return f"{clean} {dots}"
+
+
 def _normalize_runs(entry: Any) -> List[Dict[str, Any]]:
     """Return a list of run dicts for a bot, tolerating legacy formats."""
 
@@ -263,33 +272,39 @@ def _format_heartbeat() -> str:
     lines.append(status_line)
     lines.append("")
 
+    # Bots section
     lines.append("🤖 Bots")
     for r in bot_rows:
-        display = r.display_name
-        padded = display if len(display) >= 13 else f"{display} {'…' * (13 - len(display))} "
-        status = "🟢" if r.last_run_ts > 0 else "⚪"
+        padded = _pad_label(r.display_name)
+        if r.last_run_ts == 0:
+            status = "⚪"
+            last_seen = "No run today"
+        else:
+            status = "🟢"
+            last_seen = r.last_run_str or "No run today"
+            if r.scanned == 0:
+                status = "🟠"
         if r.internal_name.lower() in error_bots:
             status = "🔴"
-        last_seen = r.last_run_str if r.last_run_ts > 0 else "No run today"
-        lines.append(f"• {padded}{status} {last_seen}")
+        lines.append(f"• {padded} {status} {last_seen}")
 
+    # Totals
     lines.append("")
     lines.append("📊 Totals")
     lines.append(f"• Scanned: {total_scanned:,} • Matches: {total_matched:,} • Alerts: {total_alerts:,}")
 
+    # Per-bot metrics
     lines.append("")
     lines.append("📈 Per Bot (scanned | matches | alerts)")
     for r in bot_rows:
-        display = r.display_name
-        padded = display if len(display) >= 13 else f"{display} {'…' * (13 - len(display))} "
-        lines.append(
-            f"• {padded}{r.scanned:,} | {r.matched:,} | {r.alerts:,}"
-        )
+        padded = _pad_label(r.display_name)
+        lines.append(f"• {padded} {r.scanned:,} | {r.matched:,} | {r.alerts:,}")
 
     high_scan_zero_alert = [r.display_name for r in bot_rows if r.scanned > 0 and r.alerts == 0]
     ran_zero_scans = [r.display_name for r in bot_rows if r.last_run_ts > 0 and r.scanned == 0]
     not_run_today = [r.display_name for r in bot_rows if r.last_run_ts == 0]
 
+    # Diagnostics
     lines.append("")
     lines.append("🛠 Diagnostics")
     lines.append(
@@ -307,12 +322,13 @@ def _format_heartbeat() -> str:
     lines.append("")
     lines.append("⏱ Runtime (today)")
     for r in bot_rows:
+        padded = _pad_label(r.display_name)
         if not r.runtime_history:
-            lines.append(f"• {r.display_name}: no runtime data yet")
+            lines.append(f"• {padded} no runtime data yet")
             continue
         med = statistics.median(r.runtime_history)
         last = r.runtime_history[-1]
-        lines.append(f"• {r.display_name}: median {med:.2f}s (last {last:.2f}s, n={len(r.runtime_history)})")
+        lines.append(f"• {padded} median {med:.2f}s (last {last:.2f}s, n={len(r.runtime_history)})")
 
     return "\n".join(lines)
 

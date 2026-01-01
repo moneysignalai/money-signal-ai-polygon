@@ -20,6 +20,7 @@ from bots.shared import (
     DEBUG_FLOW_REASONS,
     debug_filter_reason,
     in_rth_window_est,
+    now_est_dt,
     resolve_options_underlying_universe,
 )
 from bots.status_report import record_bot_stats, record_error
@@ -53,7 +54,8 @@ def _dte_in_range(contract: OptionContract) -> bool:
 
 
 async def run_options_cheap_flow() -> None:
-    start = time.perf_counter()
+    start_perf = time.perf_counter()
+    start_dt = now_est_dt()
     scanned = 0
     matches = 0
     alerts = 0
@@ -61,13 +63,17 @@ async def run_options_cheap_flow() -> None:
 
     allow_outside = options_flow_allow_outside_rth()
     if not allow_outside and not in_rth_window_est():
-        record_bot_stats(BOT_NAME, 0, 0, 0, 0.0)
+        finished = now_est_dt()
+        record_bot_stats(BOT_NAME, 0, 0, 0, 0.0, started_at=start_dt, finished_at=finished)
         return
 
     universe = await resolve_options_underlying_universe(BOT_NAME)
     print(f"[options_cheap_flow] universe_size={len(universe)}")
     if not universe:
-        record_bot_stats(BOT_NAME, 0, 0, 0, time.perf_counter() - start)
+        finished = now_est_dt()
+        record_bot_stats(
+            BOT_NAME, 0, 0, 0, time.perf_counter() - start_perf, started_at=start_dt, finished_at=finished
+        )
         return
 
     for symbol in universe:
@@ -114,8 +120,9 @@ async def run_options_cheap_flow() -> None:
             record_error(BOT_NAME, exc)
             continue
 
-    runtime = time.perf_counter() - start
+    finished = now_est_dt()
+    runtime = time.perf_counter() - start_perf
     if DEBUG_FLOW_REASONS and matches == 0:
         print(f"[options_cheap_flow] No alerts. Filter breakdown: {reason_counts}")
-    record_bot_stats(BOT_NAME, scanned, matches, alerts, runtime)
+    record_bot_stats(BOT_NAME, scanned, matches, alerts, runtime, started_at=start_dt, finished_at=finished)
 

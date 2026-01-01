@@ -6,7 +6,7 @@ snapshots so the individual option flow bots can focus on their filters.
 
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from bots.shared import (
@@ -16,6 +16,7 @@ from bots.shared import (
     get_last_option_trades_cached,
     get_option_chain_cached,
     send_alert_text,
+    today_est_date,
 )
 
 
@@ -153,6 +154,37 @@ def _option_iv(opt: Dict[str, Any]) -> Optional[float]:
     )
 
 
+def _ts_to_est(ts_raw: Any) -> Optional[datetime]:
+    """Convert trade timestamps (ns/us/ms/s) to Eastern datetime."""
+
+    if ts_raw is None:
+        return None
+    try:
+        ts_int = int(ts_raw)
+    except Exception:
+        return None
+
+    if ts_int > 1_000_000_000_000_000_000:
+        ts_seconds = ts_int / 1_000_000_000
+    elif ts_int > 1_000_000_000_000:
+        ts_seconds = ts_int / 1_000_000
+    elif ts_int > 1_000_000_000:
+        ts_seconds = ts_int / 1_000
+    else:
+        ts_seconds = float(ts_int)
+
+    try:
+        dt = datetime.fromtimestamp(ts_seconds, tz=timezone.utc)
+        return dt.astimezone(eastern)
+    except Exception:
+        return None
+
+
+def _is_trade_today(ts_raw: Any) -> bool:
+    dt = _ts_to_est(ts_raw)
+    return bool(dt and dt.date() == today_est_date())
+
+
 def iter_option_contracts(symbol: str, *, ttl_seconds: int = 60) -> List[OptionContract]:
     """Return parsed option contracts for an underlying symbol.
 
@@ -195,6 +227,12 @@ def iter_option_contracts(symbol: str, *, ttl_seconds: int = 60) -> List[OptionC
                 dte = None
 
         last_trade_obj = opt.get("last_trade") or opt.get("lastTrade") or opt.get("last") or {}
+        trade_ts = (
+            last_trade_obj.get("sip_timestamp")
+            or last_trade_obj.get("participant_timestamp")
+            or last_trade_obj.get("trf_timestamp")
+            or last_trade_obj.get("t")
+        )
         premium = _safe_float(
             last_trade_obj.get("price")
             or last_trade_obj.get("p")
@@ -204,14 +242,26 @@ def iter_option_contracts(symbol: str, *, ttl_seconds: int = 60) -> List[OptionC
         )
         size = _safe_int(last_trade_obj.get("size") or last_trade_obj.get("s") or opt.get("size"))
 
+        if trade_ts and not _is_trade_today(trade_ts):
+            # Ignore stale trades from prior sessions
+            premium = None
+            size = None
+
         if (premium is None or size is None) and contract:
             # Try last trade fallback
             try:
                 lt = get_last_option_trades_cached(contract)
                 trade = lt.get("results") if isinstance(lt, dict) else None
                 if trade:
-                    premium = premium if premium is not None else _safe_float(trade.get("price"))
-                    size = size if size is not None else _safe_int(trade.get("size") or trade.get("sip_timestamp"))
+                    ts_val = (
+                        trade.get("sip_timestamp")
+                        or trade.get("participant_timestamp")
+                        or trade.get("trf_timestamp")
+                        or trade.get("t")
+                    )
+                    if _is_trade_today(ts_val):
+                        premium = premium if premium is not None else _safe_float(trade.get("price"))
+                        size = size if size is not None else _safe_int(trade.get("size"))
             except Exception:
                 pass
 

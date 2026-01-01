@@ -20,6 +20,7 @@ from bots.shared import (
     DEBUG_FLOW_REASONS,
     debug_filter_reason,
     in_rth_window_est,
+    now_est_dt,
     resolve_options_underlying_universe,
 )
 from bots.status_report import record_bot_stats, record_error
@@ -54,20 +55,25 @@ def _save_iv_cache(cache: Dict[str, float]) -> None:
 
 
 async def run_options_iv_crush() -> None:
-    start = time.perf_counter()
+    start_perf = time.perf_counter()
+    start_dt = now_est_dt()
     scanned = 0
     matches = 0
     alerts = 0
     reason_counts: Dict[str, int] = {}
 
     if not options_flow_allow_outside_rth() and not in_rth_window_est():
-        record_bot_stats(BOT_NAME, 0, 0, 0, 0.0)
+        finished = now_est_dt()
+        record_bot_stats(BOT_NAME, 0, 0, 0, 0.0, started_at=start_dt, finished_at=finished)
         return
 
     universe = await resolve_options_underlying_universe(BOT_NAME)
     print(f"[options_iv_crush] universe_size={len(universe)}")
     if not universe:
-        record_bot_stats(BOT_NAME, 0, 0, 0, time.perf_counter() - start)
+        finished = now_est_dt()
+        record_bot_stats(
+            BOT_NAME, 0, 0, 0, time.perf_counter() - start_perf, started_at=start_dt, finished_at=finished
+        )
         return
 
     iv_cache = _load_iv_cache()
@@ -131,9 +137,10 @@ async def run_options_iv_crush() -> None:
             record_error(BOT_NAME, exc)
             continue
 
-    runtime = time.perf_counter() - start
+    finished = now_est_dt()
+    runtime = time.perf_counter() - start_perf
     _save_iv_cache(updated_cache)
     if DEBUG_FLOW_REASONS and matches == 0:
         print(f"[options_iv_crush] No alerts. Filter breakdown: {reason_counts}")
-    record_bot_stats(BOT_NAME, scanned, matches, alerts, runtime)
+    record_bot_stats(BOT_NAME, scanned, matches, alerts, runtime, started_at=start_dt, finished_at=finished)
 
