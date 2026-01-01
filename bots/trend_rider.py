@@ -25,9 +25,10 @@ from bots.shared import (
     POLYGON_KEY,
     chart_link,
     debug_filter_reason,
+    format_est_timestamp,
     in_rth_window_est,
     resolve_universe_for_bot,
-    send_alert,
+    send_alert_text,
 )
 from bots.status_report import record_bot_stats, record_error
 
@@ -122,13 +123,17 @@ async def run_trend_rider() -> None:
                 ) + 1
                 continue
 
-            closes = []
-            highs = []
-            volumes = []
+            opens: list[float] = []
+            highs: list[float] = []
+            lows: list[float] = []
+            closes: list[float] = []
+            volumes: list[float] = []
             for bar in daily:
-                _, h, _, c, v = _extract_ohlcv(bar)
+                o, h, l, c, v = _extract_ohlcv(bar)
                 if c > 0 and v > 0:
+                    opens.append(o)
                     closes.append(c)
+                    lows.append(l)
                     highs.append(h)
                     volumes.append(v)
 
@@ -136,6 +141,10 @@ async def run_trend_rider() -> None:
                 continue
 
             close_today = closes[-1]
+            open_today = opens[-1] if opens else 0.0
+            high_today = highs[-1] if highs else 0.0
+            low_today = lows[-1] if lows else 0.0
+            prev_low = lows[-2] if len(lows) >= 2 else 0.0
             volume_today = volumes[-1]
             ma20 = _moving_average(closes, 20)
             ma50 = _moving_average(closes, 50)
@@ -195,18 +204,85 @@ async def run_trend_rider() -> None:
                 continue
 
             matches += 1
-            body = (
-                f"• Last: ${close_today:.2f} (+{day_change_pct:.1f}% today)\n"
-                f"• Breakout: new {_breakout_lookback}-day high ({recent_high:.2f})\n"
-                f"• Trend: MA20 {ma20:.2f} > MA50 {ma50:.2f}\n"
-                f"• Volume: {rvol:.1f}× avg — Dollar Vol ${dollar_vol:,.0f}\n"
-                f"• Link: {chart_link(sym, timeframe='D')}"
+            hod_gap_pct = (
+                ((high_today - close_today) / high_today * 100) if high_today > 0 else None
             )
+            breakout_diff_pct = (
+                ((close_today - recent_high) / recent_high * 100) if recent_high > 0 else 0.0
+            )
+
+            trend_descriptor = "healthy uptrend" if ma20 > ma50 else "trend mixed"
+
+            rvol_text = f"{rvol:.1f}×" if rvol > 0 else "N/A"
+            volume_text = f"{volume_today:,.0f}" if volume_today > 0 else "N/A"
+            dollar_text = f"${dollar_vol:,.0f}" if dollar_vol > 0 else "N/A"
+
+            hod_clause = (
+                f", {hod_gap_pct:.1f}% below HOD" if hod_gap_pct is not None else ""
+            )
+
+            breakout_line = (
+                f"• Breakout: new {_breakout_lookback}-day high at ${recent_high:,.2f} "
+                f"({breakout_diff_pct:+.1f}% above breakout level)"
+            )
+
+            trend_line = (
+                f"• Trend: MA20 ${ma20:,.2f} > MA50 ${ma50:,.2f} ({trend_descriptor})"
+            )
+
+            support_value = None
+            support_label = None
+            support_candidates = []
+            if prev_low > 0:
+                support_candidates.append((prev_low, "yesterday's low"))
+            if ma20 > 0:
+                support_candidates.append((ma20, "MA20"))
+            if support_candidates:
+                support_value, support_label = min(
+                    support_candidates, key=lambda item: abs(close_today - item[0])
+                )
+
+            resistance_value = high_today if high_today > 0 else recent_high
+
+            ts_str = format_est_timestamp()
+            header = f"🚀 TREND RIDER — {sym} ({ts_str})"
+
+            last_line = f"• Last: ${close_today:,.2f} (+{day_change_pct:.1f}% today{hod_clause})"
+            if open_today > 0 and high_today > 0 and low_today > 0:
+                last_line += (
+                    f" (O: ${open_today:,.2f}, H: ${high_today:,.2f}, L: ${low_today:,.2f})"
+                )
+
+            lines = [
+                header,
+                "────────────",
+                last_line,
+                breakout_line,
+                trend_line,
+                f"• Volume: {rvol_text} avg — {volume_text} shares · Dollar Vol ≈ {dollar_text}",
+                "• Context: Strong momentum continuation in established uptrend",
+                "• Bias: Swing LONG (2–10 day idea)",
+                "• Reference levels:",
+            ]
+
+            if support_value is not None:
+                lines.append(
+                    f"  - Support zone (near-term): ${support_value:,.2f} (based on {support_label})"
+                )
+            if resistance_value:
+                lines.append(
+                    f"  - Resistance zone: ${resistance_value:,.2f} (today's high / recent high)"
+                )
+
+            lines.append(f"• Chart: {chart_link(sym, timeframe='D')}")
+
+            alert_text = "\n".join(lines)
             try:
-                send_alert(BOT_NAME, sym, close_today, rvol, extra=body)
+                send_alert_text(alert_text)
                 alerts += 1
             except Exception as exc:
                 print(f"[trend_rider] alert error for {sym}: {exc}")
+                record_error(BOT_NAME, exc)
 
         if matches == 0 and DEBUG_FLOW_REASONS:
             print(f"[trend_rider] No alerts. Filter breakdown: {reason_counts}")
