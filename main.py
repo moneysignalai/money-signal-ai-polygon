@@ -58,6 +58,7 @@ BOT_DEFS: List[Tuple[str, str, str, int]] = [
     ("swing_pullback", "bots.swing_pullback", "run_swing_pullback", 60),
     ("panic_flush", "bots.panic_flush", "run_panic_flush", 60),
     ("momentum_reversal", "bots.momentum_reversal", "run_momentum_reversal", 60),
+    ("trend_rider", "bots.trend_rider", "run_trend_rider", 60),
     ("rsi_signals", "bots.rsi_signals", "run_rsi_signals", 60),
     (
         "opening_range_breakout",
@@ -69,7 +70,6 @@ BOT_DEFS: List[Tuple[str, str, str, int]] = [
     ("options_indicator", "bots.options_indicator", "run_options_indicator", 60),
     ("squeeze", "bots.squeeze", "run_squeeze", 60),
     ("dark_pool_radar", "bots.dark_pool_radar", "run_dark_pool_radar", 60),
-    ("trend_flow", "bots.trend_flow", "run_trend_flow", 60),
     ("earnings", "bots.earnings", "run_earnings", 300),
     ("daily_ideas", "bots.daily_ideas", "run_daily_ideas", 900),
     ("status_report", "bots.status_report", "run_status", int(STATUS_HEARTBEAT_INTERVAL_MIN * 60)),
@@ -171,13 +171,13 @@ def _time_window_allows(name: str, module_path: str) -> Tuple[bool, str | None]:
         "volume_monster",
         "gap_scanner",
         "swing_pullback",
+        "trend_rider",
         "panic_flush",
         "momentum_reversal",
         "rsi_signals",
         "options_flow",
         "options_indicator",
         "squeeze",
-        "trend_flow",
         "dark_pool_radar",
     }
 

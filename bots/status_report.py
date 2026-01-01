@@ -35,6 +35,7 @@ BOT_DISPLAY_ORDER: List[str] = [
     "volume_monster",
     "gap_scanner",
     "swing_pullback",
+    "trend_rider",
     "panic_flush",
     "momentum_reversal",
     "rsi_signals",
@@ -43,7 +44,6 @@ BOT_DISPLAY_ORDER: List[str] = [
     "options_indicator",
     "squeeze",
     "earnings",
-    "trend_flow",
     "dark_pool_radar",
     "daily_ideas",
 ]

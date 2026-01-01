@@ -38,7 +38,7 @@ The scheduler loads bots from the `bots/` directory (excluding the legacy `oldco
 | `options_indicator` | Compute option-related indicators and alerts. | 60s |
 | `squeeze` | Flag potential squeeze setups using option flow thresholds. | 60s |
 | `rsi_signals` | Generate RSI-based signals across the dynamic universe. | 20s |
-| `trend_flow` | Look for trend-aligned flow with relative-volume checks. | 60s |
+| `trend_rider` | Breakout continuation setups in strong uptrends. | 60s |
 | `earnings` | Surface upcoming earnings names with activity context. | 300s |
 | `dark_pool_radar` | Summarize dark pool / ATS clusters. | 60s |
 | `daily_ideas` | Produce slower-cadence daily idea summaries. | 600s |

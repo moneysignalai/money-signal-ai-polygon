@@ -120,7 +120,6 @@ async def run_swing_pullback() -> None:
         )
         print(f"[swing_pullback] universe_size={len(universe)}")
         if not universe:
-            record_bot_stats(BOT_NAME, 0, 0, 0, 0.0)
             return
 
         for sym in universe:
