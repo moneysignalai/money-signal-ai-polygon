@@ -158,6 +158,14 @@ def _send_telegram_status(text: str) -> None:
 # ----------------- NORMALIZATION -----------------
 
 
+DISPLAY_NAME_OVERRIDES = {
+    "opening_range_breakout": "ORB",
+    "rsi_signals": "RSI Signals",
+    "dark_pool_radar": "Dark Pool",
+    "options_indicator": "Options Ind",
+}
+
+
 def _display_name(bot_name: str) -> str:
     if bot_name in DISPLAY_NAME_OVERRIDES:
         return DISPLAY_NAME_OVERRIDES[bot_name]
@@ -231,6 +239,23 @@ def _aggregate_today(bot_name: str, entry: Any, today_iso: str) -> BotRow:
 
 
 # ----------------- HEARTBEAT FORMAT -----------------
+
+
+def _pad_label(label: str, width: int = 13) -> str:
+    """Pad a label with ellipsis characters to align columns."""
+    if len(label) >= width:
+        return label + " "
+    fill = "…" * (width - len(label))
+    return f"{label} {fill} "
+
+
+def _short_time(ts: str) -> str:
+    """Return the HH:MM AM/PM part from a human-friendly timestamp string."""
+    if not ts:
+        return ts
+    if "·" in ts:
+        return ts.split("·", 1)[0].strip()
+    return ts
 
 
 def _format_heartbeat() -> str:
