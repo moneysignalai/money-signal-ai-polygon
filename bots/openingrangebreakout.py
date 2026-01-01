@@ -32,11 +32,32 @@ from bots.shared import (
     now_est,
     today_est_date,
     minutes_since_midnight_est,
+    in_rth_window_est,
     is_etf_blacklisted,
 )
 from bots.status_report import record_bot_stats
 
 eastern = pytz.timezone("US/Eastern")
+
+
+def should_run_now() -> tuple[bool, str | None]:
+    """Expose RTH + opening-window gating to the scheduler."""
+
+    allow_outside = os.getenv("ORB_ALLOW_OUTSIDE_RTH", "false").lower() == "true"
+    if allow_outside:
+        return True, None
+
+    if not in_rth_window_est():
+        return False, "outside RTH window"
+
+    try:
+        window_minutes = int(os.getenv("ORB_RANGE_MINUTES", "15"))
+    except Exception:
+        window_minutes = 15
+
+    if in_rth_window_est(0, window_minutes):
+        return True, None
+    return False, "outside ORB opening window"
 
 _client: Optional[RESTClient] = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
@@ -323,14 +344,17 @@ async def run_opening_range_breakout() -> None:
         • RVOL + dollar-volume + price filters
     - Adds FVG context into the alert for extra confluence.
     """
+    print("[opening_range_breakout] start")
     _reset_day()
 
     if not POLYGON_KEY or not _client:
         print("[opening_range_breakout] missing POLYGON_KEY or client; skipping.")
+        record_bot_stats(BOT_NAME, 0, 0, 0, 0.0)
         return
 
     if not _in_orb_window():
         print("[opening_range_breakout] outside ORB scan window; skipping.")
+        record_bot_stats(BOT_NAME, 0, 0, 0, 0.0)
         return
 
     BOT_NAME = "opening_range_breakout"
@@ -469,7 +493,7 @@ async def run_opening_range_breakout() -> None:
             scanned=len(universe),
             matched=len(matched_syms),
             alerts=alerts_sent,
-            runtime=runtime,
+            runtime_seconds=runtime,
         )
     except Exception as e:
         print(f"[opening_range_breakout] record_bot_stats error: {e}")

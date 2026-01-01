@@ -29,7 +29,7 @@ from bots.shared import (
     POLYGON_KEY,
     MIN_RVOL_GLOBAL,
     MIN_VOLUME_GLOBAL,
-    get_dynamic_top_volume_universe,
+    resolve_universe_for_bot,
     get_option_chain_cached,
     send_alert,
     chart_link,
@@ -42,13 +42,18 @@ from bots.status_report import record_bot_stats
 
 eastern = pytz.timezone("US/Eastern")
 
+BOT_NAME = "daily_ideas"
+
 _client: Optional[RESTClient] = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
 # -------- ENV CONFIG --------
 
 DAILY_IDEAS_MIN_PRICE = float(os.getenv("DAILY_IDEAS_MIN_PRICE", "5.0"))
 DAILY_IDEAS_MIN_DOLLAR_VOL = float(os.getenv("DAILY_IDEAS_MIN_DOLLAR_VOL", "200000"))
-DAILY_IDEAS_MAX_UNIVERSE = int(os.getenv("DAILY_IDEAS_MAX_UNIVERSE", "80"))
+DEFAULT_MAX_UNIVERSE = int(os.getenv("DYNAMIC_MAX_TICKERS", "2000"))
+DAILY_IDEAS_MAX_UNIVERSE = int(
+    os.getenv("DAILY_IDEAS_MAX_UNIVERSE", str(DEFAULT_MAX_UNIVERSE))
+)
 
 DAILY_IDEAS_MIN_SCORE = int(os.getenv("DAILY_IDEAS_MIN_SCORE", "3"))
 DAILY_IDEAS_TOP_N = int(os.getenv("DAILY_IDEAS_TOP_N", "5"))
@@ -63,6 +68,10 @@ AM_SLOT_START = 10 * 60 + 45  # 10:45
 AM_SLOT_END   = 11 * 60 + 0   # 11:00
 PM_SLOT_START = 15 * 60 + 15  # 15:15
 PM_SLOT_END   = 15 * 60 + 30  # 15:30
+
+DAILY_IDEAS_ALLOW_OUTSIDE_WINDOW = (
+    os.getenv("DAILY_IDEAS_ALLOW_OUTSIDE_WINDOW", "false").lower() == "true"
+)
 
 # Track which slots have already run for the day
 _last_run_day: Optional[date] = None
@@ -87,6 +96,15 @@ def _current_slot() -> Optional[str]:
     if PM_SLOT_START <= mins <= PM_SLOT_END:
         return "pm"
     return None
+
+
+def should_run_now() -> tuple[bool, str | None]:
+    if DAILY_IDEAS_ALLOW_OUTSIDE_WINDOW:
+        return True, None
+    slot = _current_slot()
+    if slot:
+        return True, None
+    return False, "outside daily idea window"
 
 
 def _safe_float(x: Any) -> Optional[float]:
@@ -432,26 +450,32 @@ async def run_daily_ideas() -> None:
     """
     Build confluence-based daily idea lists (LONG and SHORT).
     """
+    print("[daily_ideas] start")
     _reset_slots_if_new_day()
 
     slot = _current_slot()
     global _ran_am, _ran_pm
 
-    if slot is None:
+    if slot is None and not DAILY_IDEAS_ALLOW_OUTSIDE_WINDOW:
         print("[daily_ideas] outside idea windows; skipping.")
+        record_bot_stats(BOT_NAME, 0, 0, 0, 0.0)
         return
+    if slot is None and DAILY_IDEAS_ALLOW_OUTSIDE_WINDOW:
+        slot = "override"
     if slot == "am" and _ran_am:
         print("[daily_ideas] AM slot already ran; skipping.")
+        record_bot_stats(BOT_NAME, 0, 0, 0, 0.0)
         return
     if slot == "pm" and _ran_pm:
         print("[daily_ideas] PM slot already ran; skipping.")
+        record_bot_stats(BOT_NAME, 0, 0, 0, 0.0)
         return
 
     if not POLYGON_KEY or not _client:
         print("[daily_ideas] missing POLYGON_KEY or client; skipping.")
+        record_bot_stats(BOT_NAME, 0, 0, 0, 0.0)
         return
 
-    BOT_NAME = "daily_ideas"
     start_ts = time.time()
     alerts_sent = 0
     scanned = 0
@@ -460,15 +484,19 @@ async def run_daily_ideas() -> None:
     trading_day = today_est_date()
     now_str = now_est()
 
-    universe = get_dynamic_top_volume_universe(
-        max_tickers=DAILY_IDEAS_MAX_UNIVERSE,
-        volume_coverage=0.90,
+    universe = resolve_universe_for_bot(
+        bot_name="daily_ideas",
+        bot_env_var="DAILY_IDEAS_TICKER_UNIVERSE",
+        max_universe_env="DAILY_IDEAS_MAX_UNIVERSE",
+        default_max_universe=DEFAULT_MAX_UNIVERSE,
+        apply_dynamic_filters=True,
     )
     if not universe:
         print("[daily_ideas] empty universe; skipping.")
+        record_bot_stats(BOT_NAME, 0, 0, 0, 0.0)
         return
 
-    print(f"[daily_ideas] scanning {len(universe)} symbols")
+    print(f"[daily_ideas] start slot={slot} universe_size={len(universe)}")
 
     long_ideas: List[Dict[str, Any]] = []
     short_ideas: List[Dict[str, Any]] = []
@@ -670,11 +698,11 @@ async def run_daily_ideas() -> None:
     runtime = time.time() - start_ts
     try:
         record_bot_stats(
-            "daily_ideas",
+            BOT_NAME,
             scanned=scanned,
             matched=matched,
             alerts=alerts_sent,
-            runtime=runtime,
+            runtime_seconds=runtime,
         )
     except Exception as e:
         print(f"[daily_ideas] record_bot_stats error: {e}")

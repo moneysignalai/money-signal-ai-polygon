@@ -16,7 +16,7 @@ from polygon import RESTClient
 
 from bots.shared import (
     POLYGON_KEY,
-    get_dynamic_top_volume_universe,
+    resolve_universe_for_bot,
     is_etf_blacklisted,
     minutes_since_midnight_est,
     send_alert,
@@ -32,7 +32,8 @@ _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
 RSI_MIN_PRICE = float(os.getenv("RSI_MIN_PRICE", "5.0"))
 RSI_MIN_DOLLAR_VOL = float(os.getenv("RSI_MIN_DOLLAR_VOL", "200000"))
-RSI_MAX_UNIVERSE = int(os.getenv("RSI_MAX_UNIVERSE", "120"))
+DEFAULT_MAX_UNIVERSE = int(os.getenv("DYNAMIC_MAX_TICKERS", "2000"))
+RSI_MAX_UNIVERSE = int(os.getenv("RSI_MAX_UNIVERSE", str(DEFAULT_MAX_UNIVERSE)))
 
 RSI_TIMEFRAME_MIN = int(os.getenv("RSI_TIMEFRAME_MIN", "5"))  # 5-min candles
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
@@ -62,16 +63,6 @@ def _reset_if_new_day() -> None:
 def _in_intraday_window() -> bool:
     mins = minutes_since_midnight_est()
     return INTRADAY_START_MIN <= mins <= INTRADAY_END_MIN
-
-
-def _resolve_universe() -> List[str]:
-    """
-    Use dynamic top-volume universe so we focus on stuff actually trading.
-    """
-    return get_dynamic_top_volume_universe(
-        max_tickers=RSI_MAX_UNIVERSE,
-        volume_coverage=0.90,
-    )
 
 
 def _fetch_intraday_bars(sym: str, minutes: int) -> List[Dict[str, Any]]:
@@ -198,7 +189,14 @@ async def run_rsi_signals():
     alerts_sent = 0
     matched_syms: set[str] = set()
 
-    universe = _resolve_universe()
+    universe = resolve_universe_for_bot(
+        bot_name="rsi_signals",
+        bot_env_var="RSI_TICKER_UNIVERSE",
+        max_universe_env="RSI_MAX_UNIVERSE",
+        default_max_universe=DEFAULT_MAX_UNIVERSE,
+        apply_dynamic_filters=True,
+        volume_coverage_env="DYNAMIC_VOLUME_COVERAGE",
+    )
     if not universe:
         print("[rsi_signals] empty universe; skipping.")
         return
@@ -295,7 +293,7 @@ async def run_rsi_signals():
             scanned=len(universe),
             matched=len(matched_syms),
             alerts=alerts_sent,
-            runtime=run_seconds,
+            runtime_seconds=run_seconds,
         )
     except Exception as e:
         print(f"[rsi_signals] record_bot_stats error: {e}")
