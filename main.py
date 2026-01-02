@@ -163,8 +163,8 @@ def _time_window_allows(name: str, module_path: str) -> Tuple[bool, str | None]:
 
     lname = name.lower()
 
-    # Trading-day guard (Mon–Fri only)
-    if not is_trading_day_est():
+    # Trading-day guard (Mon–Fri only); allow status_report to always run
+    if lname != "status_report" and not is_trading_day_est():
         return False, "non-trading day"
 
     # RTH-only bots
@@ -257,11 +257,15 @@ async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS):
 
     try:
         from bots.status_report import record_error
+        from bots.shared import record_bot_stats, today_est_date
     except Exception as e:
-        print(f"[main] WARNING: could not import bots.status_report: {e}")
+        print(f"[main] WARNING: could not import status helpers: {e}")
         record_error = None  # type: ignore
+        record_bot_stats = None  # type: ignore
+        today_est_date = None  # type: ignore
 
     next_run_ts: Dict[str, float] = {name: 0.0 for name, _, _, _ in BOTS}
+    last_skip_day: Dict[str, str] = {}
 
     while True:
         cycle_start_ts = time.time()
@@ -281,6 +285,22 @@ async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS):
                     f"[scheduler] bot={name} action=SKIPPED_TIME_WINDOW "
                     f"reason={reason or 'time window closed'}"
                 )
+                # Record a zero-scan skip once per trading day so status doesn't show "no run"
+                if record_bot_stats and today_est_date:
+                    day_key = today_est_date().isoformat()
+                    last_key = last_skip_day.get(name)
+                    if last_key != day_key:
+                        try:
+                            record_bot_stats(
+                                name,
+                                scanned=0,
+                                matched=0,
+                                alerts=0,
+                                runtime_seconds=0.0,
+                            )
+                            last_skip_day[name] = day_key
+                        except Exception as exc:
+                            print(f"[scheduler] warning recording skip stats for {name}: {exc}")
                 next_run_ts[name] = cycle_start_ts + interval
                 continue
 

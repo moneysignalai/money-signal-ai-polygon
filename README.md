@@ -67,7 +67,7 @@ Real template examples mirroring current code output. Timestamps are EST, date f
 ### Premarket Scanner
 ```
 📣 PREMARKET — MDB
-🕒 09:05 AM EST · 01-01-2026
+🕒 09:05 AM EST · Jan 01
 💰 $382.40 · 📊 RVOL 1.8x
 ────────────
 🚀 Premarket move: +4.7% vs prior close
@@ -80,12 +80,13 @@ Real template examples mirroring current code output. Timestamps are EST, date f
 
 ### Volume Monster
 ```
-💥 VOLUME MONSTER — AXSM
-🕒 02:53 PM EST · 01-01-2026
+🧠 VOLUME MONSTER — AXSM
+🕒 01-01-2026 · 02:53 PM EST
 
 💰 Price + Move
 • Last: $182.64 (+22.8% UP)
-• O $158.49 · H $184.40 · L $158.49 · Last $182.64
+• Day Change vs Prev Close: +22.8%
+• O $158.49 · H $184.40 · L $158.49 · C $182.64
 
 📊 Liquidity Snapshot
 • Volume: 3,059,410
@@ -93,7 +94,7 @@ Real template examples mirroring current code output. Timestamps are EST, date f
 • Dollar Vol: $558,770,642
 
 🧠 Read
-Extreme participation vs normal — big money is very active here.
+Extreme participation vs normal. This is where big money is very active right now.
 
 🔗 Chart
 https://www.tradingview.com/chart/?symbol=AXSM
@@ -101,11 +102,12 @@ https://www.tradingview.com/chart/?symbol=AXSM
 
 ### Gap Flow (Gap Up / Gap Down)
 ```
-📈 GAP FLOW — AXSM
-🕒 09:58 AM EST · 01-01-2026
+🧠 GAP FLOW — AXSM
+🕒 01-01-2026 · 09:58 AM EST
 
 💰 Gap Stats
-• Gap: +6.5% vs prior close
+• Gap: +6.5% vs prior close (Gap Up 🔼)
+• Day Move: +6.5% vs prior close
 • O $158.49 · H $184.40 · L $158.49 · Last $182.64
 
 📊 Liquidity
@@ -115,7 +117,7 @@ https://www.tradingview.com/chart/?symbol=AXSM
 
 📈 Continuation Context
 • Holding above VWAP: YES
-• Holding >60% of gap range
+• Holding >60% of gap range: YES
 • Direction: Bullish continuation gap
 
 🧠 Read
@@ -152,7 +154,7 @@ https://www.tradingview.com/chart/?symbol=NVDA
 ### Swing Pullback
 ```
 🎯 SWING PULLBACK — LULU
-🕒 11:40 AM EST · 01-01-2026
+🕒 01-01-2026 · 11:40 AM EST
 
 💰 Price Snapshot
 • Last: $420.15 (-4.1% from recent high)
@@ -174,7 +176,7 @@ https://www.tradingview.com/chart/?symbol=LULU
 ### Panic Flush
 ```
 ⚠️ PANIC FLUSH — AAPL
-🕒 01:45 PM EST · 01-01-2026
+🕒 01-01-2026 · 01:45 PM EST
 
 💰 Price + Damage
 • Last: $182.10 (-4.8% today)
@@ -200,7 +202,7 @@ https://www.tradingview.com/chart/?symbol=AAPL
 ### Momentum Reversal (Bullish example)
 ```
 🔄 MOMENTUM REVERSAL — TSLA
-🕒 02:10 PM EST · 01-01-2026
+🕒 01-01-2026 · 02:10 PM EST
 
 💰 Price Path
 • Last: $226.40 (-1.2% today, from -5.0% low)
@@ -264,7 +266,7 @@ https://www.tradingview.com/chart/?symbol=LLY
 ### Opening Range Breakout (Long)
 ```
 ⚡️ OPENING RANGE BREAKOUT — NVDA
-🕒 09:47 AM EST · 01-01-2026
+🕒 01-01-2026 · 09:47 AM EST
 ────────────
 🚀 LONG Breakout Above Opening Range High
 💰 Last: $522.30 (+3.4% vs prior close)
@@ -292,7 +294,7 @@ https://www.tradingview.com/chart/?symbol=NVDA
 ### Squeeze Bot
 ```
 🧨 SQUEEZE BREAKOUT — SHOP
-🕒 01:20 PM EST · 01-01-2026
+🕒 01-01-2026 · 01:20 PM EST
 
 💰 Price Snapshot
 • Last: $82.40 (+2.9% today)
@@ -318,7 +320,7 @@ https://www.tradingview.com/chart/?symbol=SHOP
 ### Dark Pool Radar
 ```
 🕳️ DARK POOL RADAR — AAPL
-🕒 02:15 PM EST · 01-01-2026
+🕒 01-01-2026 · 02:15 PM EST
 💰 Underlying: $182.40 · Day Move: -1.4% · RVOL: 1.3×
 ────────────
 🧊 Window: last 30 min (today only)
@@ -333,7 +335,7 @@ https://www.tradingview.com/chart/?symbol=SHOP
 ### Earnings Scanner
 ```
 📅 EARNINGS RADAR — NFLX
-🕒 03:00 PM EST · 01-01-2026
+🕒 01-01-2026 · 03:00 PM EST
 ────────────
 • Earnings Date: 01-05-2026 (after close)
 • Price: $502.10 (+1.2%)
@@ -345,7 +347,7 @@ https://www.tradingview.com/chart/?symbol=SHOP
 ### Daily Ideas (Longs / Shorts)
 ```
 💡 DAILY IDEAS — LONGS
-🕒 10:52 AM EST · 01-01-2026
+🕒 01-01-2026 · 10:52 AM EST
 ────────────
 Top LONG ideas (ranked by confluence score):
 
@@ -365,11 +367,11 @@ All options alerts were fully redesigned for readability: parsed contracts, EST 
 ### Options Cheap Flow (💰)
 ```
 💰 CHEAP FLOW — QID
-🕒 02:25 PM EST · 01-01-2026
+🕒 01-01-2026 · 02:25 PM EST
 💵 Underlying: $18.42 (+2.1% today)
 ────────────
 🎯 Order: 250x 01-16-2026 19C (Strike $19.00)
-⏳ DTE: 15
+⏳ Tenor: 15 DTE
 💸 Premium per contract: $0.18 (below CHEAP_MAX_PREMIUM=$0.80)
 💰 Total Notional: $4,500 (meets CHEAP_MIN_NOTIONAL; size meets CHEAP_MIN_SIZE)
 📊 Structure: near-dated · OTM call · sized at 250 contracts
@@ -381,7 +383,7 @@ All options alerts were fully redesigned for readability: parsed contracts, EST 
 ### Options Unusual Flow (⚠️)
 ```
 ⚠️ UNUSUAL FLOW — TSLA
-🕒 02:20 PM EST · 01-01-2026
+🕒 01-01-2026 · 02:20 PM EST
 💰 Underlying: $252.40 (+3.1% today) · RVOL 4.5×
 ────────────
 🎯 Order: 75x 01-16-2026 260C (Strike $260.00)
@@ -398,7 +400,7 @@ All options alerts were fully redesigned for readability: parsed contracts, EST 
 ### Options Whale Flow (🐳)
 ```
 🐳 WHALE FLOW — BDX
-🕒 02:21 PM EST · 01-01-2026
+🕒 01-01-2026 · 02:21 PM EST
 💰 Underlying: $245.32 (+1.8% today) · RVOL 2.4×
 ────────────
 📦 Order: 100x 01-16-2026 130C (Strike $130.00) (⏳ 15 DTE)
@@ -412,7 +414,7 @@ All options alerts were fully redesigned for readability: parsed contracts, EST 
 ### Options IV Crush (🔥)
 ```
 🔥 IV CRUSH — AMD
-🕒 09:45 AM EST · 01-02-2026
+🕒 01-02-2026 · 09:45 AM EST
 💰 Underlying: $112.10 (-6.2% today)
 ────────────
 🎯 Contract: 150x 01-17-2026 115C (Strike $115.00)
@@ -429,7 +431,7 @@ All options alerts were fully redesigned for readability: parsed contracts, EST 
 ### Options Indicator (Analytics)
 ```
 🧠 OPTIONS_INDICATOR — SPY
-🕒 02:52 PM EST · 01-01-2026
+🕒 01-01-2026 · 02:52 PM EST
 💰 Underlying: $475.10 · RVOL 1.3×
 ────────────
 🎯 Regime: HIGH-IV MOMENTUM

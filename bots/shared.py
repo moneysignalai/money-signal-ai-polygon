@@ -312,10 +312,17 @@ def _load_stats_file() -> Dict[str, Any]:
 
 
 def _save_stats_file(data: Dict[str, Any]) -> None:
-    """Internal helper: save the JSON stats file, swallowing errors."""
+    """Internal helper: save the JSON stats file atomically, swallowing errors."""
     try:
-        with open(STATS_PATH, "w") as f:
+        os.makedirs(os.path.dirname(STATS_PATH), exist_ok=True)
+    except Exception:
+        pass
+
+    try:
+        tmp_path = f"{STATS_PATH}.tmp"
+        with open(tmp_path, "w") as f:
             json.dump(data, f)
+        os.replace(tmp_path, STATS_PATH)
     except Exception as e:
         msg = f"[record_bot_stats] failed to write stats file: {e}"
         print(msg)

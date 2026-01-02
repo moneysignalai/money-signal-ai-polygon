@@ -154,6 +154,10 @@ def _extract_underlying_fields(chain: Dict[str, Any]) -> Dict[str, Optional[Any]
     if price is not None and price <= 0:
         price = None
 
+    if price is None:
+        # Fallback to open/prev close if last is missing to avoid $0.00 underlyings
+        price = _safe_float(underlying.get("close") or underlying.get("previous_close"))
+
     open_price = _safe_float(day.get("open") or day.get("o") or underlying.get("open"))
     prev_close = _safe_float(
         underlying.get("prev_close")
