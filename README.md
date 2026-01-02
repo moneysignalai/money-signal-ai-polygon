@@ -361,10 +361,16 @@ Use Case: Hedge timing; consider mean-reversion shorts.
 
 ### Event / Meta Bots
 
-**Earnings**  
-- **Behavior**: Highlights notable earnings movers and upcoming catalysts.  
-- **How it works**: Scans scheduled earnings within a forward window; during/after events, checks price move, dollar volume, and gap behavior to decide if alert-worthy.  
-- **Alert Types**: Bullish beat/strength, Bearish miss/weakness.  
+**Earnings**
+- **Behavior**: Highlights notable earnings movers and upcoming catalysts.
+- **How it works**: Scans scheduled earnings within a forward window; during/after events, checks price move, dollar volume, and gap behavior to decide if alert-worthy.
+- **Alert Types**: Bullish beat/strength, Bearish miss/weakness.
+- **Key Env Vars**:
+  - `MASSIVE_BASE_URL` (default: Polygon host) to point at the Massive Benzinga API base.
+  - `MIN_EARNINGS_PRICE`, `MIN_EARNINGS_MOVE_PCT`, `MIN_EARNINGS_DOLLAR_VOL` to gate price/volume quality.
+  - `EARNINGS_MIN_IMPORTANCE`, `EARNINGS_ALLOWED_DATE_STATUSES` to filter Benzinga events (e.g., confirmed/projected).
+  - `EARNINGS_EVENT_MAX_AGE_HOURS` to ignore stale reports; `EARNINGS_PREMARKET_WINDOW`, `EARNINGS_AFTERHOURS_WINDOW`, `EARNINGS_FOLLOWTHROUGH_WINDOW` to gate alert windows.
+  - `EARNINGS_POS_SURPRISE_PCT`, `EARNINGS_NEG_SURPRISE_PCT` to score beats/misses on EPS/revenue surprise percentages.
 - **Example Alert**:
 ```text
 EARNINGS — LULU | Post-Print Strength
