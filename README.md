@@ -14,7 +14,7 @@ MoneySignalAI is an institutional-grade, multi-bot equities and options alerting
 - **Scheduler / FastAPI (`main.py`)**
   - Registry of bots (public name, module, async entrypoint, interval, schedule type).
   - Applies `DISABLED_BOTS`, `TEST_MODE_BOTS`, RTH/premarket/slot gates, and per-bot timeouts.
-  - Runs bots concurrently with asyncio and captures per-bot errors via `record_error`.
+  - Runs bots concurrently with asyncio and captures per-bot errors via `record_error`; cap concurrency with `BOT_MAX_CONCURRENCY` (default 6).
 - **Shared utilities (`bots/shared.py`)**
   - EST time helpers (`format_est_timestamp`, `now_est`, RTH/premarket checks, trading-day detection).
   - Dynamic universe resolver (top-by-volume, capped at 250; fallback `TICKER_UNIVERSE`).
@@ -488,7 +488,7 @@ Set env vars (non-exhaustive):
 - **Squeeze**: `SQUEEZE_*`
 - **Dark Pool**: `DARK_POOL_MIN_NOTIONAL`, `DARK_POOL_MIN_LARGEST_PRINT`, `DARK_POOL_LOOKBACK_MINUTES`
 - **Options**: `OPTIONS_FLOW_MAX_UNIVERSE`, `OPTIONS_MIN_UNDERLYING_PRICE`, `CHEAP_*`, `UNUSUAL_*`, `WHALES_*`, `IVCRUSH_*`
-- **Operational**: `BOT_TIMEOUT_SECONDS`, `SCAN_INTERVAL_SECONDS`, `STATUS_HEARTBEAT_INTERVAL_MIN`, `STATUS_STATS_PATH`, `OPTIONS_IV_CACHE_PATH`, `DEBUG_FLOW_REASONS`, `DISABLED_BOTS`, `TEST_MODE_BOTS`
+- **Operational**: `BOT_TIMEOUT_SECONDS`, `SCAN_INTERVAL_SECONDS`, `STATUS_HEARTBEAT_INTERVAL_MIN`, `STATUS_STATS_PATH`, `OPTIONS_IV_CACHE_PATH`, `DEBUG_FLOW_REASONS`, `DISABLED_BOTS`, `TEST_MODE_BOTS`, `BOT_MAX_CONCURRENCY`
 
 ### Run Locally
 ```bash
