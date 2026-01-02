@@ -38,7 +38,6 @@ BOT_NAME = "volume_monster"
 _allow_outside_rth = os.getenv("VOLUME_MONSTER_ALLOW_OUTSIDE_RTH", "false").lower() == "true"
 _min_dollar_vol = float(os.getenv("VOLUME_MONSTER_MIN_DOLLAR_VOL", "150000"))
 _min_rvol = float(os.getenv("VOLUME_MONSTER_RVOL", os.getenv("VOLUME_MIN_RVOL", "1.6")))
-_min_move_pct = float(os.getenv("VOLUME_MONSTER_MIN_MOVE_PCT", "3.0"))
 _max_universe = int(os.getenv("VOLUME_MONSTER_MAX_UNIVERSE", os.getenv("DYNAMIC_MAX_TICKERS", "2000")))
 _lookback_days = int(os.getenv("VOLUME_MONSTER_LOOKBACK_DAYS", "20"))
 
@@ -89,21 +88,35 @@ def _format_volume_monster_alert(
     rvol: float,
     day_vol: float,
     dollar_vol: float,
-    move_pct: float,
+    change_pct: float,
     ts: datetime,
 ) -> str:
     ts_str = format_est_timestamp(ts)
-    rvol_text = f"{rvol:.1f}x" if rvol > 0 else "N/A"
+    rvol_text = f"{rvol:.1f}×" if rvol > 0 else "N/A"
     volume_text = f"{day_vol:,.0f}" if day_vol > 0 else "N/A"
     dollar_text = f"${dollar_vol:,.0f}" if dollar_vol > 0 else "N/A"
 
+    direction = "UP" if change_pct >= 0 else "DOWN"
+
     lines = [
-        f"🚨 VOLUME MONSTER — {symbol} ({ts_str})",
-        "────────────",
-        f"• 💵 Last: {_fmt_price(price)} (O: {_fmt_price(open_)}, H: {_fmt_price(high)}, L: {_fmt_price(low)})",
-        f"• 📊 RVOL: {rvol_text} | Volume: {volume_text} ({rvol_text} avg)",
-        f"• 💰 Dollar Vol: {dollar_text}",
-        f"• 📈 Chart: {chart_link(symbol, timeframe='D')}",
+        f"🧠 VOLUME MONSTER — {symbol}",
+        f"🕒 {ts_str}",
+        "",
+        "💰 Price + Move",
+        f"• Last: {_fmt_price(price)} ({change_pct:+.1f}% {direction})",
+        f"• Day Change vs Prev Close: {change_pct:+.1f}%",
+        f"• O {_fmt_price(open_)} · H {_fmt_price(high)} · L {_fmt_price(low)} · C {_fmt_price(price)}",
+        "",
+        "📊 Liquidity Snapshot",
+        f"• Volume: {volume_text}",
+        f"• RVOL: {rvol_text}",
+        f"• Dollar Vol: {dollar_text}",
+        "",
+        "🧠 Read",
+        "Extreme participation vs normal. This is where big money is very active right now.",
+        "",
+        "🔗 Chart",
+        chart_link(symbol, timeframe="D"),
     ]
 
     return "\n".join(lines)
@@ -181,12 +194,6 @@ async def run_volume_monster() -> None:
                 reason_counts["rvol_too_low"] = reason_counts.get("rvol_too_low", 0) + 1
                 continue
 
-            if abs(move_pct) < _min_move_pct:
-                if DEBUG_FLOW_REASONS:
-                    debug_filter_reason("volume_monster", sym, "move_too_small")
-                reason_counts["move_too_small"] = reason_counts.get("move_too_small", 0) + 1
-                continue
-
             matches += 1
             try:
                 alert_text = _format_volume_monster_alert(
@@ -198,7 +205,7 @@ async def run_volume_monster() -> None:
                     rvol=rvol,
                     day_vol=day_vol,
                     dollar_vol=dollar_vol,
-                    move_pct=move_pct,
+                    change_pct=move_pct,
                     ts=datetime.now(),
                 )
                 send_alert_text(alert_text)
