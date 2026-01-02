@@ -13,6 +13,8 @@ from typing import Dict, Any, List, Optional, Tuple
 import pytz
 import requests
 
+from bots.bot_meta import get_bot_meta, get_strategy_tag
+
 # ---------------- BASIC CONFIG ----------------
 
 POLYGON_KEY = os.getenv("POLYGON_KEY") or os.getenv("POLYGON_API_KEY")
@@ -65,6 +67,7 @@ UNIVERSE_HARD_CAP = int(os.getenv("UNIVERSE_HARD_CAP", "800"))
 MAX_REQUESTS_PER_BOT_PER_RUN = int(os.getenv("MAX_REQUESTS_PER_BOT_PER_RUN", "400"))
 CIRCUIT_BREAKER_FAILURES = int(os.getenv("CIRCUIT_BREAKER_FAILURES", "3"))
 CIRCUIT_BREAKER_COOLDOWN = float(os.getenv("CIRCUIT_BREAKER_COOLDOWN", "30"))
+BOT_FAILURE_COOLDOWN_SECONDS = float(os.getenv("BOT_FAILURE_COOLDOWN_SECONDS", "60"))
 BOTTLED_BACKOFF_CAP = float(os.getenv("BACKOFF_MAX_SECONDS", "8"))
 
 
@@ -227,6 +230,27 @@ def finish_bot_run_context(ctx: Optional[BotRunContext]) -> None:
         pass
 
 
+def _current_bot_name() -> str:
+    ctx = _BOT_CONTEXT.get()
+    return ctx.bot_name if ctx else ""
+
+
+def _load_fixture(tag: str) -> Optional[Dict[str, Any]]:
+    """When TEST_MODE is enabled, read canned data from tests/fixtures/<tag>.json."""
+
+    if not TEST_MODE:
+        return None
+    fixture_path = os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures", f"{tag}.json")
+    try:
+        with open(os.path.abspath(fixture_path), "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        print(f"[fixtures] failed to load {fixture_path}: {exc}")
+        return None
+
+
 def debug_filter_reason(bot_name: str, symbol: str, reason: str) -> None:
     """
     Optional debugging helper.
@@ -292,7 +316,8 @@ def send_alert(
         print(f"[alert:{bot_name}] (no TELEGRAM_TOKEN_ALERTS or TELEGRAM_CHAT_ALL) {symbol} {extra}")
         return
 
-    header = f"🧠 {bot_name.upper()} — {symbol}"
+    tag = get_strategy_tag(bot_name)
+    header = f"[{tag}] 🧠 {bot_name.upper()} — {symbol}"
     body_lines = [header]
     if last_price:
         body_lines.append(f"💰 Last: ${last_price:.2f}")
@@ -302,11 +327,12 @@ def send_alert(
         body_lines.append("────────────")
         body_lines.append(extra)
 
+    body_lines.append(f"🔖 Strategy: {tag}")
     text = "\n".join(body_lines)
     _send_telegram_raw(token, chat, text, parse_mode=None)
 
 
-def send_alert_text(text: str) -> None:
+def send_alert_text(text: str, *, bot_name: Optional[str] = None) -> None:
     """Send a preformatted alert message.
 
     This is useful for bots (e.g., the option flow family) that construct a
@@ -319,6 +345,12 @@ def send_alert_text(text: str) -> None:
     if not token or not chat:
         print(f"[alert:custom] (no TELEGRAM_TOKEN_ALERTS or TELEGRAM_CHAT_ALL) {text}")
         return
+
+    active_bot = bot_name or _current_bot_name()
+    if active_bot:
+        tag = get_strategy_tag(active_bot)
+        if f"Strategy: {tag}" not in text:
+            text = f"🔖 Strategy: {tag}\n{text}"
     _send_telegram_raw(token, chat, text, parse_mode=None)
 
 
@@ -492,6 +524,7 @@ def record_bot_stats(
     data["bots"] = bots
 
     _save_stats_file(data)
+    return data
 
 
 # ---------------- HTTP HELPER WITH RETRIES ----------------
@@ -515,6 +548,10 @@ def _http_get_json(
     This is used for Polygon grouped/agg/snapshot GETs so that transient
     slowness does not kill the bots or flood them with exceptions.
     """
+    fixture = _load_fixture(tag)
+    if fixture is not None:
+        return fixture
+
     for attempt in range(retries + 1):
         _enforce_bot_limits(tag)
         try:
