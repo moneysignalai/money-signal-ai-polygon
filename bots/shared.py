@@ -15,6 +15,8 @@ import requests
 
 POLYGON_KEY = os.getenv("POLYGON_KEY") or os.getenv("POLYGON_API_KEY")
 API_BASE = os.getenv("POLYGON_BASE_URL", "https://api.polygon.io")
+# Massive (Benzinga) shares the Polygon key; allow overriding the host if needed.
+MASSIVE_BASE_URL = os.getenv("MASSIVE_BASE_URL", API_BASE)
 
 # Global RVOL / volume floors that other bots can reference
 MIN_RVOL_GLOBAL = float(os.getenv("MIN_RVOL_GLOBAL", "2.0"))
@@ -445,6 +447,23 @@ def _http_get_json(
                 report_status_error(tag, msg)
                 return None
     return None
+
+
+def fetch_benzinga_earnings(params: Dict[str, Any], *, tag: str = "benzinga:earnings") -> Optional[Dict[str, Any]]:
+    """
+    Thin wrapper for the Massive Benzinga earnings endpoint.
+
+    Uses the shared POLYGON_KEY for auth and honors MASSIVE_BASE_URL overrides so the
+    bot can run against different environments without code changes.
+    """
+
+    if not POLYGON_KEY:
+        print("[benzinga] POLYGON_KEY missing; cannot fetch earnings data.")
+        return None
+
+    url = f"{MASSIVE_BASE_URL}/benzinga/v1/earnings"
+    req_params = {"apiKey": POLYGON_KEY, **params}
+    return _http_get_json(url, req_params, tag=tag, timeout=20.0, retries=2)
 
 
 # ---------------- DYNAMIC / CONFIGURABLE UNIVERSE ----------------
