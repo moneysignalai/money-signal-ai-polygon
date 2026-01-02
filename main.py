@@ -277,6 +277,27 @@ async def _run_single_bot(
                 print(f"[bot_runner] warning recording failure stats for {public_name}: {inner}")
 
 
+async def _run_bot_wrapper(
+    public_name: str,
+    module_path: str,
+    func_name: str,
+    interval: int,
+    record_error,
+    record_stats,
+    running: Dict[str, bool],
+    next_run_ts: Dict[str, float],
+    semaphore: asyncio.Semaphore,
+):
+    running[public_name] = True
+    await semaphore.acquire()
+    try:
+        await _run_single_bot(public_name, module_path, func_name, record_error, record_stats)
+    finally:
+        semaphore.release()
+        running[public_name] = False
+        next_run_ts[public_name] = time.time() + interval
+
+
 async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS):
     print(
         f"[main] scheduler_loop starting with base_interval={base_interval_seconds}s, "
@@ -293,7 +314,9 @@ async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS):
         today_est_date = None  # type: ignore
 
     next_run_ts: Dict[str, float] = {name: 0.0 for name, _, _, _ in BOTS}
+    running: Dict[str, bool] = {name: False for name, _, _, _ in BOTS}
     last_skip_day: Dict[str, str] = {}
+    semaphore = asyncio.Semaphore(int(os.getenv("BOT_MAX_CONCURRENCY", "6")))
 
     while True:
         try:
@@ -303,7 +326,6 @@ async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS):
                 f"[main] scheduler cycle starting at {cycle_start_dt.strftime('%H:%M:%S')} ET"
             )
 
-            tasks: List[asyncio.Task] = []
             for name, module_path, func_name, interval in BOTS:
                 skip = _skip_reason(name)
                 if skip:
@@ -337,27 +359,29 @@ async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS):
                     next_run_ts[name] = cycle_start_ts + interval
                     continue
 
+                if running.get(name):
+                    print(f"[scheduler] bot={name} action=SKIP_ALREADY_RUNNING")
+                    continue
+
                 due_ts = next_run_ts.get(name, 0.0)
                 if cycle_start_ts >= due_ts:
                     print(f"[scheduler] bot={name} action=RUN interval={interval}s")
-                    tasks.append(
-                        asyncio.create_task(
-                            _run_single_bot(
-                                name,
-                                module_path,
-                                func_name,
-                                record_error,
-                                record_stats=record_bot_stats,
-                            )
+                    asyncio.create_task(
+                        _run_bot_wrapper(
+                            name,
+                            module_path,
+                            func_name,
+                            interval,
+                            record_error,
+                            record_bot_stats,
+                            running,
+                            next_run_ts,
+                            semaphore,
                         )
                     )
-                    next_run_ts[name] = cycle_start_ts + interval
                 else:
                     wait_for = max(0.0, due_ts - cycle_start_ts)
                     print(f"[scheduler] bot={name} action=WAITING next_in={wait_for:.1f}s")
-
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
 
             cycle_end_ts = time.time()
             elapsed = cycle_end_ts - cycle_start_ts
