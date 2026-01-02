@@ -67,7 +67,7 @@ Real template examples mirroring current code output. Timestamps are EST, date f
 ### Premarket Scanner
 ```
 📣 PREMARKET — MDB
-🕒 09:05 AM EST · Jan 01
+🕒 09:05 AM EST · 01-01-2026
 💰 $382.40 · 📊 RVOL 1.8x
 ────────────
 🚀 Premarket move: +4.7% vs prior close
@@ -81,7 +81,7 @@ Real template examples mirroring current code output. Timestamps are EST, date f
 ### Volume Monster
 ```
 🧠 VOLUME MONSTER — AXSM
-🕒 01-01-2026 · 02:53 PM EST
+🕒 02:53 PM EST · 01-01-2026
 
 💰 Price + Move
 • Last: $182.64 (+22.8% UP)
@@ -103,7 +103,7 @@ https://www.tradingview.com/chart/?symbol=AXSM
 ### Gap Flow (Gap Up / Gap Down)
 ```
 🧠 GAP FLOW — AXSM
-🕒 01-01-2026 · 09:58 AM EST
+🕒 09:58 AM EST · 01-01-2026
 
 💰 Gap Stats
 • Gap: +6.5% vs prior close (Gap Up 🔼)
