@@ -63,6 +63,7 @@ if _min_drop_pct > -2:
 class DailyStats:
     prev_close: float
     prev_low: float
+    recent_low: float
     open: float
     high: float
     low: float
@@ -144,6 +145,13 @@ def _compute_daily_stats(sym: str) -> DailyStats | None:
     if any(x <= 0 for x in (open_, high, low, close, volume, prev_close)):
         return None
 
+    lows_history = [
+        _extract_ohlcv(b)[2]
+        for b in daily[:-1][-20:]
+        if _extract_ohlcv(b)[2] > 0
+    ]
+    recent_low = min(lows_history) if lows_history else 0.0
+
     history_vols = [
         _extract_ohlcv(b)[4]
         for b in daily[:-1][-_avg_vol_lookback:]
@@ -154,6 +162,7 @@ def _compute_daily_stats(sym: str) -> DailyStats | None:
     return DailyStats(
         prev_close=prev_close,
         prev_low=prev_low,
+        recent_low=recent_low,
         open=open_,
         high=high,
         low=low,
@@ -243,6 +252,13 @@ def _format_panic_alert(sym: str, stats: DailyStats, intraday: List) -> str:
     vwap_diff = ((stats.close - vwap) / vwap * 100) if vwap else 0.0
     structure_text = _day_structure(stats, dist_from_low_pct, vwap_diff)
     prior_low_text = f"${stats.prev_low:.2f}" if stats.prev_low > 0 else "n/a"
+    recent_low_text = None
+    if stats.recent_low > 0:
+        if stats.close <= stats.recent_low * 1.02:
+            recent_low_text = f"pressing into recent lows near ${stats.recent_low:.2f}"
+        else:
+            recent_low_text = "not near recent lows"
+    closing_near_lows_flag = "Yes" if stats.low_close_distance_pct <= _max_from_low_pct else "No"
     bounce_high = None
     if intraday:
         lows = [(_extract_ohlcv(b)[2], idx) for idx, b in enumerate(intraday)]
@@ -252,26 +268,48 @@ def _format_panic_alert(sym: str, stats: DailyStats, intraday: List) -> str:
             bounce_high_val = max(highs_after_low) if highs_after_low else 0.0
             bounce_high = bounce_high_val if bounce_high_val > 0 else None
 
-    header = f"😱 PANIC FLUSH — {sym} ({format_est_timestamp()})"
+    timestamp = format_est_timestamp()
+    header = f"⚠️ PANIC FLUSH — {sym}"
     lines = [
         header,
-        "────────────",
-        f"• Last: ${stats.close:.2f} ({stats.day_change_pct:.1f}% vs prior close, {stats.from_open_pct:.1f}% from open)",
-        f"• Intraday range: O: ${stats.open:.2f} · H: ${stats.high:.2f} · L: ${stats.low:.2f} ({dist_from_low_pct:.1f}% above low)",
-        f"• RVOL: {stats.rvol:.1f}× · Volume: {int(stats.volume):,} · Dollar Vol ≈ ${stats.dollar_vol:,.0f}",
+        f"🕒 {timestamp}",
+        "",
+        "💰 Price + Volume",
+        f"• Last: ${stats.close:.2f} ({stats.day_change_pct:.1f}% DOWN)",
+        f"• From Open: {stats.from_open_pct:.1f}% DOWN",
+        f"• RVOL: {stats.rvol:.1f}×",
+        f"• Volume: {int(stats.volume):,}",
+        f"• Dollar Vol: ${stats.dollar_vol:,.0f}",
+        "",
+        "📉 Intraday Damage",
+        f"• O ${stats.open:.2f} · H ${stats.high:.2f} · L ${stats.low:.2f} · C ${stats.close:.2f}",
+        f"• Closing Near Lows? {closing_near_lows_flag}",
     ]
+    multi_day_text = recent_low_text or "no recent lows context computed"
+    lines.append(f"• Multi-day context: {multi_day_text}")
+
     if vwap:
+        lines.append("")
+        lines.append("📈 VWAP & Structure")
         lines.append(f"• VWAP: ${vwap:.2f} ({vwap_text})")
-    lines.append(f"• Day structure: {structure_text}")
-    lines.append("• Reference levels:")
-    lines.append(f"  - Support: today’s low ${stats.low:.2f} and prior day low {prior_low_text}")
+        lines.append(f"• Day structure: {structure_text}")
+    else:
+        lines.append(f"• Day structure: {structure_text}")
+
+    lines.append("")
+    lines.append("🔎 Reference levels")
+    lines.append(f"• Support: today’s low ${stats.low:.2f} and prior day low {prior_low_text}")
     if vwap:
         resistance_parts = [f"VWAP ${vwap:.2f}"]
         if bounce_high:
             resistance_parts.append(f"bounce high ${bounce_high:.2f}")
-        lines.append(f"  - Resistance: {', '.join(resistance_parts)}")
-    lines.append("• Bias: Short-term downside exhaustion / potential bounce zone")
-    lines.append(f"• Chart: {chart_link(sym)}")
+        lines.append(f"• Resistance: {', '.join(resistance_parts)}")
+    lines.append("")
+    lines.append("🧠 Read")
+    lines.append("Violent sell pressure with elevated liquidity. Possible capitulation / flush zone for contrarian setups.")
+    lines.append("")
+    lines.append("🔗 Chart")
+    lines.append(chart_link(sym))
     return "\n".join(lines)
 
 
