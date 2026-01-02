@@ -57,26 +57,6 @@ def should_run_now() -> tuple[bool, Optional[str]]:
         return True, None
     return False, "outside ORB scan window"
 
-
-def should_run_now() -> tuple[bool, str | None]:
-    """Expose RTH + opening-window gating to the scheduler."""
-
-    allow_outside = os.getenv("ORB_ALLOW_OUTSIDE_RTH", "false").lower() == "true"
-    if allow_outside:
-        return True, None
-
-    if not in_rth_window_est():
-        return False, "outside RTH window"
-
-    try:
-        window_minutes = int(os.getenv("ORB_RANGE_MINUTES", "15"))
-    except Exception:
-        window_minutes = 15
-
-    if in_rth_window_est(0, window_minutes):
-        return True, None
-    return False, "outside ORB opening window"
-
 _client: Optional[RESTClient] = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
 # ---------------- CONFIG ----------------

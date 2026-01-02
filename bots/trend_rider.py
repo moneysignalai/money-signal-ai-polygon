@@ -204,79 +204,54 @@ async def run_trend_rider() -> None:
                 continue
 
             matches += 1
-            hod_gap_pct = (
-                ((high_today - close_today) / high_today * 100) if high_today > 0 else None
-            )
             breakout_diff_pct = (
                 ((close_today - recent_high) / recent_high * 100) if recent_high > 0 else 0.0
             )
+            ma200 = _moving_average(closes, 200) if len(closes) >= 200 else 0.0
+            direction_label = "UP" if day_change_pct >= 0 else "DOWN"
 
-            trend_descriptor = "healthy uptrend" if ma20 > ma50 else "trend mixed"
+            ma50_status = "above 50SMA" if close_today >= ma50 > 0 else "below 50SMA"
+            ma200_status = "above 200SMA" if close_today >= ma200 > 0 else "below 200SMA"
+            trend_read = "Mixed structure; monitor breakout follow-through."
+            if close_today >= ma50 and (ma200 == 0 or close_today >= ma200):
+                if breakout_diff_pct > 0:
+                    trend_read = "Strong trend, stacked MAs, fresh breakout."
+                else:
+                    trend_read = "Uptrend continuation with MA support."
+            elif close_today >= ma50 and ma200 > 0 and close_today < ma200:
+                trend_read = "Recovery attempt in longer-term downtrend."
 
             rvol_text = f"{rvol:.1f}×" if rvol > 0 else "N/A"
-            volume_text = f"{volume_today:,.0f}" if volume_today > 0 else "N/A"
             dollar_text = f"${dollar_vol:,.0f}" if dollar_vol > 0 else "N/A"
 
-            hod_clause = (
-                f", {hod_gap_pct:.1f}% below HOD" if hod_gap_pct is not None else ""
-            )
-
-            breakout_line = (
-                f"• Breakout: new {_breakout_lookback}-day high at ${recent_high:,.2f} "
-                f"({breakout_diff_pct:+.1f}% above breakout level)"
-            )
-
-            trend_line = (
-                f"• Trend: MA20 ${ma20:,.2f} > MA50 ${ma50:,.2f} ({trend_descriptor})"
-            )
-
-            support_value = None
-            support_label = None
-            support_candidates = []
-            if prev_low > 0:
-                support_candidates.append((prev_low, "yesterday's low"))
-            if ma20 > 0:
-                support_candidates.append((ma20, "MA20"))
-            if support_candidates:
-                support_value, support_label = min(
-                    support_candidates, key=lambda item: abs(close_today - item[0])
-                )
-
-            resistance_value = high_today if high_today > 0 else recent_high
-
             ts_str = format_est_timestamp()
-            header = f"🚀 TREND RIDER — {sym} ({ts_str})"
-
-            last_line = f"• Last: ${close_today:,.2f} (+{day_change_pct:.1f}% today{hod_clause})"
-            if open_today > 0 and high_today > 0 and low_today > 0:
-                last_line += (
-                    f" (O: ${open_today:,.2f}, H: ${high_today:,.2f}, L: ${low_today:,.2f})"
-                )
-
-            lines = [
-                header,
-                "────────────",
-                last_line,
-                breakout_line,
-                trend_line,
-                f"• Volume: {rvol_text} avg — {volume_text} shares · Dollar Vol ≈ {dollar_text}",
-                "• Context: Strong momentum continuation in established uptrend",
-                "• Bias: Swing LONG (2–10 day idea)",
-                "• Reference levels:",
+            volume_text = f"${dollar_vol:,.0f}" if dollar_vol > 0 else "N/A"
+            header_lines = [
+                f"🚀 TREND RIDER — {sym}",
+                f"🕒 {ts_str}",
+                "",
+                "💰 Price + Volume",
+                f"• Last: ${close_today:,.2f} ({day_change_pct:+.1f}% {direction_label})",
+                f"• RVOL: {rvol_text}",
+                f"• Dollar Vol: {volume_text}",
+                "",
+                "📈 Trend Structure",
+                f"• Breakout vs {_breakout_lookback}-day high: ${recent_high:,.2f}",
+                f"• 50 SMA: {ma50_status}",
+                f"• 200 SMA: {ma200_status if ma200 > 0 else 'N/A'}",
+                (
+                    f"• Today’s range: O ${open_today:,.2f} · H ${high_today:,.2f} "
+                    f"· L ${low_today:,.2f} · C ${close_today:,.2f}"
+                ),
+                "",
+                "🧠 Read",
+                trend_read,
+                "",
+                "🔗 Chart",
+                chart_link(sym, timeframe="D"),
             ]
 
-            if support_value is not None:
-                lines.append(
-                    f"  - Support zone (near-term): ${support_value:,.2f} (based on {support_label})"
-                )
-            if resistance_value:
-                lines.append(
-                    f"  - Resistance zone: ${resistance_value:,.2f} (today's high / recent high)"
-                )
-
-            lines.append(f"• Chart: {chart_link(sym, timeframe='D')}")
-
-            alert_text = "\n".join(lines)
+            alert_text = "\n".join(header_lines)
             try:
                 send_alert_text(alert_text)
                 alerts += 1
