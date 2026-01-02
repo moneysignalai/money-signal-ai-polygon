@@ -133,17 +133,45 @@ class OptionContract:
     open_interest: Optional[int]
     iv: Optional[float]
     underlying_price: Optional[float]
+    underlying_open: Optional[float] = None
+    underlying_prev_close: Optional[float] = None
+    underlying_rvol: Optional[float] = None
+    underlying_volume: Optional[int] = None
 
 
-def _extract_underlying_price(chain: Dict[str, Any]) -> Optional[float]:
+def _extract_underlying_fields(chain: Dict[str, Any]) -> Dict[str, Optional[Any]]:
     underlying = chain.get("underlying") or {}
     last = underlying.get("last") or {}
-    return _safe_float(
+    day = underlying.get("day") or {}
+    prev_day = underlying.get("prev_day") or {}
+
+    price = _safe_float(
         last.get("price")
         or underlying.get("last_price")
         or underlying.get("price")
         or underlying.get("close")
     )
+    if price is not None and price <= 0:
+        price = None
+
+    open_price = _safe_float(day.get("open") or day.get("o") or underlying.get("open"))
+    prev_close = _safe_float(
+        underlying.get("prev_close")
+        or underlying.get("previous_close")
+        or prev_day.get("close")
+        or prev_day.get("c")
+        or day.get("prev_close")
+    )
+    volume = _safe_int(day.get("volume") or day.get("v") or underlying.get("volume"))
+    rvol = _safe_float(underlying.get("rvol") or day.get("rvol"))
+
+    return {
+        "price": price,
+        "open": open_price,
+        "prev_close": prev_close,
+        "rvol": rvol,
+        "volume": volume,
+    }
 
 
 def _option_iv(opt: Dict[str, Any]) -> Optional[float]:
@@ -194,7 +222,8 @@ def iter_option_contracts(symbol: str, *, ttl_seconds: int = 60) -> List[OptionC
 
     chain = get_option_chain_cached(symbol, ttl_seconds=ttl_seconds) or {}
     options = chain.get("results") or chain.get("options") or []
-    underlying_price = _extract_underlying_price(chain)
+    underlying_fields = _extract_underlying_fields(chain)
+    underlying_price = underlying_fields.get("price")
 
     contracts: List[OptionContract] = []
     for opt in options:
@@ -295,6 +324,10 @@ def iter_option_contracts(symbol: str, *, ttl_seconds: int = 60) -> List[OptionC
                 open_interest=open_interest,
                 iv=_option_iv(opt),
                 underlying_price=underlying_price,
+                underlying_open=underlying_fields.get("open"),
+                underlying_prev_close=underlying_fields.get("prev_close"),
+                underlying_rvol=underlying_fields.get("rvol"),
+                underlying_volume=underlying_fields.get("volume"),
             )
         )
     return contracts
@@ -332,10 +365,102 @@ def format_option_contract_display(contract: OptionContract) -> str:
     return f"{ticker.upper()} {_format_strike(strike_val)}{cp_letter} {_format_expiry(expiry)}"
 
 
+def format_contract_brief_with_size(contract: OptionContract) -> str:
+    """Return a compact contract string with size and strike details."""
+
+    parsed = _parse_occ(contract.contract)
+    expiry = contract.expiry or parsed.get("expiry")
+    strike_val = contract.strike if contract.strike is not None else parsed.get("strike")
+    cp_val = contract.cp or parsed.get("cp")
+    cp_letter = "C" if cp_val and cp_val.upper().startswith("C") else "P" if cp_val and cp_val.upper().startswith("P") else "?"
+    ticker = contract.symbol or parsed.get("underlying") or "?"
+    size_text = f"{contract.size}x " if contract.size is not None else ""
+    strike_fmt = _format_strike(strike_val)
+    strike_currency = _format_currency(_safe_float(strike_val), decimals=2)
+    return f"{size_text}{_format_expiry(expiry)} {strike_fmt}{cp_letter} (Strike {strike_currency})"
+
+
 def _format_currency(value: Optional[float], *, decimals: int = 2) -> str:
     if value is None or value <= 0:
         return "N/A"
     return f"${value:,.{decimals}f}"
+
+
+def _underlying_change_pct(contract: OptionContract) -> Optional[float]:
+    """Estimate the underlying's day move when reference prices are present."""
+
+    last = contract.underlying_price
+    ref = contract.underlying_open or contract.underlying_prev_close
+    if last is None or ref is None or ref <= 0:
+        return None
+    try:
+        return ((last - ref) / ref) * 100.0
+    except Exception:
+        return None
+
+
+def format_whale_option_alert(
+    *,
+    contract: OptionContract,
+    flow_tags: Optional[list[str]] = None,
+    context_line: Optional[str] = None,
+    bias_line: Optional[str] = None,
+    chart_symbol: Optional[str] = None,
+) -> str:
+    """Premium whale-flow alert with parsed contract + underlying context."""
+
+    now = datetime.now(eastern)
+    timestamp = now.strftime("%m-%d-%Y · %I:%M %p EST")
+    symbol = (chart_symbol or contract.symbol or "?").upper()
+
+    change_pct = _underlying_change_pct(contract)
+    change_text = f" ({change_pct:+.1f}% today)" if change_pct is not None else ""
+    rvol_text = (
+        f" · RVOL {contract.underlying_rvol:.1f}×" if contract.underlying_rvol is not None else ""
+    )
+    underlying_line = f"💰 Underlying: {_format_currency(contract.underlying_price)}{change_text}{rvol_text}"
+
+    contract_brief = format_contract_brief_with_size(contract)
+    dte_text = f"{contract.dte} DTE" if contract.dte is not None else "n/a"
+    premium_text = _format_currency(contract.premium)
+    notional_text = _format_currency(contract.notional, decimals=0)
+    flow_tag_text = " · ".join(flow_tags) if flow_tags else "n/a"
+
+    oi = contract.open_interest or 0
+    vol = contract.volume or 0
+    ratio_text = "n/a"
+    if oi > 0 and vol > 0:
+        ratio_text = f"{vol/oi:.1f}× OI"
+    elif vol > 0:
+        ratio_text = "volume present, no OI data"
+
+    context = context_line or f"Option volume {vol} vs OI {oi} ({ratio_text})"
+    bias = bias_line or "Aggressive bullish whale flow"
+
+    header = f"🐳 WHALE FLOW — {symbol}"
+    time_line = f"🕒 {timestamp}"
+    separator = "────────────"
+    order_line = f"📦 Order: {contract_brief} (⏳ {dte_text})"
+    money_line = f"💵 Premium per contract: {premium_text} · Total Notional: {notional_text}"
+    tags_line = f"📊 Flow tags: {flow_tag_text}"
+    context_line_fmt = f"⚖️ Context: {context}"
+    bias_line_fmt = f"🧠 Bias: {bias}"
+    chart_line = f"🔗 Chart: {chart_link(symbol)}"
+
+    return "\n".join(
+        [
+            header,
+            time_line,
+            underlying_line,
+            separator,
+            order_line,
+            money_line,
+            tags_line,
+            context_line_fmt,
+            bias_line_fmt,
+            chart_line,
+        ]
+    )
 
 
 def format_option_alert(

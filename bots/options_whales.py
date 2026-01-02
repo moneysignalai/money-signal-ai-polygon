@@ -9,7 +9,7 @@ import time
 from typing import Dict
 
 from bots.options_common import (
-    format_option_alert,
+    format_whale_option_alert,
     iter_option_contracts,
     options_flow_allow_outside_rth,
     send_option_alert,
@@ -80,10 +80,30 @@ async def run_options_whales() -> None:
                     continue
 
                 matches += 1
-                alert_text = format_option_alert(
-                    emoji="🐳",
-                    label="WHALE FLOW",
+
+                flow_tags = ["WHALE_SIZE"]
+                if c.dte is not None and c.dte <= 14:
+                    flow_tags.append("SHORT_DTE")
+                if c.notional and c.notional >= WHALES_MIN_NOTIONAL * 2:
+                    flow_tags.append("MEGA_NOTIONAL")
+
+                bias_line = "Aggressive bullish whale flow" if (c.cp or "").upper().startswith("C") else "Aggressive bearish whale flow"
+
+                oi = c.open_interest or 0
+                vol = c.volume or 0
+                context_parts = []
+                if vol:
+                    context_parts.append(f"Option volume {vol}")
+                if oi:
+                    ratio = vol / oi if oi else 0
+                    context_parts.append(f"OI {oi} ({ratio:.1f}× OI)")
+                context_line = " vs ".join(context_parts) if context_parts else "volume/OI context unavailable"
+
+                alert_text = format_whale_option_alert(
                     contract=c,
+                    flow_tags=flow_tags,
+                    context_line=context_line,
+                    bias_line=bias_line,
                     chart_symbol=symbol,
                 )
                 alerts += 1
