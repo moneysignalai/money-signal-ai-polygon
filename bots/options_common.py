@@ -416,6 +416,85 @@ def _underlying_change_pct(contract: OptionContract) -> Optional[float]:
         return None
 
 
+def format_iv_crush_alert(
+    *,
+    contract: OptionContract,
+    prev_iv: Optional[float],
+    iv_drop_pct: Optional[float],
+    min_drop_pct: float,
+    volume_threshold: Optional[int] = None,
+    chart_symbol: Optional[str] = None,
+    context_line: Optional[str] = None,
+    risk_line: Optional[str] = None,
+) -> str:
+    """Return a rich IV crush alert with parsed contract and IV deltas."""
+
+    now = datetime.now(eastern)
+    timestamp = now.strftime("%m-%d-%Y · %I:%M %p EST")
+    symbol = (chart_symbol or contract.symbol or "?").upper()
+
+    change_pct = _underlying_change_pct(contract)
+    change_text = f" ({change_pct:+.1f}% today)" if change_pct is not None else ""
+    rvol_text = (
+        f" · RVOL {contract.underlying_rvol:.1f}×" if contract.underlying_rvol is not None else ""
+    )
+    underlying_line = (
+        f"💰 Underlying: {_format_currency(contract.underlying_price)}{change_text}{rvol_text}"
+    )
+
+    contract_brief = format_contract_brief_with_size(contract)
+    premium_text = _format_currency(contract.premium)
+    notional_text = _format_currency(contract.notional, decimals=0)
+    volume_text = f"{contract.volume:,}" if contract.volume is not None else "n/a"
+    oi_text = f"{contract.open_interest:,}" if contract.open_interest is not None else "n/a"
+
+    iv_before = f"{prev_iv:.1f}%" if prev_iv is not None else "n/a"
+    iv_now = f"{contract.iv:.1f}%" if contract.iv is not None else "n/a"
+    drop_text = f"{iv_drop_pct:.1f}%" if iv_drop_pct is not None else "n/a"
+    drop_note = f"(meets IVCRUSH_MIN_IV_DROP_PCT={min_drop_pct:.0f}%)" if iv_drop_pct is not None else ""
+
+    vol_note = ""
+    if volume_threshold is not None and contract.volume is not None:
+        vol_note = (
+            f" (meets IVCRUSH_MIN_VOL)"
+            if contract.volume >= volume_threshold
+            else ""
+        )
+
+    context = context_line or "Post-event IV collapse with price stabilizing"
+    risk = risk_line or "Elevated realized move already happened; options now pricing less future volatility."
+
+    header = f"🔥 IV CRUSH — {symbol}"
+    time_line = f"🕒 {timestamp}"
+    separator = "────────────"
+    contract_line = f"🎯 Contract: {contract_brief}"
+    money_line = f"💸 Premium per contract: {premium_text} · Total Notional: {notional_text}"
+    iv_block = (
+        "📉 IV Crush Details:\n"
+        f"• IV before: {iv_before} → IV now: {iv_now}\n"
+        f"• IV drop: {drop_text} {drop_note}\n"
+        f"• Option volume: {volume_text}{vol_note}"
+    )
+    context_fmt = f"🧠 Context: {context}"
+    risk_fmt = f"⚖️ Risk View: {risk}"
+    chart_line = f"🔗 Chart: {chart_link(symbol)}"
+
+    return "\n".join(
+        [
+            header,
+            time_line,
+            underlying_line,
+            separator,
+            contract_line,
+            money_line,
+            iv_block,
+            context_fmt,
+            risk_fmt,
+            chart_line,
+        ]
+    )
+
+
 def format_whale_option_alert(
     *,
     contract: OptionContract,

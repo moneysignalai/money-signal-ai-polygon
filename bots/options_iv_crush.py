@@ -11,7 +11,7 @@ from typing import Dict
 
 from bots.options_common import (
     OptionContract,
-    format_option_alert,
+    format_iv_crush_alert,
     iter_option_contracts,
     options_flow_allow_outside_rth,
     send_option_alert,
@@ -92,6 +92,10 @@ async def run_options_iv_crush() -> None:
                     reason_counts["underlying_price"] = reason_counts.get("underlying_price", 0) + 1
                     debug_filter_reason(BOT_NAME, c.contract, "ivcrush_underlying_price_too_low")
                     continue
+                if c.underlying_price is None:
+                    reason_counts["no_underlying"] = reason_counts.get("no_underlying", 0) + 1
+                    debug_filter_reason(BOT_NAME, c.contract, "ivcrush_missing_underlying")
+                    continue
                 if c.dte is not None and c.dte > IVCRUSH_MAX_DTE:
                     reason_counts["dte"] = reason_counts.get("dte", 0) + 1
                     debug_filter_reason(BOT_NAME, c.contract, "ivcrush_dte_too_long")
@@ -119,15 +123,12 @@ async def run_options_iv_crush() -> None:
                     continue
 
                 matches += 1
-                iv_line = (
-                    f"IV: {prev_iv:.1f}% → {c.iv:.1f}% (drop {iv_drop_pct:.1f}%) | "
-                    f"Volume: {c.volume or 'n/a'} | OI: {c.open_interest or 'n/a'}"
-                )
-                alert_text = format_option_alert(
-                    emoji="🔥",
-                    label="IV CRUSH",
+                alert_text = format_iv_crush_alert(
                     contract=c,
-                    iv_line=iv_line,
+                    prev_iv=prev_iv,
+                    iv_drop_pct=iv_drop_pct,
+                    min_drop_pct=IVCRUSH_MIN_IV_DROP_PCT,
+                    volume_threshold=IVCRUSH_MIN_VOL,
                     chart_symbol=symbol,
                 )
                 alerts += 1
