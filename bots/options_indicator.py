@@ -87,6 +87,7 @@ MAX_DTE = int(os.getenv("OPTIONS_INDICATOR_MAX_DTE", "60"))
 MONEYNESS_PCT = float(os.getenv("OPTIONS_INDICATOR_MONEYNESS_PCT", "0.15"))  # ±15% around spot
 
 BOT_NAME = "options_indicator"
+STRATEGY_TAG = "IV_INDICATOR"
 
 
 # ------------ SMALL HELPERS ------------

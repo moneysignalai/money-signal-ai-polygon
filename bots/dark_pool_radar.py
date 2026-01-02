@@ -120,8 +120,11 @@ def _format_context(move_pct: float, dist_from_low: Optional[float], vwap_rel: O
 # ------------------- MAIN BOT -------------------
 
 
+BOT_NAME = "dark_pool_radar"
+STRATEGY_TAG = "DARK_POOL"
+
+
 async def run_dark_pool_radar() -> None:
-    BOT_NAME = "dark_pool_radar"
     start_dt = now_est_dt()
     scanned = 0
     matches = 0

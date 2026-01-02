@@ -1,6 +1,7 @@
 import asyncio
 import importlib
 import sys
+import importlib
 import time
 from types import ModuleType
 from difflib import SequenceMatcher
@@ -107,3 +108,20 @@ def test_bot_uniqueness_tags():
             combo_b = f"{meta_b.title_template} {meta_b.why_template}"
             ratio = SequenceMatcher(None, combo_a, combo_b).ratio()
             assert ratio < 0.7, f"{name_a} and {name_b} too similar"
+
+
+def test_strategy_tag_constants_unique():
+    tags: dict[str, str] = {}
+
+    for public_name, module_path, *_ in main.BOTS:
+        module = importlib.import_module(module_path)
+        tag = getattr(module, "STRATEGY_TAG", None)
+        assert tag, f"{public_name} missing STRATEGY_TAG"
+
+        if tag in tags:
+            raise AssertionError(f"Duplicate STRATEGY_TAG {tag} for {public_name} and {tags[tag]}")
+        tags[tag] = public_name
+
+        meta = BOT_METADATA.get(public_name)
+        if meta:
+            assert meta.strategy_tag == tag, f"{public_name} STRATEGY_TAG mismatch with BOT_METADATA"

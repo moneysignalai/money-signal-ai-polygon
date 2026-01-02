@@ -49,7 +49,9 @@ Alert formats below mirror how the platform communicates with traders and downst
 - **Alert Types**: Bullish gap-up, Bearish gap-down.  
 - **Example Alerts**:
 ```text
-PREMARKET — NVDA | Bullish Gap
+🔖 Tag: GAP_PREMARKET
+🟢 [GAP_PREMARKET] 🧠 PREMARKET — NVDA
+Bias: Bullish
 Time: 08:57 AM EST
 Price: $482.30 (+3.9% vs prior close)
 Premarket Range: $476.10 – $485.90 | Vol: 950,000 (≈$458M) | RVOL 2.1x
@@ -57,7 +59,9 @@ Why: Liquidity + RVOL + gap > MIN_PREMARKET_MOVE_PCT; holding upper half of rang
 Use Case: Opening-drive setup or gap-and-go validation.
 ```
 ```text
-PREMARKET — NKE | Bearish Gap
+🔖 Tag: GAP_PREMARKET
+🔴 [GAP_PREMARKET] 🧠 PREMARKET — NKE
+Bias: Bearish
 Time: 09:05 AM EST
 Price: $96.20 (-4.4% vs prior close)
 Range: $95.80 – $97.40 | Vol: 410,000 (≈$39M) | RVOL 1.7x
@@ -72,7 +76,9 @@ Use Case: Watch for gap-fill short or continuation.
 - **Alert Types**: Bullish or Bearish depending on price direction.  
 - **Example Alerts**:
 ```text
-VOLUME MONSTER — AMZN | Bullish Surge
+🔖 Tag: VOLUME_MONSTER
+🟢 VOLUME MONSTER — AMZN
+Bias: Bullish
 Time: 02:18 PM EST
 Price: $154.80 (+2.6% today)
 Volume: 12.4M | RVOL 3.4x | Dollar Vol: $1.9B
@@ -80,7 +86,9 @@ Why: Volume spike above VOLUME_MONSTER_RVOL with price holding above VWAP.
 Use Case: Momentum confirmation or add-on entry.
 ```
 ```text
-VOLUME MONSTER — COIN | Bearish Surge
+🔖 Tag: VOLUME_MONSTER
+🔴 VOLUME MONSTER — COIN
+Bias: Bearish
 Time: 01:05 PM EST
 Price: $92.10 (-5.1% today)
 Volume: 8.8M | RVOL 2.9x | Dollar Vol: $810M
@@ -95,7 +103,9 @@ Use Case: Trend continuation short; risk recalibration for longs.
 - **Alert Types**: Bullish hold, Bearish fade.  
 - **Example Alerts**:
 ```text
-GAP FLOW — SHOP | Bullish Hold
+🔖 Tag: GAP_FLOW
+🟢 GAP FLOW — SHOP
+Bias: Bullish
 Time: 10:02 AM EST
 Price: $78.90 (+6.1% from prior close)
 Context: Opened above gap; holding +3.2% above VWAP with RVOL 2.0x.
@@ -103,7 +113,9 @@ Why: Gap persisting with support; minimal fade through first 30 minutes.
 Use Case: Continuation trades; avoid fighting strong gap.
 ```
 ```text
-GAP FLOW — INTC | Bearish Fade
+🔖 Tag: GAP_FLOW
+🔴 GAP FLOW — INTC
+Bias: Bearish
 Time: 09:58 AM EST
 Price: $40.25 (+0.8% from prior close)
 Context: Gapped +4.0% but failed; now -2.9% from open, under VWAP; RVOL 1.6x.
@@ -118,7 +130,9 @@ Use Case: Gap-fill short or avoid long bias.
 - **Alert Types**: Bullish only (controlled pullback for potential bounce).  
 - **Example Alert**:
 ```text
-SWING PULLBACK — LLY | Bullish
+🔖 Tag: SWING_PULLBACK
+🟢 SWING PULLBACK — LLY
+Bias: Bullish
 Time: 12:40 PM EST
 Price: $705.50 (-1.8% today)
 Trend: 20D uptrend; price retesting 21EMA; RVOL 1.3x
@@ -133,7 +147,9 @@ Use Case: Staged swing entries with defined risk near support.
 - **Alert Types**: Bullish continuation or Bearish trend breakdown.  
 - **Example Alerts**:
 ```text
-TREND RIDER — MSFT | Bullish Continuation
+🔖 Tag: TREND_RIDER
+🟢 TREND RIDER — MSFT
+Bias: Bullish
 Time: 11:22 AM EST
 Price: $348.10 (+1.9% today)
 Structure: Above 8/21/50 EMA stack; VWAP support; RVOL 1.5x
@@ -141,7 +157,9 @@ Why: Trend strength with fresh intraday breakout > TREND_RIDER_MIN_BREAKOUT_PCT.
 Use Case: Momentum continuation; ride institutional trend.
 ```
 ```text
-TREND RIDER — IWM | Bearish Breakdown
+🔖 Tag: TREND_RIDER
+🔴 TREND RIDER — IWM
+Bias: Bearish
 Time: 02:05 PM EST
 Price: $182.30 (-2.4% today)
 Structure: Below 8/21/50 EMA stack; VWAP resistance; RVOL 1.7x
@@ -156,7 +174,9 @@ Use Case: Short confirmation; hedge selection.
 - **Alert Types**: Bearish only.  
 - **Example Alert**:
 ```text
-PANIC FLUSH — AFRM | Bearish
+🔖 Tag: PANIC_FLUSH
+🔴 PANIC FLUSH — AFRM
+Bias: Bearish
 Time: 01:48 PM EST
 Price: $29.40 (-11.6% today)
 Context: RVOL 3.1x; trading within 1.2% of LOD; heavy sell pressure.
@@ -171,7 +191,9 @@ Use Case: Risk warning for longs; potential exhaustion watch for contrarians.
 - **Alert Types**: Bullish reversal after selloff; Bearish reversal after squeeze.  
 - **Example Alerts**:
 ```text
-MOMENTUM REVERSAL — META | Bullish Reclaim
+🔖 Tag: MOMO_REVERSAL
+🟢 MOMENTUM REVERSAL — META
+Bias: Bullish
 Time: 02:30 PM EST
 Price: $327.50 (-3.2% from highs)
 Context: Morning selloff -5.8%; now reclaimed VWAP with RVOL 1.8x; +2.6% off lows.
@@ -179,7 +201,9 @@ Why: VWAP reclaim + range recovery within MOMO thresholds.
 Use Case: Intraday reversal entry; stop below VWAP.
 ```
 ```text
-MOMENTUM REVERSAL — TSLA | Bearish Failure
+🔖 Tag: MOMO_REVERSAL
+🔴 MOMENTUM REVERSAL — TSLA
+Bias: Bearish
 Time: 11:15 AM EST
 Price: $232.80 (+4.9% today)
 Context: Early squeeze +7.5%; lost VWAP; now -2.5% off highs with RVOL 2.2x.
@@ -194,7 +218,9 @@ Use Case: Short against VWAP after failed squeeze.
 - **Alert Types**: RSI Overbought (bearish skew) or Oversold (bullish skew).  
 - **Example Alerts**:
 ```text
-RSI SIGNAL — COST | Oversold
+🔖 Tag: RSI_SIGNAL
+🟢 RSI SIGNAL — COST
+Bias: Bullish
 Time: 01:00 PM EST
 Price: $502.10 (-2.1% today)
 RSI(14): 27 | RVOL 1.4x | Dollar Vol: $1.2B
@@ -202,7 +228,9 @@ Why: RSI below RSI_OVERSOLD with liquidity confirmation.
 Use Case: Mean-reversion scout; pair with level-based entries.
 ```
 ```text
-RSI SIGNAL — NVDA | Overbought
+🔖 Tag: RSI_SIGNAL
+🔴 RSI SIGNAL — NVDA
+Bias: Bearish
 Time: 12:18 PM EST
 Price: $496.80 (+3.6% today)
 RSI(14): 78 | RVOL 1.9x | Dollar Vol: $4.8B
@@ -217,7 +245,9 @@ Use Case: De-risk longs; lookout for pullback or hedge.
 - **Alert Types**: Bullish breakout or Bearish breakdown.  
 - **Example Alerts**:
 ```text
-ORB — NFLX | Bullish Breakout
+🔖 Tag: OPEN_RANGE
+🟢 ORB — NFLX
+Bias: Bullish
 Time: 09:53 AM EST
 Price: $458.40 (+1.9% since open)
 Opening Range: $450.20 – $453.10 (15 min)
@@ -225,7 +255,9 @@ Why: Cleared opening range with RVOL 1.7x; holding above VWAP.
 Use Case: Opening drive continuation with defined range risk.
 ```
 ```text
-ORB — BA | Bearish Breakdown
+🔖 Tag: OPEN_RANGE
+🔴 ORB — BA
+Bias: Bearish
 Time: 09:48 AM EST
 Price: $198.10 (-1.6% since open)
 Opening Range: $199.90 – $203.20 (15 min)
@@ -240,7 +272,9 @@ Use Case: Early trend alignment; avoid long attempts.
 - **Alert Types**: Bullish expansion or Bearish breakdown from squeeze.  
 - **Example Alerts**:
 ```text
-SQUEEZE — MU | Bullish Expansion
+🔖 Tag: SQUEEZE_BREAK
+🟢 SQUEEZE — MU
+Bias: Bullish
 Time: 01:22 PM EST
 Price: $88.70 (+1.4% today)
 Context: Multi-hour range compression; BB inside Keltner; RVOL 1.5x on breakout.
@@ -248,7 +282,9 @@ Why: Expansion trigger after confirmed squeeze; price above VWAP and MA stack.
 Use Case: Range-break momentum with clear invalidation.
 ```
 ```text
-SQUEEZE — SNAP | Bearish Expansion
+🔖 Tag: SQUEEZE_BREAK
+🔴 SQUEEZE — SNAP
+Bias: Bearish
 Time: 02:10 PM EST
 Price: $10.45 (-3.1% today)
 Context: Tight compression all morning; breakdown with RVOL 1.8x; below VWAP.
@@ -264,15 +300,17 @@ Use Case: Short continuation out of squeeze; scalp or day trade.
 - **Alert Types**: Bullish or Bearish depending on call/put direction.  
 - **Example Alerts**:
 ```text
-OPTIONS CHEAP FLOW — AMD | Bullish Calls
-Time: 01:05 PM EST
+🔖 Tag: CHEAP_FLOW
+🟢 💰 CHEAP FLOW — AMD (01:05 PM EST)
+Bias: Bullish
 Contract: 2,500x 02/16/2026 $140C | Premium $0.38 | Notional $95,000 | 18 DTE
 Context: Low-cost lotto-sized call sweep; underlying $132.10; near-term catalyst.
 Use Case: Speculative momentum participation with defined premium risk.
 ```
 ```text
-OPTIONS CHEAP FLOW — X | Bearish Puts
-Time: 11:42 AM EST
+🔖 Tag: CHEAP_FLOW
+🔴 💰 CHEAP FLOW — X (11:42 AM EST)
+Bias: Bearish
 Contract: 1,800x 03/15/2026 $25P | Premium $0.42 | Notional $75,600 | 35 DTE
 Context: Cheap downside protection with size; underlying $27.05.
 Use Case: Hedge indicator or short confirmation.
@@ -285,15 +323,17 @@ Use Case: Hedge indicator or short confirmation.
 - **Alert Types**: Bullish (calls/bullish spreads) or Bearish (puts/bearish spreads).  
 - **Example Alerts**:
 ```text
-OPTIONS UNUSUAL — MS | Bullish Calls
-Time: 10:55 AM EST
+🔖 Tag: UNUSUAL_FLOW
+🟢 ⚠️ UNUSUAL FLOW — MS (10:55 AM EST)
+Bias: Bullish
 Contract: 3,200x 04/18/2026 $95C | Premium $2.40 | Notional $768,000 | 58 DTE
 Context: Size 2.6x daily average; OI 1,050; RVOL in equity 1.3x.
 Use Case: Detect institutional leaning; confirm equity strength.
 ```
 ```text
-OPTIONS UNUSUAL — DAL | Bearish Puts
-Time: 12:30 PM EST
+🔖 Tag: UNUSUAL_FLOW
+🔴 ⚠️ UNUSUAL FLOW — DAL (12:30 PM EST)
+Bias: Bearish
 Contract: 4,100x 03/01/2026 $38P | Premium $1.05 | Notional $430,500 | 24 DTE
 Context: Size materially above OI; equity RVOL 1.5x to downside.
 Use Case: Downside confirmation or hedge insight.
@@ -306,15 +346,17 @@ Use Case: Downside confirmation or hedge insight.
 - **Alert Types**: Bullish or Bearish depending on side.  
 - **Example Alerts**:
 ```text
-OPTIONS WHALE — AAPL | Bullish Calls
-Time: 02:02 PM EST
+🔖 Tag: WHALE_FLOW
+🟢 🐳 WHALE FLOW — AAPL (02:02 PM EST)
+Bias: Bullish
 Contract: 10,000x 03/20/2026 $200C | Premium $3.25 | Notional $3,250,000 | 60 DTE
 Context: Whale-size sweep; underlying $191.40; equity RVOL 1.4x.
 Use Case: High-conviction follow or sentiment gauge.
 ```
 ```text
-OPTIONS WHALE — JPM | Bearish Puts
-Time: 01:18 PM EST
+🔖 Tag: WHALE_FLOW
+🔴 🐳 WHALE FLOW — JPM (01:18 PM EST)
+Bias: Bearish
 Contract: 6,500x 03/15/2026 $150P | Premium $2.80 | Notional $1,820,000 | 45 DTE
 Context: Large downside bet; OI 2,900; IV elevated.
 Use Case: Downside confirmation, hedge alignment for financials.
@@ -327,7 +369,9 @@ Use Case: Downside confirmation, hedge alignment for financials.
 - **Alert Types**: Neutral/bias depends on price action (often post-event).  
 - **Example Alert**:
 ```text
-IV CRUSH — NFLX
+🔖 Tag: IV_CRUSH
+⚪ IV CRUSH — NFLX
+Bias: Neutral
 Time: 09:45 AM EST
 Underlying: $398.10 (-6.0% today)
 Contract: 1,200x 02/14/2026 $420C | IV: 144% → 92% (-52%) | Premium $3.10 | 24 DTE
@@ -342,7 +386,9 @@ Use Case: Reprice expectations; evaluate selling premium or avoiding stale volat
 - **Alert Types**: Bullish, Bearish, or Neutral bias depending on regime.  
 - **Example Alerts**:
 ```text
-OPTIONS INDICATOR — SPY | High-IV Momentum (Bullish)
+🔖 Tag: IV_INDICATOR
+🟢 OPTIONS INDICATOR — SPY | High-IV Momentum
+Bias: Bullish
 Time: 02:15 PM EST
 Underlying: $479.60 (+1.7% today) | RVOL 1.3x
 IV Rank: 82 | RSI(14): 65 | MACD: +0.14 vs Signal +0.09 | Bollinger: near upper band
@@ -350,7 +396,9 @@ Why: High-IV uptrend with supportive momentum indicators.
 Use Case: Align delta exposure with vol regime; bias long.
 ```
 ```text
-OPTIONS INDICATOR — QQQ | Low-IV Reversal (Bearish Bias)
+🔖 Tag: IV_INDICATOR
+🔴 OPTIONS INDICATOR — QQQ | Low-IV Reversal
+Bias: Bearish
 Time: 11:50 AM EST
 Underlying: $382.40 (-0.8% today)
 IV Rank: 24 | RSI(14): 74 | MACD: negative cross | Bollinger: tagging upper band
@@ -373,7 +421,9 @@ Use Case: Hedge timing; consider mean-reversion shorts.
   - `EARNINGS_POS_SURPRISE_PCT`, `EARNINGS_NEG_SURPRISE_PCT` to score beats/misses on EPS/revenue surprise percentages.
 - **Example Alert**:
 ```text
-EARNINGS — LULU | Post-Print Strength
+🔖 Tag: EARNINGS_CAL
+🟢 EARNINGS — LULU | Post-Print Strength
+Bias: Bullish
 Time: 09:12 AM EST
 Price: $408.50 (+7.8% premarket)
 Context: Beat EPS/rev; RVOL 3.0x; holding top of premarket range.
@@ -387,7 +437,9 @@ Use Case: Event-driven momentum watch; informs ORB/gap strategies.
 - **Alert Types**: Neutral directional bias; highlights accumulation or distribution context.  
 - **Example Alert**:
 ```text
-DARK POOL RADAR — AMD
+🔖 Tag: DARK_POOL
+⚪ DARK POOL RADAR — AMD
+Bias: Neutral
 Time: 03:05 PM EST
 Largest Print: $38.5M | Total DP Notional: $142M across 126 prints | Lookback: 45m
 Why: Exceeds DARK_POOL_MIN_NOTIONAL and largest-print threshold.
@@ -401,7 +453,9 @@ Use Case: Track stealth accumulation/distribution; pair with price trend.
 - **Alert Types**: Long ideas and Short ideas lists.  
 - **Example Alert**:
 ```text
-DAILY IDEAS — AM Session
+🔖 Tag: DAILY_IDEAS
+⚪ DAILY IDEAS — AM Session
+Bias: Neutral
 Top Longs: NVDA, LLY, PANW (trend + RVOL + bullish options bias)
 Top Shorts: COIN, RBLX, SNAP (weak structure + RVOL + bearish flow)
 Context: Generated 10:52–11:00 AM slot from cross-signal scoring.

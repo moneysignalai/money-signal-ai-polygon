@@ -25,6 +25,7 @@ from bots.shared import (
 from bots.status_report import record_bot_stats, record_error
 
 BOT_NAME = "options_cheap_flow"
+STRATEGY_TAG = "CHEAP_FLOW"
 
 CHEAP_MAX_PREMIUM = float(os.getenv("CHEAP_MAX_PREMIUM", "0.60"))
 CHEAP_MIN_NOTIONAL = float(os.getenv("CHEAP_MIN_NOTIONAL", "3000"))

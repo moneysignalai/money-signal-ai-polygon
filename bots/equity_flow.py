@@ -13,8 +13,11 @@ import time
 
 from bots.status_report import record_bot_stats
 
+BOT_NAME = "equity_flow"
+STRATEGY_TAG = "EQUITY_FLOW"
+
 
 async def run_equity_flow() -> None:
     start = time.perf_counter()
     print("[equity_flow] DEPRECATED – use Volume Monster / Gap Flow / Swing Pullback")
-    record_bot_stats("equity_flow", 0, 0, 0, time.perf_counter() - start)
+    record_bot_stats(BOT_NAME, 0, 0, 0, time.perf_counter() - start)

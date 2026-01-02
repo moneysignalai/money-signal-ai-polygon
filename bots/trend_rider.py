@@ -33,6 +33,7 @@ from bots.shared import (
 from bots.status_report import record_bot_stats, record_error
 
 BOT_NAME = "trend_rider"
+STRATEGY_TAG = "TREND_RIDER"
 
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 

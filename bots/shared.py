@@ -299,12 +299,22 @@ def _send_telegram_raw(token: str, chat_id: str, text: str, parse_mode: Optional
         print(f"[telegram] failed to send: {e} | text={text!r}")
 
 
+def _normalize_bias(bias: Optional[str]) -> tuple[str, str]:
+    normalized = (bias or "neutral").strip().lower()
+    if normalized not in {"bullish", "bearish", "neutral"}:
+        normalized = "neutral"
+    emoji = {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪"}[normalized]
+    return normalized, emoji
+
+
 def send_alert(
     bot_name: str,
     symbol: str,
     last_price: float,
     rvol: float,
     extra: Optional[str] = None,
+    *,
+    bias: Optional[str] = None,
 ) -> None:
     """
     Core alert sender used by all bots.
@@ -317,8 +327,11 @@ def send_alert(
         return
 
     tag = get_strategy_tag(bot_name)
-    header = f"[{tag}] 🧠 {bot_name.upper()} — {symbol}"
-    body_lines = [header]
+    normalized_bias, bias_emoji = _normalize_bias(bias)
+    bias_label = normalized_bias.capitalize()
+
+    header = f"{bias_emoji} [{tag}] 🧠 {bot_name.upper()} — {symbol}"
+    body_lines = [header, f"Bias: {bias_label}"]
     if last_price:
         body_lines.append(f"💰 Last: ${last_price:.2f}")
     if rvol:
@@ -327,7 +340,7 @@ def send_alert(
         body_lines.append("────────────")
         body_lines.append(extra)
 
-    body_lines.append(f"🔖 Strategy: {tag}")
+    body_lines.append(f"🔖 Tag: {tag}")
     text = "\n".join(body_lines)
     _send_telegram_raw(token, chat, text, parse_mode=None)
 
@@ -349,8 +362,8 @@ def send_alert_text(text: str, *, bot_name: Optional[str] = None) -> None:
     active_bot = bot_name or _current_bot_name()
     if active_bot:
         tag = get_strategy_tag(active_bot)
-        if f"Strategy: {tag}" not in text:
-            text = f"🔖 Strategy: {tag}\n{text}"
+        if f"Tag: {tag}" not in text:
+            text = f"🔖 Tag: {tag}\n{text}"
     _send_telegram_raw(token, chat, text, parse_mode=None)
 
 

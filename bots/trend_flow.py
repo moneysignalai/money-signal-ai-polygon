@@ -17,6 +17,7 @@ import time
 from bots.status_report import record_bot_stats
 
 BOT_NAME = "trend_flow"
+STRATEGY_TAG = "TREND_FLOW"
 
 
 async def run_trend_flow() -> None:

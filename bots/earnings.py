@@ -310,8 +310,11 @@ def _alert_header(outcome: str, price_move: float) -> str:
 # ---------------- MAIN BOT ----------------
 
 
+BOT_NAME = "earnings"
+STRATEGY_TAG = "EARNINGS_CAL"
+
+
 async def run_earnings():
-    BOT_NAME = "earnings"
     if not POLYGON_KEY:
         print("[earnings] POLYGON_KEY missing; skipping.")
         record_bot_stats(BOT_NAME, 0, 0, 0, 0.0)
@@ -386,7 +389,15 @@ async def run_earnings():
             f"🔗 Chart: {chart_link(ticker)}",
         ]
 
-        send_alert(BOT_NAME, ticker, last_price, price_ctx["rvol"], extra="\n".join(body_lines))
+        bias_value = "bullish" if move_pct > 0 else "bearish" if move_pct < 0 else "neutral"
+        send_alert(
+            BOT_NAME,
+            ticker,
+            last_price,
+            price_ctx["rvol"],
+            extra="\n".join(body_lines),
+            bias=bias_value,
+        )
         _mark_alerted(key)
         alerts_sent += 1
 

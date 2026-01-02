@@ -39,6 +39,7 @@ _client: Optional[RESTClient] = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY e
 # ---------------- CONFIG ----------------
 
 BOT_NAME = "premarket"
+STRATEGY_TAG = "GAP_PREMARKET"
 
 MIN_PREMARKET_PRICE       = float(os.getenv("MIN_PREMARKET_PRICE", "5.0"))
 MIN_PREMARKET_MOVE_PCT    = float(os.getenv("MIN_PREMARKET_MOVE_PCT", "3.0"))
@@ -387,7 +388,8 @@ async def run_premarket() -> None:
             f"{body}"
         )
 
-        send_alert("premarket", sym, last_px, rvol, extra=extra)
+        bias_value = "bullish" if move_pct > 0 else "bearish"
+        send_alert("premarket", sym, last_px, rvol, extra=extra, bias=bias_value)
 
         matched_symbols.add(sym)
         alerts_sent += 1
