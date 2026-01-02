@@ -27,7 +27,7 @@ from bots.shared import (
     send_alert,
     chart_link,
     grade_equity_setup,
-    get_dynamic_top_volume_universe,
+    resolve_universe_for_bot,
     is_etf_blacklisted,
     now_est,
 )
@@ -37,6 +37,8 @@ eastern = pytz.timezone("US/Eastern")
 _client: Optional[RESTClient] = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 
 # ---------------- CONFIG ----------------
+
+BOT_NAME = "premarket"
 
 MIN_PREMARKET_PRICE       = float(os.getenv("MIN_PREMARKET_PRICE", "5.0"))
 MIN_PREMARKET_MOVE_PCT    = float(os.getenv("MIN_PREMARKET_MOVE_PCT", "3.0"))
@@ -49,9 +51,15 @@ MAX_PREMARKET_MOVE_PCT    = float(os.getenv("MAX_PREMARKET_MOVE_PCT", "0.0"))
 # Premarket window (EST)
 PREMARKET_START_MIN       = 4 * 60        # 04:00
 PREMARKET_END_MIN         = 9 * 60 + 29   # 09:29
+PREMARKET_ALLOW_OUTSIDE_WINDOW = (
+    os.getenv("PREMARKET_ALLOW_OUTSIDE_WINDOW", "false").lower() == "true"
+)
 
 # Universe
-PREMARKET_MAX_UNIVERSE    = int(os.getenv("PREMARKET_MAX_UNIVERSE", "120"))
+DEFAULT_MAX_UNIVERSE      = int(os.getenv("DYNAMIC_MAX_TICKERS", "2000"))
+PREMARKET_MAX_UNIVERSE    = int(
+    os.getenv("PREMARKET_MAX_UNIVERSE", str(DEFAULT_MAX_UNIVERSE))
+)
 
 # ---------------- STATE ----------------
 
@@ -84,6 +92,14 @@ def _in_premarket_window() -> bool:
     return PREMARKET_START_MIN <= mins <= PREMARKET_END_MIN
 
 
+def should_run_now() -> tuple[bool, str | None]:
+    if PREMARKET_ALLOW_OUTSIDE_WINDOW:
+        return True, None
+    if _in_premarket_window():
+        return True, None
+    return False, "outside premarket window"
+
+
 # ---------------- HELPERS ----------------
 
 def _safe_float(x: Any) -> float:
@@ -102,12 +118,12 @@ def _get_universe() -> List[str]:
       2) TICKER_UNIVERSE (global override)
       3) Dynamic top volume universe
     """
-    env = os.getenv("PREMARKET_TICKER_UNIVERSE") or os.getenv("TICKER_UNIVERSE")
-    if env:
-        return [t.strip().upper() for t in env.split(",") if t.strip()]
-    return get_dynamic_top_volume_universe(
-        max_tickers=PREMARKET_MAX_UNIVERSE,
-        volume_coverage=0.90,
+    return resolve_universe_for_bot(
+        bot_name="premarket",
+        bot_env_var="PREMARKET_TICKER_UNIVERSE",
+        max_universe_env="PREMARKET_MAX_UNIVERSE",
+        default_max_universe=DEFAULT_MAX_UNIVERSE,
+        apply_dynamic_filters=True,
     )
 
 
@@ -262,17 +278,19 @@ async def run_premarket() -> None:
       - Partial-day RVOL >= max(MIN_PREMARKET_RVOL, MIN_RVOL_GLOBAL)
       - Day volume so far >= MIN_VOLUME_GLOBAL
     """
+    print("[premarket] start")
     _reset_if_new_day()
 
     if not POLYGON_KEY or not _client:
         print("[premarket] POLYGON_KEY or client missing; skipping.")
+        record_bot_stats(BOT_NAME, 0, 0, 0, 0.0)
         return
 
-    if not _in_premarket_window():
+    if not PREMARKET_ALLOW_OUTSIDE_WINDOW and not _in_premarket_window():
         print("[premarket] Outside premarket window; skipping.")
+        record_bot_stats(BOT_NAME, 0, 0, 0, 0.0)
         return
 
-    BOT_NAME = "premarket"
     start_ts = time.time()
     alerts_sent = 0
     matched_symbols: set[str] = set()
@@ -280,6 +298,7 @@ async def run_premarket() -> None:
     universe = _get_universe()
     if not universe:
         print("[premarket] empty universe; skipping.")
+        record_bot_stats(BOT_NAME, 0, 0, 0, 0.0)
         return
 
     trading_day = date.today()
@@ -381,7 +400,7 @@ async def run_premarket() -> None:
             scanned=len(universe),
             matched=len(matched_symbols),
             alerts=alerts_sent,
-            runtime=run_seconds,
+            runtime_seconds=run_seconds,
         )
     except Exception as e:
         print(f"[premarket] record_bot_stats error: {e}")
