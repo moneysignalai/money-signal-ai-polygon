@@ -1,13 +1,19 @@
-import os
-import threading
+"""FastAPI app and background scheduler for MoneySignalAI bots."""
+
 import asyncio
 import importlib
+import os
+import threading
+import time
+import traceback
 from datetime import datetime
-from typing import Dict, Tuple, List
+from typing import Dict, List, Tuple
 
 import pytz
 import uvicorn
 from fastapi import FastAPI
+
+from bots.shared import in_premarket_window_est, in_rth_window_est, is_trading_day_est
 
 # ----------------- Time helpers -----------------
 
@@ -20,59 +26,62 @@ def now_est_str() -> str:
 
 # ----------------- Global config -----------------
 
-# Default global base polling interval (used as minimum sleep)
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "20"))
-BOT_TIMEOUT_SECONDS = int(os.getenv("BOT_TIMEOUT_SECONDS", "40"))
+BOT_TIMEOUT_SECONDS = int(os.getenv("BOT_TIMEOUT_SECONDS", "180"))
+STATUS_HEARTBEAT_INTERVAL_MIN = float(os.getenv("STATUS_HEARTBEAT_INTERVAL_MIN", "5"))
 
-# Per-bot interval can be overridden via env:
-#   <BOTNAME_UPPER>_INTERVAL, e.g. OPTIONS_FLOW_INTERVAL=20
+
+def _parse_bot_list(env_var: str) -> set[str]:
+    raw = os.getenv(env_var, "")
+    return {b.strip().lower() for b in raw.replace(" ", "").split(",") if b.strip()}
+
+
 def _interval_env(bot_name: str, default: int) -> int:
     key = f"{bot_name.upper()}_INTERVAL"
     try:
         v = int(os.getenv(key, str(default)))
-        return max(5, v)  # safety: minimum 5s
+        return max(5, v)
     except Exception:
         return default
 
 
-# DISABLED_BOTS: comma-separated list, e.g. "daily_ideas,options_indicator"
-DISABLED_BOTS = {
-    b.strip().lower()
-    for b in os.getenv("DISABLED_BOTS", "").replace(" ", "").split(",")
-    if b.strip()
-}
+DISABLED_BOTS = _parse_bot_list("DISABLED_BOTS")
+TEST_MODE_BOTS = _parse_bot_list("TEST_MODE_BOTS")
 
-# TEST_MODE_BOTS: comma-separated list of bots that should be considered "test only"
-TEST_MODE_BOTS = {
-    b.strip().lower()
-    for b in os.getenv("TEST_MODE_BOTS", "").replace(" ", "").split(",")
-    if b.strip()
-}
 
 # ----------------- Bot registry -----------------
 # (public_name, module_path, function_name, default_interval_seconds)
 
-_BOT_DEFS: List[Tuple[str, str, str, int]] = [
+BOT_DEFS: List[Tuple[str, str, str, int]] = [
     ("premarket", "bots.premarket", "run_premarket", 60),
-    ("equity_flow", "bots.equity_flow", "run_equity_flow", 20),
-    ("intraday_flow", "bots.intraday_flow", "run_intraday_flow", 20),
-    ("rsi_signals", "bots.rsi_signals", "run_rsi_signals", 20),
-    ("opening_range_breakout", "bots.openingrangebreakout", "run_opening_range_breakout", 20),
-    ("options_flow", "bots.options_flow", "run_options_flow", 20),
+    ("volume_monster", "bots.volume_monster", "run_volume_monster", 60),
+    ("gap_flow", "bots.gap_flow", "run_gap_flow", 60),
+    ("swing_pullback", "bots.swing_pullback", "run_swing_pullback", 60),
+    ("panic_flush", "bots.panic_flush", "run_panic_flush", 60),
+    ("momentum_reversal", "bots.momentum_reversal", "run_momentum_reversal", 60),
+    ("trend_rider", "bots.trend_rider", "run_trend_rider", 60),
+    ("rsi_signals", "bots.rsi_signals", "run_rsi_signals", 60),
+    (
+        "opening_range_breakout",
+        "bots.openingrangebreakout",
+        "run_opening_range_breakout",
+        20,
+    ),
+    ("options_cheap_flow", "bots.options_cheap_flow", "run_options_cheap_flow", 60),
+    ("options_unusual_flow", "bots.options_unusual_flow", "run_options_unusual_flow", 60),
+    ("options_whales", "bots.options_whales", "run_options_whales", 60),
+    ("options_iv_crush", "bots.options_iv_crush", "run_options_iv_crush", 60),
     ("options_indicator", "bots.options_indicator", "run_options_indicator", 60),
     ("squeeze", "bots.squeeze", "run_squeeze", 60),
-    ("earnings", "bots.earnings", "run_earnings", 300),
-    ("trend_flow", "bots.trend_flow", "run_trend_flow", 60),
     ("dark_pool_radar", "bots.dark_pool_radar", "run_dark_pool_radar", 60),
-    ("daily_ideas", "bots.daily_ideas", "run_daily_ideas", 600),
+    ("earnings", "bots.earnings", "run_earnings", 300),
+    ("daily_ideas", "bots.daily_ideas", "run_daily_ideas", 900),
+    ("status_report", "bots.status_report", "run_status", int(STATUS_HEARTBEAT_INTERVAL_MIN * 60)),
 ]
 
-# Final BOTS list with resolved intervals (after env overrides & disabled filter)
-# (public_name, module_path, function_name, interval_seconds)
+# Precompute effective intervals
 BOTS: List[Tuple[str, str, str, int]] = []
-for name, mod, func, base_interval in _BOT_DEFS:
-    if name.lower() in DISABLED_BOTS:
-        continue
+for name, mod, func, base_interval in BOT_DEFS:
     interval = _interval_env(name, base_interval)
     BOTS.append((name, mod, func, interval))
 
@@ -84,9 +93,6 @@ app = FastAPI(title="MoneySignalAI", version="1.0.0")
 
 @app.get("/")
 async def root():
-    """
-    Basic status endpoint.
-    """
     return {
         "status": "ok",
         "now_est": now_est_str(),
@@ -101,29 +107,141 @@ async def root():
                 "disabled": name.lower() in DISABLED_BOTS,
                 "test_mode": name.lower() in TEST_MODE_BOTS,
             }
-            for (name, module, func, interval) in _BOT_DEFS
+            for (name, module, func, interval) in BOTS
         ],
     }
 
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "now_est": now_est_str()}
+    summary = None
+    try:
+        from bots.status_report import _load_stats
+
+        data = _load_stats()
+        summary = data.get("bots", {}) if isinstance(data, dict) else None
+    except Exception:
+        summary = None
+
+    return {"status": "healthy", "now_est": now_est_str(), "summary": summary}
+
+
+def _validate_registry() -> None:
+    """Eagerly import bot modules to surface missing entrypoints early."""
+    for name, module_path, func_name, _ in BOTS:
+        try:
+            module = importlib.import_module(module_path)
+            func = getattr(module, "run_bot", None) or getattr(module, func_name, None)
+            if func is None:
+                print(
+                    f"[main] WARNING registry mismatch: {module_path} missing run_bot/{func_name}"
+                )
+            elif not asyncio.iscoroutinefunction(func):
+                print(
+                    f"[main] WARNING registry mismatch: {module_path}.{func_name} is not async"
+                )
+        except Exception as exc:
+            print(f"[main] WARNING failed to validate {name} ({module_path}): {exc}")
 
 
 # ----------------- Scheduler logic -----------------
 
-async def _run_single_bot(public_name: str, module_path: str, func_name: str, record_error):
+def _skip_reason(name: str) -> str | None:
+    """Return a human-readable skip reason for a bot if applicable."""
+    lname = name.lower()
+    if lname in DISABLED_BOTS:
+        return "disabled via DISABLED_BOTS"
+    if TEST_MODE_BOTS and lname not in TEST_MODE_BOTS:
+        return "not in TEST_MODE_BOTS while test mode is active"
+    return None
+
+
+def _time_window_allows(name: str, module_path: str) -> Tuple[bool, str | None]:
     """
-    Import and run a single bot with a per-bot timeout.
+    Combine trading-day/time-of-day heuristics with a bot-provided should_run_now().
+    This keeps scheduler visibility aligned with per-bot gating.
     """
+
+    lname = name.lower()
+
+    # Trading-day guard (Mon–Fri only); allow status_report to always run
+    if lname != "status_report" and not is_trading_day_est():
+        return False, "non-trading day"
+
+    # RTH-only bots
+    rth_bots = {
+        "volume_monster",
+        "gap_flow",
+        "swing_pullback",
+        "trend_rider",
+        "panic_flush",
+        "momentum_reversal",
+        "rsi_signals",
+        "options_cheap_flow",
+        "options_unusual_flow",
+        "options_whales",
+        "options_iv_crush",
+        "options_indicator",
+        "squeeze",
+        "dark_pool_radar",
+    }
+
+    # Premarket-only
+    if lname == "premarket":
+        if os.getenv("PREMARKET_ALLOW_OUTSIDE_WINDOW", "false").lower() == "true":
+            pass
+        elif not in_premarket_window_est():
+            return False, "outside premarket window"
+
+    if lname in rth_bots:
+        allow_outside = os.getenv(f"{lname.upper()}_ALLOW_OUTSIDE_RTH", "false").lower()
+        if allow_outside != "true" and not in_rth_window_est():
+            return False, "outside RTH window"
+
+    if lname in {"opening_range_breakout", "orb"}:
+        allow_outside = os.getenv("ORB_ALLOW_OUTSIDE_RTH", "false").lower() == "true"
+        if not allow_outside:
+            if not in_rth_window_est():
+                return False, "outside RTH window"
+            try:
+                limit = int(os.getenv("ORB_RANGE_MINUTES", "15"))
+            except Exception:
+                limit = 15
+            # Only allow within the opening range window
+            if not in_rth_window_est(0, limit):
+                return False, "outside ORB window"
+
+    # Delegate to bot-specific should_run_now if available
     try:
         module = importlib.import_module(module_path)
-        func = getattr(module, func_name, None)
-        if func is None:
-            raise AttributeError(f"{module_path} has no attribute {func_name}")
+        fn = getattr(module, "should_run_now", None)
+        if fn is None:
+            return True, None
 
-        # If the bot function is async, await it; otherwise run in thread pool.
+        result = fn()
+        if isinstance(result, tuple):
+            allowed, reason = result
+            return bool(allowed), reason
+        return bool(result), None
+    except Exception as exc:
+        print(f"[scheduler] warning checking time window for {module_path}: {exc}")
+        return True, None
+
+
+async def _run_single_bot(
+    public_name: str,
+    module_path: str,
+    func_name: str,
+    record_error,
+    record_stats=None,
+):
+    start_dt = datetime.now(eastern)
+    try:
+        module = importlib.import_module(module_path)
+        func = getattr(module, "run_bot", None) or getattr(module, func_name, None)
+        if func is None:
+            raise AttributeError(f"{module_path} has no attribute run_bot or {func_name}")
+
         if asyncio.iscoroutinefunction(func):
             await asyncio.wait_for(func(), timeout=BOT_TIMEOUT_SECONDS)
         else:
@@ -131,96 +249,128 @@ async def _run_single_bot(public_name: str, module_path: str, func_name: str, re
             await asyncio.wait_for(loop.run_in_executor(None, func), timeout=BOT_TIMEOUT_SECONDS)
 
     except Exception as e:
-        print(f"[main] ERROR running bot {public_name} ({module_path}.{func_name}): {e}")
+        tb = traceback.format_exc()
+        print(
+            f"[bot_runner] ERROR bot={public_name} fn={module_path}.{func_name} "
+            f"exc={e.__class__.__name__} msg={e}\n{tb}"
+        )
         if record_error is not None:
             try:
                 record_error(public_name, e)
             except Exception as inner:
                 print("[main] ERROR while recording bot error:", inner)
+        # Record a failed run so status shows attempted today
+        if record_stats is not None:
+            try:
+                finished_dt = datetime.now(eastern)
+                runtime = max((finished_dt - start_dt).total_seconds(), 0.0)
+                record_stats(
+                    public_name,
+                    scanned=0,
+                    matched=0,
+                    alerts=0,
+                    runtime_seconds=runtime,
+                    started_at=start_dt,
+                    finished_at=finished_dt,
+                )
+            except Exception as inner:
+                print(f"[bot_runner] warning recording failure stats for {public_name}: {inner}")
 
 
 async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS):
-    """
-    Main async loop that runs bots on their own cadence.
-
-    Each bot has its own interval, but we tick the loop every `base_interval_seconds`.
-    """
     print(
         f"[main] scheduler_loop starting with base_interval={base_interval_seconds}s, "
         f"bot_timeout={BOT_TIMEOUT_SECONDS}s"
     )
 
-    # Lazy import status_report helpers so we can log errors & send heartbeat
     try:
-        from bots.status_report import run_status, record_error
+        from bots.status_report import record_error
+        from bots.shared import record_bot_stats, today_est_date
     except Exception as e:
-        print(f"[main] WARNING: could not import bots.status_report: {e}")
-        run_status = None  # type: ignore
+        print(f"[main] WARNING: could not import status helpers: {e}")
         record_error = None  # type: ignore
+        record_bot_stats = None  # type: ignore
+        today_est_date = None  # type: ignore
 
-    # Per-bot next-run timestamps
-    next_run_ts: Dict[str, float] = {}
-    time_now = datetime.now(eastern).timestamp()
-    for name, _, _, interval in BOTS:
-        # Run everything once on startup
-        next_run_ts[name] = time_now
-
-    # Log configuration
-    print("[main] Bot configuration:")
-    for name, module_path, func_name, interval in _BOT_DEFS:
-        state = []
-        if name.lower() in DISABLED_BOTS:
-            state.append("DISABLED")
-        if name.lower() in TEST_MODE_BOTS:
-            state.append("TEST_MODE")
-        state_str = f" ({', '.join(state)})" if state else ""
-        effective_interval = _interval_env(name, interval)
-        print(f"  - {name}: {module_path}.{func_name}, interval={effective_interval}s{state_str}")
-
-    import time
+    next_run_ts: Dict[str, float] = {name: 0.0 for name, _, _, _ in BOTS}
+    last_skip_day: Dict[str, str] = {}
 
     while True:
-        cycle_start_dt = datetime.now(eastern)
-        cycle_start_ts = cycle_start_dt.timestamp()
-        print(f"[main] scheduler cycle starting at {cycle_start_dt.strftime('%H:%M:%S')} ET")
+        try:
+            cycle_start_ts = time.time()
+            cycle_start_dt = datetime.fromtimestamp(cycle_start_ts, tz=eastern)
+            print(
+                f"[main] scheduler cycle starting at {cycle_start_dt.strftime('%H:%M:%S')} ET"
+            )
 
-        tasks: List[asyncio.Task] = []
+            tasks: List[asyncio.Task] = []
+            for name, module_path, func_name, interval in BOTS:
+                skip = _skip_reason(name)
+                if skip:
+                    print(f"[scheduler] bot={name} action=SKIPPED_DISABLED reason={skip}")
+                    continue
 
-        # 1) schedule bots whose next_run_ts is due
-        for name, module_path, func_name, interval in BOTS:
-            due_ts = next_run_ts.get(name, 0.0)
-            if cycle_start_ts >= due_ts:
-                print(f"[main] scheduling bot {name} (interval={interval}s)")
-                tasks.append(
-                    asyncio.create_task(
-                        _run_single_bot(name, module_path, func_name, record_error)
+                allowed, reason = _time_window_allows(name, module_path)
+                if not allowed:
+                    print(
+                        f"[scheduler] bot={name} action=SKIPPED_TIME_WINDOW "
+                        f"reason={reason or 'time window closed'}"
                     )
-                )
-                next_run_ts[name] = cycle_start_ts + interval
+                    # Record a zero-scan skip once per trading day so status doesn't show "no run"
+                    if record_bot_stats and today_est_date:
+                        day_key = today_est_date().isoformat()
+                        last_key = last_skip_day.get(name)
+                        if last_key != day_key:
+                            try:
+                                record_bot_stats(
+                                    name,
+                                    scanned=0,
+                                    matched=0,
+                                    alerts=0,
+                                    runtime_seconds=0.0,
+                                )
+                                last_skip_day[name] = day_key
+                            except Exception as exc:
+                                print(
+                                    f"[scheduler] warning recording skip stats for {name}: {exc}"
+                                )
+                    next_run_ts[name] = cycle_start_ts + interval
+                    continue
 
-        # 2) schedule status_report.run_status, if available
-        if run_status is not None:
-            try:
-                print("[main] scheduling status heartbeat task")
-                tasks.append(asyncio.create_task(run_status()))
-            except Exception as e:
-                print(f"[main] ERROR scheduling run_status: {e}")
+                due_ts = next_run_ts.get(name, 0.0)
+                if cycle_start_ts >= due_ts:
+                    print(f"[scheduler] bot={name} action=RUN interval={interval}s")
+                    tasks.append(
+                        asyncio.create_task(
+                            _run_single_bot(
+                                name,
+                                module_path,
+                                func_name,
+                                record_error,
+                                record_stats=record_bot_stats,
+                            )
+                        )
+                    )
+                    next_run_ts[name] = cycle_start_ts + interval
+                else:
+                    wait_for = max(0.0, due_ts - cycle_start_ts)
+                    print(f"[scheduler] bot={name} action=WAITING next_in={wait_for:.1f}s")
 
-        # 3) wait for all tasks to complete (errors logged inside tasks)
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
-        cycle_end_dt = datetime.now(eastern)
-        elapsed = (cycle_end_dt - cycle_start_dt).total_seconds()
-        print(f"[main] scheduler cycle finished in {elapsed:.2f}s; sleeping {base_interval_seconds}s")
-
+            cycle_end_ts = time.time()
+            elapsed = cycle_end_ts - cycle_start_ts
+            print(
+                f"[main] scheduler cycle finished in {elapsed:.2f}s; "
+                f"sleeping {base_interval_seconds}s"
+            )
+        except Exception as exc:
+            print(f"[main] scheduler loop error: {exc}")
         await asyncio.sleep(base_interval_seconds)
 
 
-def _start_background_scheduler():
-    """
-    Run the async scheduler loop in a dedicated background thread.
-    """
+def _start_background_scheduler() -> None:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(scheduler_loop())
@@ -228,8 +378,8 @@ def _start_background_scheduler():
 
 @app.on_event("startup")
 async def startup_event():
-    """FastAPI startup hook."""
     print(f"[main] startup_event fired at {now_est_str()}")
+    _validate_registry()
     print(
         f"[main] launching background scheduler thread "
         f"(base_interval={SCAN_INTERVAL_SECONDS}s, bot_timeout={BOT_TIMEOUT_SECONDS}s)"
