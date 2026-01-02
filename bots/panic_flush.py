@@ -1,10 +1,9 @@
 """Panic Flush bot: flags capitulation-style selloffs with heavy volume.
 
 Criteria (price/volume only):
-- Large down day vs prior close (threshold set by env; defaults to mid-single digits)
+- Large down day vs prior close (threshold set by env)
 - High RVOL and dollar volume
-- Closing near the low of day
-- Optional from-open weakness
+- Trading near the low of day and below VWAP
 
 Universe: top-volume equities (Polygon/Massive) with fallback to TICKER_UNIVERSE.
 Runs during RTH unless PANIC_FLUSH_ALLOW_OUTSIDE_RTH is true.
@@ -46,7 +45,6 @@ _min_price = float(os.getenv("PANIC_FLUSH_MIN_PRICE", "3.0"))
 _min_dollar_vol = float(os.getenv("PANIC_FLUSH_MIN_DOLLAR_VOL", "150000"))
 _min_rvol = float(os.getenv("PANIC_FLUSH_MIN_RVOL", "1.1"))
 _max_from_low_pct = float(os.getenv("PANIC_FLUSH_MAX_FROM_LOW_PCT", "3.0"))
-_min_from_open_pct = float(os.getenv("PANIC_FLUSH_MIN_FROM_OPEN_PCT", "-2.0"))
 _avg_vol_lookback = int(os.getenv("PANIC_FLUSH_LOOKBACK_DAYS", os.getenv("DYNAMIC_MAX_LOOKBACK_DAYS", "5")))
 
 _drop_env = os.getenv("PANIC_FLUSH_MIN_DAY_DROP_PCT")
@@ -90,6 +88,27 @@ class DailyStats:
     @property
     def low_close_distance_pct(self) -> float:
         return ((self.close - self.low) / self.close * 100) if self.close > 0 else 0.0
+
+
+def _compute_rsi(closes: List[float], period: int = 14) -> float:
+    if len(closes) <= period:
+        return 0.0
+    gains: List[float] = []
+    losses: List[float] = []
+    for prev, curr in zip(closes[:-1], closes[1:]):
+        delta = curr - prev
+        if delta >= 0:
+            gains.append(delta)
+            losses.append(0.0)
+        else:
+            gains.append(0.0)
+            losses.append(-delta)
+    avg_gain = mean(gains[-period:]) if gains[-period:] else 0.0
+    avg_loss = mean(losses[-period:]) if losses[-period:] else 0.0
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 0.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
 
 def _fetch_daily(sym: str, days: int) -> List:
@@ -229,12 +248,12 @@ def _format_relative_vwap(last: float, vwap: float) -> str:
         return "n/a"
     diff_pct = (last - vwap) / vwap * 100
     if diff_pct <= -1.5:
-        return f"trading well below VWAP ({diff_pct:.1f}%)"
+        return f"BELOW ({diff_pct:.1f}%)"
     if diff_pct < 0:
         return f"slightly below VWAP ({diff_pct:.1f}%)"
     if diff_pct < 1.5:
         return f"hugging VWAP ({diff_pct:.1f}%)"
-    return f"firmly above VWAP (+{diff_pct:.1f}%)"
+    return f"ABOVE (+{diff_pct:.1f}%)"
 
 
 def _day_structure(summary: DailyStats, dist_from_low_pct: float, vwap_diff: float) -> str:
@@ -251,15 +270,15 @@ def _format_panic_alert(sym: str, stats: DailyStats, intraday: List) -> str:
     vwap_text = _format_relative_vwap(stats.close, vwap) if vwap else "n/a"
     vwap_diff = ((stats.close - vwap) / vwap * 100) if vwap else 0.0
     structure_text = _day_structure(stats, dist_from_low_pct, vwap_diff)
-    prior_low_text = f"${stats.prev_low:.2f}" if stats.prev_low > 0 else "n/a"
     recent_low_text = None
     if stats.recent_low > 0:
         if stats.close <= stats.recent_low * 1.02:
-            recent_low_text = f"pressing into recent lows near ${stats.recent_low:.2f}"
+            recent_low_text = f"Pressing into recent lows near ${stats.recent_low:.2f}"
         else:
-            recent_low_text = "not near recent lows"
-    closing_near_lows_flag = "Yes" if stats.low_close_distance_pct <= _max_from_low_pct else "No"
+            recent_low_text = "Not near recent lows"
+
     bounce_high = None
+    rsi_val = 0.0
     if intraday:
         lows = [(_extract_ohlcv(b)[2], idx) for idx, b in enumerate(intraday)]
         if lows:
@@ -267,6 +286,12 @@ def _format_panic_alert(sym: str, stats: DailyStats, intraday: List) -> str:
             highs_after_low = [_extract_ohlcv(b)[1] for b in intraday[low_idx:]]
             bounce_high_val = max(highs_after_low) if highs_after_low else 0.0
             bounce_high = bounce_high_val if bounce_high_val > 0 else None
+        closes = [
+            float(getattr(b, "close", getattr(b, "c", 0.0)) or 0.0)
+            for b in intraday
+            if float(getattr(b, "close", getattr(b, "c", 0.0)) or 0.0) > 0
+        ]
+        rsi_val = _compute_rsi(closes) if closes else 0.0
 
     timestamp = format_est_timestamp()
     header = f"⚠️ PANIC FLUSH — {sym}"
@@ -274,39 +299,35 @@ def _format_panic_alert(sym: str, stats: DailyStats, intraday: List) -> str:
         header,
         f"🕒 {timestamp}",
         "",
-        "💰 Price + Volume",
-        f"• Last: ${stats.close:.2f} ({stats.day_change_pct:.1f}% DOWN)",
-        f"• From Open: {stats.from_open_pct:.1f}% DOWN",
-        f"• RVOL: {stats.rvol:.1f}×",
-        f"• Volume: {int(stats.volume):,}",
-        f"• Dollar Vol: ${stats.dollar_vol:,.0f}",
-        "",
-        "📉 Intraday Damage",
+        "💰 Price + Damage",
+        f"• Last: ${stats.close:.2f} ({stats.day_change_pct:.1f}% today)",
         f"• O ${stats.open:.2f} · H ${stats.high:.2f} · L ${stats.low:.2f} · C ${stats.close:.2f}",
-        f"• Closing Near Lows? {closing_near_lows_flag}",
+        f"• Distance from LOD: {dist_from_low_pct:.1f}%",
+        "",
+        "📊 Liquidity",
+        f"• Volume: {int(stats.volume):,}",
+        f"• RVOL: {stats.rvol:.1f}×",
+        f"• Dollar Vol: ${stats.dollar_vol:,.0f}",
     ]
-    multi_day_text = recent_low_text or "no recent lows context computed"
-    lines.append(f"• Multi-day context: {multi_day_text}")
-
-    if vwap:
-        lines.append("")
-        lines.append("📈 VWAP & Structure")
-        lines.append(f"• VWAP: ${vwap:.2f} ({vwap_text})")
-        lines.append(f"• Day structure: {structure_text}")
-    else:
-        lines.append(f"• Day structure: {structure_text}")
 
     lines.append("")
-    lines.append("🔎 Reference levels")
-    lines.append(f"• Support: today’s low ${stats.low:.2f} and prior day low {prior_low_text}")
+    lines.append("📉 Context")
     if vwap:
-        resistance_parts = [f"VWAP ${vwap:.2f}"]
-        if bounce_high:
-            resistance_parts.append(f"bounce high ${bounce_high:.2f}")
-        lines.append(f"• Resistance: {', '.join(resistance_parts)}")
+        lines.append(f"• VWAP: {vwap_text}")
+    if rsi_val:
+        lines.append(f"• RSI(14): {rsi_val:.1f} (pressure zone)")
+    if recent_low_text:
+        lines.append(f"• Multi-day context: {recent_low_text}")
+    else:
+        lines.append("• Multi-day context: n/a")
+    if vwap:
+        lines.append(f"• Day structure: {structure_text}")
+    if bounce_high:
+        lines.append(f"• Bounce high after LOD: ${bounce_high:.2f}")
+
     lines.append("")
     lines.append("🧠 Read")
-    lines.append("Violent sell pressure with elevated liquidity. Possible capitulation / flush zone for contrarian setups.")
+    lines.append("Heavy capitulation selling with price pinned near lows. Very risky, but often where reflex bounces can start.")
     lines.append("")
     lines.append("🔗 Chart")
     lines.append(chart_link(sym))
@@ -370,13 +391,26 @@ async def run_panic_flush() -> None:
                     reason_counts["rvol"] = reason_counts.get("rvol", 0) + 1
                     continue
 
-                if stats.from_open_pct > _min_from_open_pct:
-                    debug_filter_reason(BOT_NAME, sym, "panic_not_weak_from_open")
-                    reason_counts["from_open"] = reason_counts.get("from_open", 0) + 1
+                range_span = stats.high - stats.low
+                if range_span > 0:
+                    range_pos = (stats.close - stats.low) / range_span
+                    if range_pos > 0.2:
+                        debug_filter_reason(BOT_NAME, sym, "panic_not_bottom_range")
+                        reason_counts["range_pos"] = reason_counts.get("range_pos", 0) + 1
+                        continue
+
+                intraday = _fetch_intraday(sym)
+                if not intraday:
+                    debug_filter_reason(BOT_NAME, sym, "panic_no_intraday")
+                    reason_counts["no_intraday"] = reason_counts.get("no_intraday", 0) + 1
+                    continue
+                vwap = _compute_vwap(intraday)
+                if vwap <= 0 or stats.close >= vwap:
+                    debug_filter_reason(BOT_NAME, sym, "panic_not_below_vwap")
+                    reason_counts["vwap"] = reason_counts.get("vwap", 0) + 1
                     continue
 
                 matches += 1
-                intraday = _fetch_intraday(sym)
                 alert_text = _format_panic_alert(sym, stats, intraday)
                 send_alert_text(alert_text)
                 alerts += 1
