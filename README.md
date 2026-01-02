@@ -17,7 +17,7 @@ MoneySignalAI is an institutional-grade, multi-bot equities and options alerting
   - Runs bots concurrently with asyncio and captures per-bot errors via `record_error`.
 - **Shared utilities (`bots/shared.py`)**
   - EST time helpers (`format_est_timestamp`, `now_est`, RTH/premarket checks, trading-day detection).
-  - Dynamic universe resolver (top-by-volume, capped at 1,500; fallback `TICKER_UNIVERSE`).
+  - Dynamic universe resolver (top-by-volume, capped at 250; fallback `TICKER_UNIVERSE`).
   - Data helpers (RVOL, RSI, MAs, Bollinger, VWAP), Telegram senders (`send_alert`, `send_alert_text`), chart links, stats helpers (`record_bot_stats`).
 - **Options utilities (`bots/options_common.py`)**
   - OCC parsing, contract display, IV/notional/DTE helpers, and premium formatters for all option flow bots.
@@ -67,7 +67,7 @@ Real template examples mirroring current code output. Timestamps are EST, date f
 ### Premarket Scanner
 ```
 📣 PREMARKET — MDB
-🕒 09:05 AM EST · Jan 01
+🕒 09:05 AM EST · 01-01-2026
 💰 $382.40 · 📊 RVOL 1.8x
 ────────────
 🚀 Premarket move: +4.7% vs prior close
@@ -81,7 +81,7 @@ Real template examples mirroring current code output. Timestamps are EST, date f
 ### Volume Monster
 ```
 🧠 VOLUME MONSTER — AXSM
-🕒 01-01-2026 · 02:53 PM EST
+🕒 02:53 PM EST · 01-01-2026
 
 💰 Price + Move
 • Last: $182.64 (+22.8% UP)
@@ -103,7 +103,7 @@ https://www.tradingview.com/chart/?symbol=AXSM
 ### Gap Flow (Gap Up / Gap Down)
 ```
 🧠 GAP FLOW — AXSM
-🕒 01-01-2026 · 09:58 AM EST
+🕒 09:58 AM EST · 01-01-2026
 
 💰 Gap Stats
 • Gap: +6.5% vs prior close (Gap Up 🔼)

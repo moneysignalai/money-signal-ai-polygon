@@ -497,20 +497,39 @@ def _get_options_override_universe() -> List[str]:
     return tickers
 
 
+MAX_UNIVERSE_CAP = 250
+
+
+def _should_log_universe(now_ts: float) -> bool:
+    """Emit a universe log at most once per minute to avoid spam."""
+
+    last_log = _UNIVERSE_CACHE.get("log_ts") or 0.0
+    if now_ts - float(last_log) >= 60.0:
+        _UNIVERSE_CACHE["log_ts"] = now_ts
+        return True
+    return False
+
+
 def _get_top_volume_universe_sync(
-    max_tickers: int = 1500, volume_coverage: Optional[float] = None
+    max_tickers: int = MAX_UNIVERSE_CAP, volume_coverage: Optional[float] = None
 ) -> List[str]:
     """Return a liquid universe ordered by dollar volume with layered fallbacks."""
 
     now_ts = time.time()
     if _UNIVERSE_CACHE["data"] and now_ts - float(_UNIVERSE_CACHE["ts"]) < 60.0:
-        return _UNIVERSE_CACHE["data"][:max_tickers]
+        cached = _UNIVERSE_CACHE["data"][:max_tickers]
+        if _should_log_universe(now_ts):
+            print(
+                f"[universe] using cached top-volume universe size={len(cached)} "
+                f"(source=TOP_250_VOLUME)"
+            )
+        return cached
 
     try:
         env_cap = int(os.getenv("DYNAMIC_MAX_TICKERS", str(max_tickers)))
-        max_tickers = max(1, min(max_tickers, env_cap, 1500))
+        max_tickers = max(1, min(max_tickers, env_cap, MAX_UNIVERSE_CAP))
     except Exception:
-        max_tickers = max(1, min(max_tickers, 1500))
+        max_tickers = max(1, min(max_tickers, MAX_UNIVERSE_CAP))
 
     tickers: List[Tuple[str, float]] = []
     if POLYGON_KEY:
@@ -551,8 +570,10 @@ def _get_top_volume_universe_sync(
                 break
         _UNIVERSE_CACHE["ts"] = now_ts
         _UNIVERSE_CACHE["data"] = universe
+        _UNIVERSE_CACHE["log_ts"] = now_ts
         print(
-            f"[universe] using top-volume universe size={len(universe)} (source=massive/polygon)"
+            f"[universe] using top-volume universe size={len(universe)} "
+            f"(source=TOP_250_VOLUME)"
         )
         return universe[:max_tickers]
 
@@ -563,19 +584,22 @@ def _get_top_volume_universe_sync(
     if env_universe:
         _UNIVERSE_CACHE["ts"] = now_ts
         _UNIVERSE_CACHE["data"] = env_universe
+        _UNIVERSE_CACHE["log_ts"] = now_ts
         print(
-            f"[universe] massive volume feed unavailable, using ENV TICKER_UNIVERSE size={len(env_universe)}"
+            f"[universe] massive volume feed unavailable, using ENV TICKER_UNIVERSE "
+            f"size={len(env_universe)}"
         )
         return env_universe[:max_tickers]
 
     print("[universe] CRITICAL: universe empty — using emergency minimal fallback set")
     _UNIVERSE_CACHE["ts"] = now_ts
     _UNIVERSE_CACHE["data"] = _EMERGENCY_UNIVERSE
+    _UNIVERSE_CACHE["log_ts"] = now_ts
     return _EMERGENCY_UNIVERSE[:max_tickers]
 
 
 async def get_top_volume_universe(
-    limit: int = 1500, volume_coverage: Optional[float] = None
+    limit: int = MAX_UNIVERSE_CAP, volume_coverage: Optional[float] = None
 ) -> List[str]:
     """Async helper wrapper for fetching the top-volume universe with fallbacks."""
 
@@ -585,7 +609,7 @@ async def get_top_volume_universe(
 
 
 def get_dynamic_top_volume_universe(
-    max_tickers: int = 100, volume_coverage: Optional[float] = None
+    max_tickers: int = MAX_UNIVERSE_CAP, volume_coverage: Optional[float] = None
 ) -> List[str]:
     """Backwards-compatible wrapper for older callers (uses top-volume resolver)."""
 
@@ -608,9 +632,10 @@ async def resolve_options_underlying_universe(
     """
 
     try:
-        env_cap = int(os.getenv("OPTIONS_FLOW_MAX_UNIVERSE", "2000"))
+        env_cap = int(os.getenv("OPTIONS_FLOW_MAX_UNIVERSE", str(MAX_UNIVERSE_CAP)))
     except Exception:
-        env_cap = 2000
+        env_cap = MAX_UNIVERSE_CAP
+    env_cap = min(env_cap, MAX_UNIVERSE_CAP)
     if max_tickers is None:
         max_tickers = env_cap
     else:
@@ -675,9 +700,9 @@ def resolve_universe_for_bot(
         except Exception:
             return None
 
-    dyn_cap = _int_env("DYNAMIC_MAX_TICKERS") or default_max_universe or 2000
-    # Hard cap to 1500 per requirements to avoid overly wide scans.
-    dyn_cap = min(dyn_cap, 1500)
+    dyn_cap = _int_env("DYNAMIC_MAX_TICKERS") or default_max_universe or MAX_UNIVERSE_CAP
+    # Hard cap to 250 per requirements to avoid overly wide scans.
+    dyn_cap = min(dyn_cap, MAX_UNIVERSE_CAP)
     resolved_max = dyn_cap
     if max_universe_env:
         env_cap = _int_env(max_universe_env)
