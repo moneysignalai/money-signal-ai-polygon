@@ -97,14 +97,17 @@ def _fetch_earnings_for_symbol(sym: str, earning_date: date) -> Optional[Dict[st
 async def run_earnings():
     if not POLYGON_KEY:
         print("[earnings] POLYGON_KEY missing; skipping.")
+        record_bot_stats("earnings", 0, 0, 0, 0.0)
         return
 
     client = _get_client()
     if not client:
+        record_bot_stats("earnings", 0, 0, 0, 0.0)
         return
 
     if not _within_earnings_hours():
         print("[earnings] Outside earnings window; skipping.")
+        record_bot_stats("earnings", 0, 0, 0, 0.0)
         return
 
     BOT_NAME = "earnings"
@@ -193,13 +196,6 @@ async def run_earnings():
 
         # -------------- EARNINGS FUNDAMENTALS (stub) --------------
         earnings_rec = _fetch_earnings_for_symbol(sym, today)
-        if not earnings_rec:
-            # Do not alert—this is only for actual earnings events.
-            continue
-
-        # Real alert logic (if we had fundamentals)
-        # Currently unreachable due to stub unless you integrate real API.
-        # Kept here for completeness:
 
         _mark_alerted(sym)
         alerts_sent += 1
@@ -211,6 +207,9 @@ async def run_earnings():
         now_str = now_est()
         emoji = "💎"
         bias = "Post-earnings momentum long" if move_pct > 0 else "Post-earnings fade candidate"
+        earnings_context = (
+            f"Earnings: {earnings_rec.get('report', 'N/A')}" if earnings_rec else "Earnings event (details unavailable)"
+        )
 
         body = (
             f"{emoji} EARNINGS MOVE — {sym}\n"
@@ -219,6 +218,7 @@ async def run_earnings():
             f"📊 Move: {move_pct:.1f}% · Gap: {gap_pct:.1f}% · Intraday: {intraday_pct:.1f}%\n"
             f"📦 Vol: {today_bar.volume:,.0f} (≈ ${dollar_vol:,.0f}) · RVOL: {rvol:.1f}x\n"
             f"🎯 Grade: {grade}\n"
+            f"📰 {earnings_context}\n"
             f"🔗 Chart: {chart_link(sym)}"
         )
 
@@ -232,7 +232,7 @@ async def run_earnings():
         scanned=len(universe),
         matched=len(matches),
         alerts=alerts_sent,
-        runtime=run_seconds,
+        runtime_seconds=run_seconds,
     )
 
     print(
