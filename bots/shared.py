@@ -1,5 +1,6 @@
 # bots/shared.py
 import asyncio
+import asyncio
 import os
 import time
 import math
@@ -1056,7 +1057,13 @@ def get_last_option_trades_cached(
     params = {"apiKey": POLYGON_KEY}
 
     timeout = 20.0
-    retries = 1
+    try:
+        asyncio.get_running_loop()
+        in_async_context = True
+    except RuntimeError:
+        in_async_context = False
+
+    retries = 1 if not in_async_context else 0
     backoff_seconds = 2.5
 
     for attempt in range(retries + 1):
@@ -1077,7 +1084,14 @@ def get_last_option_trades_cached(
                     f"[shared:last_option_trade] HTTP error on attempt "
                     f"{attempt+1}/{retries+1}: {e} — retrying in {wait:.1f}s"
                 )
-                time.sleep(wait)
+                if in_async_context:
+                    try:
+                        asyncio.run(asyncio.sleep(wait))
+                    except RuntimeError:
+                        # Already running loop; skip blocking sleep to avoid stalling scheduler
+                        pass
+                else:
+                    time.sleep(wait)
                 _handle_request_failure("shared:last_option_trade", exc=e)
             else:
                 msg = (
