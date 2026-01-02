@@ -1,339 +1,523 @@
-my<p align="center">
-  <img src="docs/moneysignal-logo.png" alt="MoneySignalAI Logo" width="420">
-</p>
+# MoneySignalAI — Polygon Data Engine
 
-<h1 align="center">💚 MoneySignalAI 💚</h1>
+MoneySignalAI is an institutional-grade, multi-bot equities and options alerting platform built in Python. It scans a dynamic top-volume universe (up to ~1,500 tickers with `TICKER_UNIVERSE` fallback), applies strategy-specific filters, and streams emoji-rich, trader-ready alerts to Telegram. The FastAPI scheduler runs multiple bots in parallel, enforces time windows, and emits a heartbeat with per-bot health, scan counts, and runtimes.
 
-<p align="center">
-  <b>15-in-1 Market Intelligence Bot Suite for Stocks, Options, Flow & Momentum</b><br>
-  Built on <a href="https://polygon.io">Polygon.io</a> • Deployed on <a href="https://render.com">Render</a> • Alerts on Telegram
-</p>
-
-<p align="center">
-  <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white" />
-  <img src="https://img.shields.io/badge/Framework-FastAPI-009688?logo=fastapi&logoColor=white" />
-  <img src="https://img.shields.io/badge/Data-Polygon.io-00B3FF?logo=data:image/svg+xml;base64,IA==" />
-  <img src="https://img.shields.io/badge/Deploy-Render-46E3B7?logo=render&logoColor=white" />
-  <img src="https://img.shields.io/badge/Alerts-Telegram-26A5E4?logo=telegram&logoColor=white" />
-</p>
+- **AI-powered, modular bot engine** across equity momentum, intraday flows, gaps, squeezes, dark pool, earnings, options flow, analytics, and daily ideas.
+- **Real-time Polygon/Massive data** with EST-aware trading-day logic and dynamic top-volume universes.
+- **Env-driven tuning** for every threshold (RVOL, dollar volume, IV crush %, DTE, gap %, RSI bands, etc.).
+- **Production telemetry** via `status_report.py` (today-only stats, diagnostics, runtimes) and Telegram delivery.
+- **Scales to 1,500+ tickers** with safe fallbacks and per-bot timeouts.
 
 ---
 
-## ⚡ What Is MoneySignalAI?
+## 1️⃣ System Architecture Overview
+- **Scheduler / FastAPI (`main.py`)**
+  - Registry of bots (public name, module, async entrypoint, interval, schedule type).
+  - Applies `DISABLED_BOTS`, `TEST_MODE_BOTS`, RTH/premarket/slot gates, and per-bot timeouts.
+  - Runs bots concurrently with asyncio and captures per-bot errors via `record_error`.
+- **Shared utilities (`bots/shared.py`)**
+  - EST time helpers (`format_est_timestamp`, `now_est`, RTH/premarket checks, trading-day detection).
+  - Dynamic universe resolver (top-by-volume, capped at 1,500; fallback `TICKER_UNIVERSE`).
+  - Data helpers (RVOL, RSI, MAs, Bollinger, VWAP), Telegram senders (`send_alert`, `send_alert_text`), chart links, stats helpers (`record_bot_stats`).
+- **Options utilities (`bots/options_common.py`)**
+  - OCC parsing, contract display, IV/notional/DTE helpers, and premium formatters for all option flow bots.
+- **Bots (`bots/*.py`)**
+  - Each strategy exposes an async `run_*` entrypoint, reads env thresholds once, uses shared helpers for universes/time windows, and always records stats.
+- **Status / Heartbeat (`bots/status_report.py`)**
+  - Loads `STATUS_STATS_PATH`, aggregates today-only scanned/matches/alerts, diagnostics (high scan/zero alerts, zero scans, not run today), runtimes, and sends the MoneySignalAI Heartbeat to Telegram.
 
-**MoneySignalAI** is a high-octane, async scanner that runs **multiple alpha bots at once**, watches the whole US equities market, and pushes **clean, emoji-styled alerts** to your Telegram.
-
-Instead of staring at charts all day, you get:
-
-- 🐋 **Whale options flow**
-- 🧊 **IV crush after earnings**
-- 🌑 **Dark pool clusters**
-- 🔥 **Cheap 0DTE plays**
-- 📈 **Daily breakouts**
-- 💥 **Panic flush wipeouts**
-- 🔄 **A+ pullbacks in strong trends**
-- …all in **one bot suite**, running automatically.
-
----
-
-## 📊 Included Bots (15 Total)
-
-### 🔥 High-Conviction Options Bots
-
-| # | Bot | What It Hunts | Time (EST) | Type |
-|---|-----|---------------|-----------|------|
-| 1 | **Cheap 0DTE / 3DTE Hunter** | Cheap weekly options on $10–$80 names with high IV + RVOL surge | 9:30–16:00 | Options |
-| 2 | **Unusual Options Sweeps** | Big call/put sweeps and concentrated premium in one contract | 9:30–16:00 | Options |
-| 3 | **Whales** | Single-contract orders with notional ≥ \$2M (CALLS + PUTS) | 9:30–16:00 | Options |
-| 4 | **IV Crush / Earnings Post-Mortem** | Day-over-day IV collapse vs actual move after earnings/events | 7:00–16:00 | Options |
+**Text diagram**
+```
+[Polygon/Massive API] -> shared.py (time, universe, data, alerts, stats)
+                      -> options_common.py (option parsing/formatting)
+main.py scheduler -> bot registry -> async run_* per bot -> record_bot_stats
+status_report.py -> today-only aggregation -> heartbeat to Telegram
+Telegram -> alerts + heartbeat delivered to TELEGRAM_CHAT_ALL
+```
 
 ---
 
-### 📈 Momentum, Breakouts & Reversals
+## 2️⃣ Full Bot List + What They Do
+Each bot uses the shared dynamic universe (top-by-volume capped at ~1,500) with `TICKER_UNIVERSE` fallback and EST time gating unless noted.
 
-| # | Bot | What It Hunts | Time (EST) | Type |
-|---|-----|---------------|-----------|------|
-| 5 | **ORB (Opening Range Breakout)** | 15-min ORB + clean 5-min confirmation, with RVOL filters | 9:45–11:00 | Price Action |
-| 6 | **Gap & Go / Gap Down** | Overnight gap up/down + strong open volume, low junk | 9:30–10:30 | Price Action |
-| 7 | **Momentum Reversal** | Overextended intraday runs that start reversing with volume | 11:30–16:00 | Price Action |
-| 8 | **Trend Rider** | 20 EMA > 50 EMA and breakout > 20-day high (or breakdown < 20-day low) | 15:30–20:00 | Daily Trend |
-| 9 | **Swing Pullback** | Strong uptrend + multi-day dip + bounce near 20 EMA | 9:30–16:00 | Swing |
-|10 | **Panic Flush** | -12%+ down days near 52-week lows with huge RVOL | 9:30–16:00 | Capitulation |
-|11 | **Volume Monster** | 1-minute bars with insane relative volume | 9:30–16:00 | Analytics |
+- **Premarket Scanner** – Finds premarket gappers with RVOL/price/dollar-vol floors. Env: `MIN_PREMARKET_MOVE_PCT`, `MIN_PREMARKET_DOLLAR_VOL`, `MIN_PREMARKET_RVOL`, `MIN_PREMARKET_PRICE`, `PREMARKET_TICKER_UNIVERSE`. Runs premarket window only.
+- **Volume Monster** – Pure liquidity explosion detector (institutional participation). Env: `VOLUME_MONSTER_MIN_DOLLAR_VOL`, `VOLUME_MONSTER_RVOL`, global floors. Runs RTH.
+- **Gap Flow** – Gap + continuation behavior (holding strength after open). Env: `MIN_PREMARKET_MOVE_PCT`, `MIN_PREMARKET_DOLLAR_VOL`, `MIN_PREMARKET_RVOL`, global floors. Runs RTH.
+- **Trend Rider** – Institutional trend continuation & breakout structure (stacked MAs, VWAP alignment). Env: `TREND_RIDER_MIN_DOLLAR_VOL`, `TREND_RIDER_MIN_RVOL`, `TREND_RIDER_TREND_DAYS`, `TREND_RIDER_MIN_BREAKOUT_PCT`, global floors. Runs RTH.
+- **Swing Pullback** – Controlled dip-buys inside strong uptrends near key MAs. Env: `SWING_*` thresholds (pullback %, trend days, RVOL, dollar vol), global floors. Runs RTH.
+- **Panic Flush** – Capitulation detector: heavy down days pinned near lows with big RVOL (not a reversal confirmer). Env: `PANIC_FLUSH_MIN_DROP`, `PANIC_FLUSH_MIN_RVOL`, `PANIC_FLUSH_MAX_FROM_LOW_PCT`, global floors. Runs RTH.
+- **Momentum Reversal** – Confirmed intraday reversals after strong moves (VWAP reclaim/loss + range recoveries). Env: `MOMO_REV_MIN_RECLAIM_PCT`, `MOMO_REV_MIN_RVOL`, `MOMO_REV_MIN_MOVE_PCT`, `MOMO_REV_MAX_FROM_EXTREME_PCT`, global floors. Runs RTH.
+- **RSI Signals** – Pure RSI extremes (overbought/oversold) with liquidity filters. Env: `RSI_PERIOD`, `RSI_TIMEFRAME_MIN`, `RSI_OVERBOUGHT`, `RSI_OVERSOLD`, `RSI_MIN_PRICE`, `RSI_MIN_DOLLAR_VOL`, `RSI_MAX_UNIVERSE`, global floors. Runs RTH.
+- **Opening Range Breakout (ORB)** – Breaks above/below opening range with volume confirmation and VWAP context. Env: `ORB_RANGE_MINUTES`, `ORB_MIN_DOLLAR_VOL`, `ORB_MIN_RVOL`, `ORB_START_MINUTE`, `ORB_END_MINUTE`, global floors. Runs RTH opening window.
+- **Squeeze Bot** – Volatility compression → expansion breakout detector (compression first, then direction). Env: `SQUEEZE_*` thresholds, global floors. Runs RTH.
+- **Dark Pool Radar** – Highlights unusual dark-pool prints (count, total notional, largest print) for today. Env: `DARK_POOL_MIN_NOTIONAL`, `DARK_POOL_MIN_LARGEST_PRINT`, `DARK_POOL_LOOKBACK_MINUTES`, global floors. Runs RTH.
+- **Earnings Scanner** – Surfaces notable earnings movers/upcoming events. Env: `EARNINGS_MAX_FORWARD_DAYS`, plus earnings price/move/dollar-vol floors. Runs on a slower cadence.
+- **Options Cheap Flow** – Low-premium contracts with meaningful size/notional. Env: `CHEAP_MAX_PREMIUM`, `CHEAP_MIN_NOTIONAL`, `CHEAP_MIN_SIZE`, `OPTIONS_MIN_UNDERLYING_PRICE`, `OPTIONS_FLOW_MAX_UNIVERSE`. Runs RTH.
+- **Options Unusual Flow** – Outlier size/notional vs typical flow. Env: `UNUSUAL_MIN_NOTIONAL`, `UNUSUAL_MIN_SIZE`, `UNUSUAL_MAX_DTE`, `OPTIONS_MIN_UNDERLYING_PRICE`. Runs RTH.
+- **Options Whale Flow** – Very large “whale” orders. Env: `WHALES_MIN_NOTIONAL`, `WHALES_MIN_SIZE`, `WHALES_MAX_DTE`, `OPTIONS_MIN_UNDERLYING_PRICE`. Runs RTH.
+- **Options IV Crush** – Contracts with sharp IV drops (post-catalyst). Env: `IVCRUSH_MIN_IV_DROP_PCT`, `IVCRUSH_MIN_VOL`, `IVCRUSH_MAX_DTE`, `OPTIONS_MIN_UNDERLYING_PRICE`. Runs RTH.
+- **Options Indicator (Analytics)** – Regime-based IV momentum vs reversal with MACD/RSI/Bollinger/OI context. Env: shared options thresholds + indicator IV rank bounds. Runs RTH.
+- **Daily Ideas Bot** – Twice-daily confluence scoring (trend + VWAP + RVOL + RSI + options bias) with top LONG/SHORT lists. Slots: AM (10:45–11:00 ET), PM (15:15–15:30 ET). Uses shared thresholds/universe.
 
 ---
 
-### 🌑 Events, Liquidity & System Health
+## 3️⃣ 📢 Example Alerts
+Real template examples mirroring current code output. Timestamps are EST, date format `MM-DD-YYYY`.
 
-| # | Bot | What It Hunts | Time (EST) | Type |
-|---|-----|---------------|-----------|------|
-|12 | **Pre-Market Runner** | +8% premarket movers with real volume | 4:00–9:29 | Pre-Market |
-|13 | **Earnings Catalyst** | Stocks with upcoming earnings + RVOL “loading” | 7:00–22:00 | Events |
-|14 | **Dark Pool Radar** | Clusters of dark/ATS prints (10M–50M+) over last X minutes | 4:00–20:00 | Liquidity |
-|15 | **Status / Health Bot** | Scan cycles, errors, environment sanity pings | Scheduled | Utility |
-
----
-
-## 🧱 Architecture (High Level)
-
-```text
-main.py
- ├─ FastAPI app (health endpoint /)
- ├─ background loop (every 60s)
- └─ launches all bots concurrently (asyncio.gather)
-
-bots/
- ├─ cheap.py             # Cheap 0DTE / 3DTE
- ├─ unusual.py           # Unusual sweeps / flow
- ├─ whales.py            # $2M+ whale orders
- ├─ iv_crush.py          # Earnings IV crush
- ├─ dark_pool_radar.py   # Dark/ATS clusters
- ├─ panic_flush.py       # True capitulation
- ├─ swing_pullback.py    # A+ uptrend pullbacks
- ├─ trend_rider.py       # Daily breakouts
- ├─ volume.py            # Volume monster
- ├─ orb.py               # Opening Range Breakout
- ├─ gap.py               # Gap up / gap down
- ├─ premarket.py         # Pre-market runners
- ├─ earnings.py          # Earnings calendar / movers
- ├─ momentum_reversal.py # Late-day reversals
- └─ status_report.py     # System heartbeat
-
-bots/shared.py
- ├─ POLYGON_KEY, global RVOL/volume thresholds
- ├─ send_alert() / send_status()
- ├─ dynamic most-active universe builder
- ├─ equity setup grading (A+, A, B, C)
- └─ small helpers: chart_link(), is_etf_blacklisted(), etc.
-
-⚙️ Local Installation
-
-1️⃣ Clone the repo
-
-git clone https://github.com/YOURNAME/money-signal-ai.git
-cd money-signal-ai
-
-2️⃣ Create a virtualenv (optional but recommended)
-
-python -m venv .venv
-source .venv/bin/activate      # macOS / Linux
-# or
-.\.venv\Scripts\activate       # Windows
-
-3️⃣ Install requirements
-
-pip install -r requirements.txt
-
-4️⃣ Environment variables
-
-Create a .env file or set these directly in your environment / Render dashboard.
-
-🔑 Core
-
-POLYGON_KEY=your_polygon_api_key
-
-TELEGRAM_TOKEN_ALERTS=your_telegram_bot_token
-TELEGRAM_CHAT_ALL=your_main_alert_chat_id
-
-TELEGRAM_TOKEN_STATUS=optional_status_bot_token
-TELEGRAM_CHAT_STATUS=optional_status_chat_id
-
-🌍 Global filters (for all bots)
-
-MIN_RVOL_GLOBAL=2.5         # RVOL floor
-MIN_VOLUME_GLOBAL=800000    # minimum daily volume in shares
-
-🎯 Optional per-bot tuning (override defaults)
-
-These are optional; the code includes safe defaults. Only set them if you want to be more aggressive / conservative.
-
-# WHALES
-WHALES_MIN_NOTIONAL=2000000
-WHALES_MIN_PRICE=10
-WHALES_MAX_PRICE=500
-
-# DARK POOL RADAR
-DARK_LOOKBACK_MIN=20
-DARK_MIN_TOTAL_NOTIONAL=20000000
-DARK_MIN_SINGLE_NOTIONAL=10000000
-DARK_MIN_PRINT_COUNT=3
-
-# TREND RIDER
-TREND_BREAKOUT_LOOKBACK=20
-TREND_BREAKOUT_MIN_PCT=2.0
-TREND_MIN_RVOL=3.0
-
-# PANIC FLUSH
-PANIC_MIN_DROP_PCT=12
-PANIC_MIN_RVOL=4.0
-PANIC_NEAR_LOW_PCT=2.0
-
-# SWING PULLBACK
-PULLBACK_MAX_DIST_EMA=1.0
-PULLBACK_MIN_RVOL=2.0
-
-# IV CRUSH
-IVCRUSH_MAX_DTE=14
-IVCRUSH_MIN_IV=0.6
-IVCRUSH_MIN_IV_DROP_PCT=30
-IVCRUSH_MIN_IMPLIED_MOVE_PCT=8
-IVCRUSH_MAX_MOVE_REL_IV=0.6
-
-🚀 Running Locally
-
-Run the FastAPI + background scanner
-
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
-
-This will:
-	•	Start a small API (for Render health checks).
-	•	Spin up a background task that:
-	•	Every ~60 seconds:
-	•	Builds the dynamic universe.
-	•	Runs all 15 bots concurrently.
-	•	Sends alerts to Telegram.
-
-Visit:
-
-http://localhost:8000/
-
-to confirm the service is up.
-
-🌥 Deploying on Render
-	1.	Push your repo to GitHub.
-	2.	Go to Render → New → Web Service.
-	3.	Connect to your GitHub repo.
-	4.	Choose:
-	•	Runtime: Python
-	•	Start Command:
-
-gunicorn -k uvicorn.workers.UvicornWorker main:app --timeout 600
-
-5.	In Environment → Environment Variables, add all POLYGON_KEY, TELEGRAM_*, MIN_*, etc.
-	6.	Deploy.
-
-Render will:
-	•	Health-check /
-	•	Keep the process alive
-	•	Let the async scanner run 24/5.
-
-
-🧪 Sample Alert Formats
-
-These are examples of how Telegram messages look.
-In your own alerts the tickers, numbers, and times will be live.
-
-🐋 Whale Flow
-
-🐋 WHALE FLOW — META
-🕒 10:35 AM EST · Nov 21
-💰 Underlying: $317.22 · RVOL 3.9x
+### Premarket Scanner
+```
+📣 PREMARKET — MDB
+🕒 09:05 AM EST · 01-01-2026
+💰 $382.40 · 📊 RVOL 1.8x
 ────────────
-🟢 META 11/24 330C
-📦 Volume: 4,812 · Avg: $6.15
-💰 Notional: ≈ $2,961,000
-🔗 Chart: https://www.tradingview.com/chart/?symbol=META
+🚀 Premarket move: +4.7% vs prior close
+📈 Prev Close: $365.10 → Premarket Last: $382.40
+📊 Premarket Range: $378.00 – $386.20
+📦 Premarket Vol: 1,120,000 (≈ $428,000,000)
+🧠 Read: Early momentum with solid liquidity; watch for gap-and-go.
+🔗 Chart: https://www.tradingview.com/chart/?symbol=MDB
+```
 
-🌑 Dark Pool Radar
+### Volume Monster
+```
+💥 VOLUME MONSTER — AXSM
+🕒 02:53 PM EST · 01-01-2026
 
-🌑 DARK POOL RADAR — AMD
-🕒 7:42 PM EST · Nov 21
-💰 $117.88 · RVOL 2.8x
+💰 Price + Move
+• Last: $182.64 (+22.8% UP)
+• O $158.49 · H $184.40 · L $158.49 · Last $182.64
+
+📊 Liquidity Snapshot
+• Volume: 3,059,410
+• RVOL: 6.3×
+• Dollar Vol: $558,770,642
+
+🧠 Read
+Extreme participation vs normal — big money is very active here.
+
+🔗 Chart
+https://www.tradingview.com/chart/?symbol=AXSM
+```
+
+### Gap Flow (Gap Up / Gap Down)
+```
+📈 GAP FLOW — AXSM
+🕒 09:58 AM EST · 01-01-2026
+
+💰 Gap Stats
+• Gap: +6.5% vs prior close
+• O $158.49 · H $184.40 · L $158.49 · Last $182.64
+
+📊 Liquidity
+• Volume: 3,059,410
+• RVOL: 6.3×
+• Dollar Vol: $484,885,891
+
+📈 Continuation Context
+• Holding above VWAP: YES
+• Holding >60% of gap range
+• Direction: Bullish continuation gap
+
+🧠 Read
+Strong gap-and-go behavior with real volume behind the move.
+
+🔗 Chart
+https://www.tradingview.com/chart/?symbol=AXSM
+```
+(Gap Down swaps 🔻 and downside continuation text.)
+
+### Trend Rider
+```
+🚀 TREND RIDER — NVDA
+🕒 02:15 PM EST · 01-01-2026
+
+💰 Price + Move
+• Last: $522.88 (+4.2% UP)
+• O $500.10 · H $525.40 · L $497.50 · C $522.88
+• RVOL: 2.1× · Dollar Vol: $8,200,000,000
+
+📈 Trend Structure
+• Above 50-day MA: YES
+• Above 200-day MA: YES
+• Breakout vs 20-day high: $510.20
+• Intraday vs VWAP: ABOVE
+
+🧠 Read
+Clean, high-volume trend continuation with stacked MAs and fresh breakout.
+
+🔗 Chart
+https://www.tradingview.com/chart/?symbol=NVDA
+```
+
+### Swing Pullback
+```
+🎯 SWING PULLBACK — LULU
+🕒 11:40 AM EST · 01-01-2026
+
+💰 Price Snapshot
+• Last: $420.15 (-4.1% from recent high)
+• O $432.80 · H $435.20 · L $418.10 · C $420.15
+• RVOL: 1.1×
+
+📈 Trend Context
+• Above 200-day MA: YES
+• Above / Near 50-day MA: NEAR (testing support)
+• Recent 20-day high: $438.50
+
+🧠 Read
+Strong longer-term uptrend with a controlled pullback into support — potential swing-long “buy-the-dip” zone.
+
+🔗 Chart
+https://www.tradingview.com/chart/?symbol=LULU
+```
+
+### Panic Flush
+```
+⚠️ PANIC FLUSH — AAPL
+🕒 01:45 PM EST · 01-01-2026
+
+💰 Price + Damage
+• Last: $182.10 (-4.8% today)
+• O $194.00 · H $195.10 · L $180.55 · C $182.10
+• Distance from LOD: 0.9%
+
+📊 Liquidity
+• Volume: 78,200,000
+• RVOL: 3.4×
+• Dollar Vol: $14,200,000,000
+
+📉 Context
+• VWAP: BELOW
+• RSI(14): 31.2 (pressure zone)
+
+🧠 Read
+Heavy capitulation selling with price pinned near lows. Very risky, but often where reflex bounces can start.
+
+🔗 Chart
+https://www.tradingview.com/chart/?symbol=AAPL
+```
+
+### Momentum Reversal (Bullish example)
+```
+🔄 MOMENTUM REVERSAL — TSLA
+🕒 02:10 PM EST · 01-01-2026
+
+💰 Price Path
+• Last: $226.40 (-1.2% today, from -5.0% low)
+• O $234.00 · H $236.20 · L $224.10 · C $226.40
+• RVOL: 1.9×
+
+📈 Reversal Context
+• Earlier: BELOW VWAP → Now ABOVE VWAP (reclaimed ~45% of range)
+• RSI(14, 5m): 28.4 → 42.1 (recovering)
+
+🧠 Read
+Intraday reversal after a hard selloff — buyers reclaimed VWAP and are pushing off the lows.
+
+🔗 Chart
+https://www.tradingview.com/chart/?symbol=TSLA
+```
+(Bearish variant swaps to VWAP loss, lower highs, RSI rollover.)
+
+### RSI Oversold
+```
+🧠 RSI OVERSOLD — META
+🕒 01:35 PM EST · 01-01-2026
+
+💰 Price Snapshot
+• Last: $310.22 (-3.1% today)
+• O $320.10 · H $322.80 · L $308.60 · C $310.22
+
+📉 Momentum
+• RSI(14, 5m): 23.4 (≤ 30 OVERSOLD)
+• RVOL: 1.6×
+• Distance from Low: 0.5%
+
+🧠 Read
+Short-term momentum washed out — potential bounce/mean reversion area.
+
+🔗 Chart
+https://www.tradingview.com/chart/?symbol=META
+```
+
+### RSI Overbought
+```
+🔥 RSI OVERBOUGHT — LLY
+🕒 10:50 AM EST · 01-01-2026
+
+💰 Price Snapshot
+• Last: $720.10 (+3.9% today)
+• O $695.80 · H $722.40 · L $694.50 · C $720.10
+
+📈 Momentum
+• RSI(14, 5m): 81.2 (≥ 70 OVERBOUGHT)
+• RVOL: 1.9×
+• Distance from High: 0.4%
+
+🧠 Read
+Momentum is very stretched — potential fade or consolidation zone.
+
+🔗 Chart
+https://www.tradingview.com/chart/?symbol=LLY
+```
+
+### Opening Range Breakout (Long)
+```
+⚡️ OPENING RANGE BREAKOUT — NVDA
+🕒 09:47 AM EST · 01-01-2026
 ────────────
-📡 Dark pool cluster (last 20 min)
-📦 Prints: 12
-💰 Total Dark Notional: ≈ $47,550,000
-🏦 Largest Single Print: ≈ $12,800,000
+🚀 LONG Breakout Above Opening Range High
+💰 Last: $522.30 (+3.4% vs prior close)
+
+📊 Opening Range (first 15m)
+• High: $510.00
+• Low: $500.20
+
+🔥 Break Distance: +2.4% above OR high
+
+📈 Volume & Strength
+• Volume: 12,500,000 (2.1× avg)
+• Dollar Vol ≈ $6,520,000,000
+• RVOL: 2.1×
+• VWAP: $518.10 (trading ABOVE VWAP)
+
+🔎 Context
+Strong OR breakout with confirmed volume & trend strength
+
+🔗 Chart
+https://www.tradingview.com/chart/?symbol=NVDA
+```
+(Breakdown swaps 🩸 SHORT, below OR low, VWAP BELOW, negative break distance.)
+
+### Squeeze Bot
+```
+🧨 SQUEEZE BREAKOUT — SHOP
+🕒 01:20 PM EST · 01-01-2026
+
+💰 Price Snapshot
+• Last: $82.40 (+2.9% today)
+• O $79.10 · H $83.00 · L $78.60 · C $82.40
+• RVOL: 1.5×
+
+📉 Compression Phase
+• Bollinger Band Width: 1.8% of price (near recent lows)
+• Daily range compression flagged over 5 sessions
+
+📈 Breakout Context
+• Break direction: UPSIDE (closing above upper band)
+• Above VWAP: YES
+• Recent swing high: $81.90 (now cleared)
+
+🧠 Read
+Volatility squeeze resolving to the upside with volume starting to expand — classic pre-breakout to breakout transition.
+
+🔗 Chart
+https://www.tradingview.com/chart/?symbol=SHOP
+```
+
+### Dark Pool Radar
+```
+🕳️ DARK POOL RADAR — AAPL
+🕒 02:15 PM EST · 01-01-2026
+💰 Underlying: $182.40 · Day Move: -1.4% · RVOL: 1.3×
+────────────
+🧊 Window: last 30 min (today only)
+📦 Prints: 42
+💵 Dark Pool Notional (window): ≈ $310,000,000
+🐋 Largest Print: ≈ $45,000,000 @ $182.10
+📊 Dark Pool vs Full-Day Volume: 8.5% of today’s $ volume
+🔍 Context: Cluster of mid-day blocks accumulating just below VWAP.
+🔗 Chart: https://www.tradingview.com/chart/?symbol=AAPL
+```
+
+### Earnings Scanner
+```
+📅 EARNINGS RADAR — NFLX
+🕒 03:00 PM EST · 01-01-2026
+────────────
+• Earnings Date: 01-05-2026 (after close)
+• Price: $502.10 (+1.2%)
+• IV Snapshot: elevated vs baseline
+🧠 Read: Upcoming event within 4 days; watch for IV crush setups
+🔗 Chart: https://www.tradingview.com/chart/?symbol=NFLX
+```
+
+### Daily Ideas (Longs / Shorts)
+```
+💡 DAILY IDEAS — LONGS
+🕒 10:52 AM EST · 01-01-2026
+────────────
+Top LONG ideas (ranked by confluence score):
+
+NVDA — Score: 9.1
+   Trend: Uptrend (price > MA20 > MA50)
+   💵 Price: $522.30 (O: $510.00, H: $525.40, L: $508.20)
+   📊 Intraday: +2.4% vs prior close, above VWAP | RVOL 2.1×
+   🔍 RSI (5m): 54.2
+   🧩 Options flow bias: +0.72
+   🧠 Read: High confluence across trend, volume, RSI, flow
+   📈 Chart: https://www.tradingview.com/chart/?symbol=NVDA
+```
+(Shorts version swaps direction/bias; “No ideas” variants state none found.)
+
+All options alerts were fully redesigned for readability: parsed contracts, EST timestamps, human-readable premiums/notional, and clear context/bias lines.
+
+### Options Cheap Flow (💰)
+```
+💰 CHEAP FLOW — QID
+🕒 02:25 PM EST · 01-01-2026
+💵 Underlying: $18.42 (+2.1% today)
+────────────
+🎯 Order: 250x 01-16-2026 19C (Strike $19.00)
+⏳ DTE: 15
+💸 Premium per contract: $0.18 (below CHEAP_MAX_PREMIUM=$0.80)
+💰 Total Notional: $4,500 (meets CHEAP_MIN_NOTIONAL; size meets CHEAP_MIN_SIZE)
+📊 Structure: near-dated · OTM call · sized at 250 contracts
+⚖️ Context: Option volume 3,200 vs OI 1,000 (3.2× OI)
+🧠 Read: Speculative bullish “lottery” flow priced cheaply.
+🔗 Chart: https://www.tradingview.com/chart/?symbol=QID
+```
+
+### Options Unusual Flow (⚠️)
+```
+⚠️ UNUSUAL FLOW — TSLA
+🕒 02:20 PM EST · 01-01-2026
+💰 Underlying: $252.40 (+3.1% today) · RVOL 4.5×
+────────────
+🎯 Order: 75x 01-16-2026 260C (Strike $260.00)
+💸 Premium per contract: $4.80 · Total Notional: $153,600
+📊 Unusual vs normal:
+• Option volume today: 2,300 (avg 120)
+• This trade: 75 contracts (3.3% of today’s option volume)
+• Volume vs OI: 2,300 vs 400 (5.8× OI)
+🧠 Flow tags: SWEEP · AT_ASK · SAME_DAY_CLUSTER
+📌 Narrative: Short-dated upside call flow well above normal activity.
+🔗 Chart: https://www.tradingview.com/chart/?symbol=TSLA
+```
+
+### Options Whale Flow (🐳)
+```
+🐳 WHALE FLOW — BDX
+🕒 02:21 PM EST · 01-01-2026
+💰 Underlying: $245.32 (+1.8% today) · RVOL 2.4×
+────────────
+📦 Order: 100x 01-16-2026 130C (Strike $130.00) (⏳ 15 DTE)
+💵 Premium per contract: $6.52 · Total Notional: $652,000
+📊 Flow tags: WHALE_SIZE · SHORT_DTE
+⚖️ Context: Option volume 1,200 vs OI 3,400 (0.4× OI)
+🧠 Read: Aggressive bullish whale flow.
+🔗 Chart: https://www.tradingview.com/chart/?symbol=BDX
+```
+
+### Options IV Crush (🔥)
+```
+🔥 IV CRUSH — AMD
+🕒 09:45 AM EST · 01-02-2026
+💰 Underlying: $112.10 (-6.2% today)
+────────────
+🎯 Contract: 150x 01-17-2026 115C (Strike $115.00)
+💸 Premium per contract: $1.20 · Total Notional: $18,000
+📉 IV Crush Details:
+• IV before: 142% → IV now: 82%
+• IV drop: -60.0% (meets IVCRUSH_MIN_IV_DROP_PCT=20%)
+• Option volume: 2,100 (meets IVCRUSH_MIN_VOL)
+🧠 Context: Post-event IV collapse with price stabilizing
+⚖️ Risk View: Elevated realized move already happened; options now pricing less future volatility.
 🔗 Chart: https://www.tradingview.com/chart/?symbol=AMD
+```
 
-🔥 Cheap 0DTE / 3DTE
-
-🔥 CHEAP — BBAI
-🕒 12:14 PM EST · Nov 21
-💰 Last: $5.98
+### Options Indicator (Analytics)
+```
+🧠 OPTIONS_INDICATOR — SPY
+🕒 02:52 PM EST · 01-01-2026
+💰 Underlying: $475.10 · RVOL 1.3×
 ────────────
-🔥 Cheap CALL: O:BBAI251121P00006000
-⏱ DTE: 3 · Strike: 6.00
-📦 Volume: 2,666 · Avg: $0.35
-💰 Notional: ≈ $94,525
-🔗 Chart: https://www.tradingview.com/chart/?symbol=BBAI
+🎯 Regime: HIGH-IV MOMENTUM
+📊 IV Rank (intra-chain): 78
+📉 RSI(14): 64.2
+📈 MACD: 0.123 vs Signal 0.087
+📎 Bollinger 20/2: Lower 460.00 · Mid 470.00 · Upper 480.00
+💵 Dollar Volume (today): ≈ $8,200,000,000
+📦 Options OI: total 2,500,000 · max strike 180,000
+📊 Day Move: 1.8%
 
+🧠 Bias: Bullish momentum — continuing strength vs vol regime
+🔗 Chart: https://www.tradingview.com/chart/?symbol=SPY
+```
+## 4️⃣ Status Report & Heartbeat
+- **Source**: `bots/status_report.py` reads `STATUS_STATS_PATH`, filters to today’s trading day (EST), and builds the MoneySignalAI Heartbeat.
+- **What it shows**:
+  - **Bots**: last run time or “No run today”.
+  - **Totals**: sum of today’s scanned/matches/alerts across all bots.
+  - **Per Bot**: today’s scanned | matches | alerts.
+  - **Diagnostics**: high-scan/zero-alert, ran-today-zero-scans, not-run-today.
+  - **Runtime**: median + last runtime (n runs today).
+- **Use it to**:
+  - Verify bots are running on schedule.
+  - Spot over-filtering (high scan, zero alerts).
+  - Catch wiring issues (zero scans) or disabled bots.
 
-🛠 Developer Notes
+---
 
-	•	All bots are structured as async coroutines (async def run_xxx()).
-	•	bots/shared.py centralizes:
-	•	Global ENV
-	•	Telegram sending
-	•	Universe building
-	•	Equity grading
-	•	New bots are easy to add:
-	1.	Create bots/new_strategy.py with async def run_new_strategy().
-	2.	Import and add it to the asyncio.gather() list in main.py.
-	3.	Use send_alert("new_strategy", ticker, price, rvol, extra=msg).
+## 5️⃣ Installation & Setup
 
+### Prerequisites
+- Python 3.10+
+- Polygon/Massive-compatible API key (`POLYGON_KEY`)
+- Telegram tokens: `TELEGRAM_TOKEN_ALERTS`, `TELEGRAM_TOKEN_STATUS`, `TELEGRAM_CHAT_ALL`
 
-❓ FAQ
+### Clone & Install
+```bash
+git clone https://github.com/moneysignalai/money-signal-ai-polygon.git
+cd money-signal-ai-polygon
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-❓ Why am I not getting any alerts?
+### Configuration (.env)
+Set env vars (non-exhaustive):
+- **Universe**: `TICKER_UNIVERSE`, `DYNAMIC_MAX_TICKERS` (cap ~1,500), `DYNAMIC_VOLUME_COVERAGE`, `FALLBACK_TICKER_UNIVERSE`
+- **Global floors**: `MIN_RVOL_GLOBAL`, `MIN_VOLUME_GLOBAL`
+- **Premarket**: `MIN_PREMARKET_MOVE_PCT`, `MIN_PREMARKET_DOLLAR_VOL`, `MIN_PREMARKET_RVOL`, `MIN_PREMARKET_PRICE`
+- **ORB**: `ORB_RANGE_MINUTES`, `ORB_MIN_DOLLAR_VOL`, `ORB_MIN_RVOL`, `ORB_START_MINUTE`, `ORB_END_MINUTE`
+- **RSI**: `RSI_PERIOD`, `RSI_TIMEFRAME_MIN`, `RSI_OVERBOUGHT`, `RSI_OVERSOLD`, `RSI_MIN_PRICE`, `RSI_MIN_DOLLAR_VOL`, `RSI_MAX_UNIVERSE`
+- **Panic Flush / Momentum Reversal**: `PANIC_FLUSH_*`, `MOMO_REV_*`
+- **Trend/Swing**: `TREND_RIDER_*`, `SWING_*`
+- **Squeeze**: `SQUEEZE_*`
+- **Dark Pool**: `DARK_POOL_MIN_NOTIONAL`, `DARK_POOL_MIN_LARGEST_PRINT`, `DARK_POOL_LOOKBACK_MINUTES`
+- **Options**: `OPTIONS_FLOW_MAX_UNIVERSE`, `OPTIONS_MIN_UNDERLYING_PRICE`, `CHEAP_*`, `UNUSUAL_*`, `WHALES_*`, `IVCRUSH_*`
+- **Operational**: `BOT_TIMEOUT_SECONDS`, `SCAN_INTERVAL_SECONDS`, `STATUS_HEARTBEAT_INTERVAL_MIN`, `STATUS_STATS_PATH`, `OPTIONS_IV_CACHE_PATH`, `DEBUG_FLOW_REASONS`, `DISABLED_BOTS`, `TEST_MODE_BOTS`
 
-Check:
-	1.	Are your Telegram tokens and chat IDs correct?
-	2.	Do logs show:
-SCANNING: Premarket, Volume, Gaps, ORB, ...
+### Run Locally
+```bash
+python main.py
+# or
+uvicorn main:app --reload
+```
+Bots start scanning per schedule; heartbeat posts every `STATUS_HEARTBEAT_INTERVAL_MIN` minutes.
 
-3.	Are your global filters too strict?
+### Deploy (Render / Docker)
+- Configure env vars in Render dashboard.
+- Deploy as a web/background worker using this repo; container builds from `requirements.txt`.
+- GitHub-connected deploys auto-restart with new commits.
 
-	•	Try temporarily:
-MIN_RVOL_GLOBAL=2.0
-MIN_VOLUME_GLOBAL=500000
+---
 
-❓ Why am I getting too many alerts?
+## 6️⃣ Performance Philosophy
+- **Reliability at scale**: dynamic universes capped at ~1,500, per-bot timeouts, error isolation per symbol.
+- **Efficiency**: shared caches/helpers, day-scoped data, debounced alerts.
+- **Data accuracy**: today-only flows/prints for intraday/option/dark-pool strategies; EST-aware trading-day logic.
+- **Observability**: heartbeat diagnostics expose over-filtering (high scan, zero alerts) and zero-scan runs.
 
-	•	Raise thresholds:
-MIN_RVOL_GLOBAL=3.0
-MIN_VOLUME_GLOBAL=1500000
-WHALES_MIN_NOTIONAL=3000000
-DARK_MIN_TOTAL_NOTIONAL=40000000
+---
 
-	•	Or narrow the universe to only specific tickers via:
-TICKER_UNIVERSE=AAPL,MSFT,TSLA,NVDA,META,AMZN
+## 7️⃣ Roadmap / Future Enhancements
+- ML-driven probability scoring and quality tiers
+- Backtesting and performance analytics per bot
+- Web dashboard for alert review and tuning
+- Multi-account routing and broker integration
+- Expanded analytics (sector/relative-strength overlays, pair trades)
 
-❓ Does this place trades for me?
+---
 
-No.
-This is an information and alert system only. You (or your own trading system) decide whether to trade.
-
-🧭 Roadmap
-
-	•	🧬 Greeks Extreme Bot (gamma, vanna, charm pressure extremes)
-	•	⚖️ Options vs Equity Divergence Bot (flow doesn’t match price)
-	•	🧲 Liquidity Vacuum Detector (thin-book sweeps)
-	•	📅 Pre-Earnings IV Ramp scanner
-	•	🧂 Mean Reversion Bot for intraday overextensions
-	•	🌐 Multi-exchange support (if Polygon adds more feeds)
-
-
-⚠️ Disclaimer
-
-This project is for educational and informational purposes only.
-Nothing in this repository is financial advice.
-Markets are risky. Do your own research. Use at your own risk.
-
-
-🤝 Contributing
-
-PRs, issues, and ideas are welcome.
-	1.	Fork the repo
-	2.	Create a feature branch
-	3.	Add logs + comments
-	4.	Submit a PR describing:
-	•	What strategy you added/changed
-	•	Example alert
-	•	Any new ENV vars
-
-<p align="center">
-  Built for traders who don’t have time to babysit every chart. ⚡<br>
-  <b>Let the bots watch the market. You just watch the alerts.</b>
-</p>
-
+MoneySignalAI delivers production-quality, emoji-rich alerts and transparent telemetry so traders, investors, and engineers can trust the signals and scale their workflows.

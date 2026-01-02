@@ -1,0 +1,433 @@
+"""Momentum Reversal bot: detects strong intraday moves that start to reverse.
+
+Two-sided patterns:
+- Bullish reversal: sharp early selloff that is being reclaimed intraday.
+- Bearish reversal: sharp early rip that is fading intraday.
+
+Universe: top-volume equities (Polygon/Massive) with fallback to TICKER_UNIVERSE.
+Runs during RTH unless MOMENTUM_REVERSAL_ALLOW_OUTSIDE_RTH is true.
+"""
+
+from __future__ import annotations
+
+import os
+import time
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from statistics import mean
+from typing import Iterable, List, Optional, Tuple
+
+try:
+    from massive import RESTClient
+except ImportError:  # pragma: no cover - fallback for local dev
+    from polygon import RESTClient
+
+from bots.shared import (
+    DEBUG_FLOW_REASONS,
+    MIN_RVOL_GLOBAL,
+    MIN_VOLUME_GLOBAL,
+    POLYGON_KEY,
+    chart_link,
+    debug_filter_reason,
+    format_est_timestamp,
+    in_rth_window_est,
+    resolve_universe_for_bot,
+    send_alert_text,
+)
+from bots.status_report import record_bot_stats
+
+BOT_NAME = "momentum_reversal"
+
+_client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
+_allow_outside_rth = os.getenv("MOMENTUM_REVERSAL_ALLOW_OUTSIDE_RTH", "false").lower() == "true"
+_min_price = float(os.getenv("MOMO_REV_MIN_PRICE", "3.0"))
+_min_dollar_vol = float(os.getenv("MOMO_REV_MIN_DOLLAR_VOL", "150000"))
+_min_rvol = float(os.getenv("MOMO_REV_MIN_RVOL", "1.0"))
+_min_move_pct = float(os.getenv("MOMO_REV_MIN_MOVE_PCT", "4.0"))
+_min_reclaim_pct = float(os.getenv("MOMO_REV_MIN_RECLAIM_PCT", "0.30"))
+_max_from_extreme_pct = float(os.getenv("MOMO_REV_MAX_FROM_EXTREME_PCT", "30.0"))
+_avg_vol_lookback = int(os.getenv("MOMO_REV_LOOKBACK_DAYS", os.getenv("DYNAMIC_MAX_LOOKBACK_DAYS", "5")))
+
+
+@dataclass
+class DailySnapshot:
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    avg_volume: float
+    prev_close: Optional[float]
+
+    @property
+    def rvol(self) -> float:
+        return self.volume / self.avg_volume if self.avg_volume > 0 else 0.0
+
+    @property
+    def dollar_vol(self) -> float:
+        return self.close * self.volume
+
+
+def _fetch_daily(sym: str, days: int) -> List:
+    if not _client:
+        return []
+    start = (date.today() - timedelta(days=days + 2)).isoformat()
+    end = date.today().isoformat()
+    try:
+        return list(
+            _client.list_aggs(
+                sym,
+                1,
+                "day",
+                start,
+                end,
+                limit=days + 5,
+                sort="asc",
+            )
+        )
+    except Exception as exc:
+        print(f"[momentum_reversal] daily agg error for {sym}: {exc}")
+        return []
+
+
+def _extract_ohlcv(bar: any) -> Tuple[float, float, float, float, float]:
+    open_ = float(getattr(bar, "open", getattr(bar, "o", 0.0)) or 0.0)
+    high = float(getattr(bar, "high", getattr(bar, "h", 0.0)) or 0.0)
+    low = float(getattr(bar, "low", getattr(bar, "l", 0.0)) or 0.0)
+    close = float(getattr(bar, "close", getattr(bar, "c", 0.0)) or 0.0)
+    volume = float(getattr(bar, "volume", getattr(bar, "v", 0.0)) or 0.0)
+    return open_, high, low, close, volume
+
+
+def _compute_daily(sym: str) -> DailySnapshot | None:
+    daily = _fetch_daily(sym, max(_avg_vol_lookback, 6))
+    if len(daily) < 1:
+        return None
+
+    today_bar = daily[-1]
+    today_ts = getattr(today_bar, "timestamp", getattr(today_bar, "t", None))
+    if today_ts and today_ts > 1e12:
+        today_ts /= 1000.0
+    if today_ts:
+        dt = datetime.utcfromtimestamp(today_ts)
+        if dt.date() != date.today():
+            return None
+
+    open_, high, low, close, volume = _extract_ohlcv(today_bar)
+    if any(x <= 0 for x in (open_, high, low, close, volume)):
+        return None
+
+    history_vols = [
+        _extract_ohlcv(b)[4]
+        for b in daily[:-1][-_avg_vol_lookback:]
+        if _extract_ohlcv(b)[4] > 0
+    ]
+    avg_volume = mean(history_vols) if history_vols else 0.0
+
+    prev_close = None
+    if len(daily) >= 2:
+        _, _, _, prev_c, _ = _extract_ohlcv(daily[-2])
+        prev_close = prev_c if prev_c > 0 else None
+
+    return DailySnapshot(open_, high, low, close, volume, avg_volume, prev_close)
+
+
+def _fetch_intraday(sym: str) -> List:
+    if not _client:
+        return []
+    start = date.today().isoformat()
+    try:
+        bars = list(
+            _client.list_aggs(
+                sym,
+                5,
+                "minute",
+                start,
+                start,
+                limit=500,
+                sort="asc",
+            )
+        )
+    except Exception as exc:
+        print(f"[momentum_reversal] intraday agg error for {sym}: {exc}")
+        return []
+
+    filtered: List = []
+    for b in bars:
+        ts = getattr(b, "timestamp", getattr(b, "t", None))
+        if ts is None:
+            continue
+        if ts > 1e12:
+            ts = ts / 1000.0
+        dt = datetime.utcfromtimestamp(ts)
+        if dt.date() != date.today():
+            continue
+        minutes = dt.hour * 60 + dt.minute
+        if minutes < 9 * 60 + 30 or minutes > 16 * 60:
+            continue
+        filtered.append(b)
+    return filtered
+
+
+def _rsi(values: Iterable[float], period: int = 14) -> Optional[float]:
+    closes = list(values)
+    if len(closes) <= period:
+        return None
+
+    gains: List[float] = []
+    losses: List[float] = []
+    for prev, curr in zip(closes, closes[1:]):
+        delta = curr - prev
+        if delta >= 0:
+            gains.append(delta)
+            losses.append(0.0)
+        else:
+            gains.append(0.0)
+            losses.append(-delta)
+
+    avg_gain = mean(gains[-period:]) if gains[-period:] else 0.0
+    avg_loss = mean(losses[-period:]) if losses[-period:] else 0.0
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _compute_reversal(sym: str, daily: DailySnapshot, intraday: List) -> dict:
+    if not intraday:
+        raise ValueError("no intraday data")
+
+    open_, _, _, _, _ = _extract_ohlcv(intraday[0])
+    _, _, _, latest_close, latest_vol = _extract_ohlcv(intraday[-1])
+    high_price = max(_extract_ohlcv(b)[1] for b in intraday)
+    low_price = min(_extract_ohlcv(b)[2] for b in intraday)
+    total_vol = sum(_extract_ohlcv(b)[4] for b in intraday)
+    vwap = (
+        sum(_extract_ohlcv(b)[3] * _extract_ohlcv(b)[4] for b in intraday)
+        / total_vol
+        if total_vol > 0
+        else 0.0
+    )
+
+    closes = [_extract_ohlcv(b)[3] for b in intraday if _extract_ohlcv(b)[3] > 0]
+    rsi_current = _rsi(closes, period=14)
+    rsi_early = _rsi(closes[: len(closes) // 2], period=14) if closes else None
+
+    high_move = (high_price - open_) / open_ * 100 if open_ > 0 else 0.0
+    low_move = (low_price - open_) / open_ * 100 if open_ > 0 else 0.0
+
+    direction = "none"
+    move_pct = 0.0
+    reclaim_pct = 0.0
+    earlier_below_vwap = any(
+        _extract_ohlcv(b)[3] < vwap for b in intraday[: len(intraday) // 2]
+    )
+    earlier_above_vwap = any(
+        _extract_ohlcv(b)[3] > vwap for b in intraday[: len(intraday) // 2]
+    )
+
+    if abs(low_move) >= abs(high_move):
+        move_pct = abs(low_move)
+        drop = open_ - low_price
+        reclaim_pct = (latest_close - low_price) / drop if drop > 0 else 0.0
+        if (
+            move_pct >= _min_move_pct
+            and reclaim_pct >= _min_reclaim_pct
+            and latest_close > vwap
+            and earlier_below_vwap
+        ):
+            direction = "bullish"
+    else:
+        move_pct = abs(high_move)
+        pop = high_price - open_
+        reclaim_pct = (high_price - latest_close) / pop if pop > 0 else 0.0
+        if (
+            move_pct >= _min_move_pct
+            and reclaim_pct >= _min_reclaim_pct
+            and latest_close < vwap
+            and earlier_above_vwap
+        ):
+            direction = "bearish"
+
+    return {
+        "direction": direction,
+        "move_pct": move_pct,
+        "reclaim_pct": reclaim_pct,
+        "vwap": vwap,
+        "latest_close": latest_close,
+        "high_price": high_price,
+        "low_price": low_price,
+        "open_price": open_,
+        "rsi": rsi_current,
+        "rsi_early": rsi_early,
+        "earlier_below_vwap": earlier_below_vwap,
+        "earlier_above_vwap": earlier_above_vwap,
+    }
+
+
+def _format_alert(sym: str, daily: DailySnapshot, info: dict) -> str:
+    ts = format_est_timestamp()
+    last = info["latest_close"]
+    open_price = info["open_price"]
+    high_price = info["high_price"]
+    low_price = info["low_price"]
+    vwap = info["vwap"]
+    rvol = daily.rvol
+    dollar_vol = daily.dollar_vol
+    rsi_early = info.get("rsi_early")
+
+    ref_price = daily.prev_close or daily.open
+    day_change_pct = (
+        (last - ref_price) / ref_price * 100 if ref_price and ref_price > 0 else None
+    )
+    low_change_pct = (
+        (low_price - ref_price) / ref_price * 100 if ref_price and ref_price > 0 else None
+    )
+
+    reclaim_pct = info["reclaim_pct"] * 100
+    direction = info["direction"]
+    rsi_val = info.get("rsi")
+
+    price_path = (
+        f"• Last: ${last:.2f}"
+        + (f" ({day_change_pct:+.1f}% today" if day_change_pct is not None else "")
+        + (f", from {low_change_pct:+.1f}% low" if low_change_pct is not None else "")
+        + (")" if day_change_pct is not None else "")
+    )
+
+    lines = [
+        f"🔄 MOMENTUM REVERSAL — {sym}",
+        f"🕒 {ts}",
+        "",
+        "💰 Price Path",
+        price_path,
+        f"• O ${open_price:.2f} · H ${high_price:.2f} · L ${low_price:.2f} · C ${last:.2f}",
+        f"• RVOL: {rvol:.1f}×",
+        f"• Dollar Vol: ${dollar_vol:,.0f}",
+        "",
+        "📈 Reversal Context",
+    ]
+
+    earlier_line = (
+        "Earlier in session: BELOW VWAP" if direction == "bullish" else "Earlier in session: ABOVE VWAP"
+    )
+    now_line = (
+        f"Now: ABOVE VWAP (reclaimed ~{reclaim_pct:.1f}% of range)"
+        if direction == "bullish"
+        else f"Now: BELOW VWAP (given up ~{reclaim_pct:.1f}% of early rip)"
+    )
+    lines.append(f"• {earlier_line}")
+    lines.append(f"• {now_line}")
+    if rsi_val is not None:
+        if rsi_early is not None:
+            lines.append(f"• RSI(14, 5m): {rsi_early:.1f} → {rsi_val:.1f}")
+        else:
+            lines.append(f"• RSI(14, 5m): {rsi_val:.1f}")
+
+    lines.extend(
+        [
+            "",
+            "🧠 Read",
+            (
+                "Intraday reversal after a hard selloff — buyers stepped in, reclaimed VWAP, and are pushing off the lows."
+                if direction == "bullish"
+                else "Intraday reversal after a rip — sellers faded strength, lost VWAP, and are leaning on the roll over."
+            ),
+            "",
+            "🔗 Chart",
+            chart_link(sym),
+        ]
+    )
+
+    return "\n".join(lines)
+
+
+async def run_momentum_reversal() -> None:
+    start = time.perf_counter()
+    scanned = matches = alerts = 0
+    reason_counts: dict[str, int] = {}
+
+    try:
+        if not POLYGON_KEY or not _client:
+            print("[momentum_reversal] missing POLYGON_KEY; skipping")
+            record_bot_stats(BOT_NAME, 0, 0, 0, time.perf_counter() - start)
+            return
+
+        if not _allow_outside_rth and not in_rth_window_est():
+            print("[momentum_reversal] outside RTH; skipping")
+            record_bot_stats(BOT_NAME, 0, 0, 0, time.perf_counter() - start)
+            return
+
+        universe = resolve_universe_for_bot(bot_name=BOT_NAME)
+        print(f"[momentum_reversal] universe_size={len(universe)}")
+        if not universe:
+            record_bot_stats(BOT_NAME, 0, 0, 0, time.perf_counter() - start)
+            return
+
+        for sym in universe:
+            try:
+                daily = _compute_daily(sym)
+                if not daily:
+                    debug_filter_reason(BOT_NAME, sym, "momo_no_daily_data")
+                    reason_counts["daily"] = reason_counts.get("daily", 0) + 1
+                    continue
+
+                if daily.close < _min_price:
+                    debug_filter_reason(BOT_NAME, sym, "momo_price_too_low")
+                    reason_counts["price"] = reason_counts.get("price", 0) + 1
+                    continue
+
+                intraday = _fetch_intraday(sym)
+                if not intraday:
+                    debug_filter_reason(BOT_NAME, sym, "momo_no_intraday")
+                    reason_counts["intraday"] = reason_counts.get("intraday", 0) + 1
+                    continue
+
+                scanned += 1
+                info = _compute_reversal(sym, daily, intraday)
+                direction = info["direction"]
+                move_pct = info["move_pct"]
+                reclaim_pct = info["reclaim_pct"]
+                last_price = info["latest_close"]
+
+                if move_pct < _min_move_pct:
+                    debug_filter_reason(BOT_NAME, sym, "momo_move_too_small")
+                    reason_counts["move"] = reason_counts.get("move", 0) + 1
+                    continue
+
+                if move_pct > _max_from_extreme_pct:
+                    debug_filter_reason(BOT_NAME, sym, "momo_move_excessive")
+                    reason_counts["move_excess"] = reason_counts.get("move_excess", 0) + 1
+                    continue
+
+                if reclaim_pct < _min_reclaim_pct:
+                    debug_filter_reason(BOT_NAME, sym, "momo_reclaim_too_small")
+                    reason_counts["reclaim"] = reason_counts.get("reclaim", 0) + 1
+                    continue
+
+                if daily.dollar_vol < max(_min_dollar_vol, MIN_VOLUME_GLOBAL * daily.close):
+                    debug_filter_reason(BOT_NAME, sym, "momo_dollar_vol_too_low")
+                    reason_counts["dollar_vol"] = reason_counts.get("dollar_vol", 0) + 1
+                    continue
+
+                if daily.rvol < max(_min_rvol, MIN_RVOL_GLOBAL):
+                    debug_filter_reason(BOT_NAME, sym, "momo_rvol_too_low")
+                    reason_counts["rvol"] = reason_counts.get("rvol", 0) + 1
+                    continue
+
+                if direction == "none":
+                    debug_filter_reason(BOT_NAME, sym, "momo_no_reversal")
+                    reason_counts["no_reversal"] = reason_counts.get("no_reversal", 0) + 1
+                    continue
+
+                matches += 1
+                send_alert_text(_format_alert(sym, daily, info))
+                alerts += 1
+            except Exception as exc:  # pragma: no cover - defensive
+                print(f"[momentum_reversal] error for {sym}: {exc}")
+                continue
+    finally:
+        runtime = time.perf_counter() - start
+        record_bot_stats(BOT_NAME, scanned, matches, alerts, runtime)
+        if DEBUG_FLOW_REASONS and matches == 0:
+            print(f"[momentum_reversal] No alerts. Filter breakdown: {reason_counts}")
