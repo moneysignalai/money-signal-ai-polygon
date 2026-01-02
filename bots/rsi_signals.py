@@ -26,7 +26,7 @@ from bots.shared import (
     POLYGON_KEY,
     chart_link,
     debug_filter_reason,
-    format_est_timestamp,
+    eastern,
     in_rth_window_est,
     send_alert_text,
     resolve_universe_for_bot,
@@ -199,42 +199,30 @@ def _format_rsi_alert(
     day_move_pct: float,
     direction_label: str,
     signal: str,
-    distance_from_low_pct: float,
-    distance_from_high_pct: float,
     ts: datetime,
 ) -> str:
     """Return a premium, emoji-rich alert for RSI overbought/oversold events."""
 
-    timestamp = format_est_timestamp(ts)
+    dt = ts if ts.tzinfo else eastern.localize(ts)
+    dt_est = dt.astimezone(eastern)
+    timestamp = dt_est.strftime("%I:%M %p EST · %m-%d-%Y")
+
     header_emoji = "🧠" if signal == "oversold" else "🔥"
     header_title = "RSI OVERSOLD" if signal == "oversold" else "RSI OVERBOUGHT"
 
     rvol_text = f"{rvol:.1f}×" if rvol > 0 else "N/A"
-    vol_text = f"{volume:,.0f}" if volume > 0 else "N/A"
     dollar_vol_text = f"${dollar_vol:,.0f}" if dollar_vol > 0 else "N/A"
 
-    distance_low_text = (
-        f"{distance_from_low_pct:.1f}%" if distance_from_low_pct > 0 else "N/A"
-    )
-    distance_high_text = (
-        f"{distance_from_high_pct:.1f}%" if distance_from_high_pct > 0 else "N/A"
-    )
-    distance_line = (
-        f"• Distance from Low: {distance_low_text}"
-        if signal == "oversold"
-        else f"• Distance from High: {distance_high_text}"
-    )
-
     rsi_threshold_text = (
-        f"(≤ {RSI_OVERSOLD} OVERSOLD)"
+        f"(below RSI_OVERSOLD={RSI_OVERSOLD})"
         if signal == "oversold"
-        else f"(≥ {RSI_OVERBOUGHT} OVERBOUGHT)"
+        else f"(above RSI_OVERBOUGHT={RSI_OVERBOUGHT})"
     )
 
     read_line = (
-        "Short-term momentum washed out. Potential bounce or mean-reversion zone."
+        "Short-term momentum washed out — potential bounce/mean reversion area."
         if signal == "oversold"
-        else "Short-term move looks stretched. Possible fade / digestion zone."
+        else "Momentum is very stretched — possible fade or consolidation zone."
     )
 
     lines = [
@@ -243,13 +231,12 @@ def _format_rsi_alert(
         "",
         "💰 Price Snapshot",
         f"• Last: {_fmt_price(last)} ({day_move_pct:.1f}% {direction_label})",
+        f"• O {_fmt_price(open_)} · H {_fmt_price(high)} · L {_fmt_price(low)} · C {_fmt_price(close)}",
+        "",
+        "📉 Momentum" if signal == "oversold" else "📈 Momentum",
+        f"• RSI({RSI_PERIOD}, {RSI_TIMEFRAME_MIN}m): {rsi_val:.1f} {rsi_threshold_text}",
         f"• RVOL: {rvol_text}",
         f"• Dollar Vol: {dollar_vol_text}",
-        "",
-        "📉 Momentum Setup" if signal == "oversold" else "📈 Momentum Setup",
-        f"• RSI({RSI_PERIOD}, {RSI_TIMEFRAME_MIN}m): {rsi_val:.1f} {rsi_threshold_text}",
-        f"• Today’s range: O {_fmt_price(open_)} · H {_fmt_price(high)} · L {_fmt_price(low)} · C {_fmt_price(close)}",
-        distance_line,
         "",
         "🧠 Read",
         read_line,
@@ -384,9 +371,6 @@ async def run_rsi_signals() -> None:
                     continue
 
                 direction_label = "UP" if day_move_pct >= 0 else "DOWN"
-                distance_from_low_pct = ((last - low) / low * 100) if low > 0 else 0.0
-                distance_from_high_pct = ((high - last) / high * 100) if high > 0 else 0.0
-
                 alert_text = _format_rsi_alert(
                     symbol=sym,
                     rsi_val=rsi_last,
@@ -401,8 +385,6 @@ async def run_rsi_signals() -> None:
                     day_move_pct=day_move_pct,
                     direction_label=direction_label,
                     signal=signal,
-                    distance_from_low_pct=distance_from_low_pct,
-                    distance_from_high_pct=distance_from_high_pct,
                     ts=datetime.now(),
                 )
                 send_alert_text(alert_text)
@@ -438,8 +420,6 @@ if __name__ == "__main__":  # simple formatter demo
         day_move_pct=-4.6,
         direction_label="DOWN",
         signal="oversold",
-        distance_from_low_pct=1.6,
-        distance_from_high_pct=3.7,
         ts=datetime(2026, 1, 1, 10, 32),
     )
     print(demo)
