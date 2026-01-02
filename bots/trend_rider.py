@@ -25,8 +25,8 @@ from bots.shared import (
     POLYGON_KEY,
     chart_link,
     debug_filter_reason,
-    format_est_timestamp,
     in_rth_window_est,
+    now_est_dt,
     resolve_universe_for_bot,
     send_alert_text,
 )
@@ -148,6 +148,7 @@ async def run_trend_rider() -> None:
             volume_today = volumes[-1]
             ma20 = _moving_average(closes, 20)
             ma50 = _moving_average(closes, 50)
+            ma200 = _moving_average(closes, 200) if len(closes) >= 200 else 0.0
             prev_close = closes[-2] if len(closes) >= 2 else 0.0
 
             avg_vol = mean(volumes[-20:]) if len(volumes) >= 20 else mean(volumes)
@@ -181,7 +182,15 @@ async def run_trend_rider() -> None:
                 reason_counts["rvol_too_low"] = reason_counts.get("rvol_too_low", 0) + 1
                 continue
 
-            in_trend = ma20 > ma50 and close_today >= ma20
+            if ma200 == 0:
+                if DEBUG_FLOW_REASONS:
+                    debug_filter_reason(BOT_NAME, sym, "insufficient_ma200")
+                reason_counts["insufficient_ma200"] = reason_counts.get(
+                    "insufficient_ma200", 0
+                ) + 1
+                continue
+
+            in_trend = close_today >= ma50 > 0 and close_today >= ma200 > 0 and ma20 > ma50
             if not in_trend:
                 if DEBUG_FLOW_REASONS:
                     debug_filter_reason(BOT_NAME, sym, "not_in_uptrend")
@@ -207,7 +216,6 @@ async def run_trend_rider() -> None:
             breakout_diff_pct = (
                 ((close_today - recent_high) / recent_high * 100) if recent_high > 0 else 0.0
             )
-            ma200 = _moving_average(closes, 200) if len(closes) >= 200 else 0.0
             direction_label = "UP" if day_change_pct >= 0 else "DOWN"
 
             ma50_status = "above 50SMA" if close_today >= ma50 > 0 else "below 50SMA"
@@ -224,25 +232,31 @@ async def run_trend_rider() -> None:
             rvol_text = f"{rvol:.1f}×" if rvol > 0 else "N/A"
             dollar_text = f"${dollar_vol:,.0f}" if dollar_vol > 0 else "N/A"
 
-            ts_str = format_est_timestamp()
+            ts_dt = now_est_dt()
+            ts_display = ts_dt.strftime("%I:%M %p EST · %m-%d-%Y").lstrip("0")
+            vwap_today = float(
+                getattr(daily[-1], "vwap", getattr(daily[-1], "vw", 0.0)) or 0.0
+            )
+            vwap_relation = "ABOVE" if vwap_today and close_today >= vwap_today else "BELOW"
             volume_text = f"${dollar_vol:,.0f}" if dollar_vol > 0 else "N/A"
+
             header_lines = [
                 f"🚀 TREND RIDER — {sym}",
-                f"🕒 {ts_str}",
+                f"🕒 {ts_display}",
                 "",
-                "💰 Price + Volume",
+                "💰 Price + Move",
                 f"• Last: ${close_today:,.2f} ({day_change_pct:+.1f}% {direction_label})",
-                f"• RVOL: {rvol_text}",
-                f"• Dollar Vol: {volume_text}",
+                (
+                    f"• O ${open_today:,.2f} · H ${high_today:,.2f} · "
+                    f"L ${low_today:,.2f} · C ${close_today:,.2f}"
+                ),
+                f"• RVOL: {rvol_text} · Dollar Vol: {volume_text}",
                 "",
                 "📈 Trend Structure",
+                f"• Above 50-day MA: {'YES' if close_today >= ma50 > 0 else 'NO'}",
+                f"• Above 200-day MA: {'YES' if close_today >= ma200 > 0 else 'NO'}",
                 f"• Breakout vs {_breakout_lookback}-day high: ${recent_high:,.2f}",
-                f"• 50 SMA: {ma50_status}",
-                f"• 200 SMA: {ma200_status if ma200 > 0 else 'N/A'}",
-                (
-                    f"• Today’s range: O ${open_today:,.2f} · H ${high_today:,.2f} "
-                    f"· L ${low_today:,.2f} · C ${close_today:,.2f}"
-                ),
+                f"• Intraday vs VWAP: {vwap_relation if vwap_today else 'N/A'}",
                 "",
                 "🧠 Read",
                 trend_read,
