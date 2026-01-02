@@ -28,6 +28,9 @@ def now_est_str() -> str:
 
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "20"))
 BOT_TIMEOUT_SECONDS = int(os.getenv("BOT_TIMEOUT_SECONDS", "180"))
+BOT_MAX_RUNTIME_SECONDS = int(os.getenv("BOT_MAX_RUNTIME_SECONDS", str(BOT_TIMEOUT_SECONDS)))
+BOT_MAX_CONCURRENCY = int(os.getenv("BOT_MAX_CONCURRENCY", "6"))
+BOT_TIMEOUT_SECONDS = max(5, BOT_TIMEOUT_SECONDS)
 STATUS_HEARTBEAT_INTERVAL_MIN = float(os.getenv("STATUS_HEARTBEAT_INTERVAL_MIN", "5"))
 
 
@@ -235,7 +238,10 @@ async def _run_single_bot(
     record_error,
     record_stats=None,
 ):
+    from bots.shared import start_bot_run_context, finish_bot_run_context
+
     start_dt = datetime.now(eastern)
+    run_ctx = start_bot_run_context(public_name, max_runtime=BOT_MAX_RUNTIME_SECONDS)
     try:
         module = importlib.import_module(module_path)
         func = getattr(module, "run_bot", None) or getattr(module, func_name, None)
@@ -272,9 +278,12 @@ async def _run_single_bot(
                     runtime_seconds=runtime,
                     started_at=start_dt,
                     finished_at=finished_dt,
+                    failure_reason=str(e),
                 )
             except Exception as inner:
                 print(f"[bot_runner] warning recording failure stats for {public_name}: {inner}")
+    finally:
+        finish_bot_run_context(run_ctx)
 
 
 async def _run_bot_wrapper(
@@ -298,7 +307,7 @@ async def _run_bot_wrapper(
         next_run_ts[public_name] = time.time() + interval
 
 
-async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS):
+async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS, *, stop_after_cycles: int | None = None):
     print(
         f"[main] scheduler_loop starting with base_interval={base_interval_seconds}s, "
         f"bot_timeout={BOT_TIMEOUT_SECONDS}s"
@@ -315,8 +324,11 @@ async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS):
 
     next_run_ts: Dict[str, float] = {name: 0.0 for name, _, _, _ in BOTS}
     running: Dict[str, bool] = {name: False for name, _, _, _ in BOTS}
+    pending_tasks: List[asyncio.Task] = []
     last_skip_day: Dict[str, str] = {}
-    semaphore = asyncio.Semaphore(int(os.getenv("BOT_MAX_CONCURRENCY", "6")))
+    semaphore = asyncio.Semaphore(max(1, BOT_MAX_CONCURRENCY if not os.getenv("INTEGRATION_TEST", "false").lower() == "true" else min(BOT_MAX_CONCURRENCY, 2)))
+
+    cycles = 0
 
     while True:
         try:
@@ -366,7 +378,8 @@ async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS):
                 due_ts = next_run_ts.get(name, 0.0)
                 if cycle_start_ts >= due_ts:
                     print(f"[scheduler] bot={name} action=RUN interval={interval}s")
-                    asyncio.create_task(
+                    running[name] = True
+                    task = asyncio.create_task(
                         _run_bot_wrapper(
                             name,
                             module_path,
@@ -379,6 +392,7 @@ async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS):
                             semaphore,
                         )
                     )
+                    pending_tasks.append(task)
                 else:
                     wait_for = max(0.0, due_ts - cycle_start_ts)
                     print(f"[scheduler] bot={name} action=WAITING next_in={wait_for:.1f}s")
@@ -391,7 +405,15 @@ async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS):
             )
         except Exception as exc:
             print(f"[main] scheduler loop error: {exc}")
+        cycles += 1
+        if stop_after_cycles is not None and cycles >= stop_after_cycles:
+            break
         await asyncio.sleep(base_interval_seconds)
+
+    if pending_tasks:
+        done, pending = await asyncio.wait(pending_tasks, timeout=BOT_TIMEOUT_SECONDS)
+        for task in pending:
+            task.cancel()
 
 
 def _start_background_scheduler() -> None:
