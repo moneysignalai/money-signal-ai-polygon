@@ -41,15 +41,15 @@ Telegram -> alerts + heartbeat delivered to TELEGRAM_CHAT_ALL
 Each bot uses the shared dynamic universe (top-by-volume capped at ~1,500) with `TICKER_UNIVERSE` fallback and EST time gating unless noted.
 
 - **Premarket Scanner** – Finds premarket gappers with RVOL/price/dollar-vol floors. Env: `MIN_PREMARKET_MOVE_PCT`, `MIN_PREMARKET_DOLLAR_VOL`, `MIN_PREMARKET_RVOL`, `MIN_PREMARKET_PRICE`, `PREMARKET_TICKER_UNIVERSE`. Runs premarket window only.
-- **Volume Monster** – Intraday “monster bar” spikes with strong price moves. Env: `VOLUME_MONSTER_MIN_DOLLAR_VOL`, `VOLUME_MONSTER_RVOL`, `VOLUME_MONSTER_MIN_MOVE_PCT`, global floors. Runs RTH.
-- **Gap Flow** – Gap up/down vs prior close with RVOL/liquidity filters. Env: `GAP_FLOW_MAX_UNIVERSE` + global gap/volume floors. Runs RTH.
-- **Trend Rider** – Breakouts in strong uptrends (stacked MAs, new highs). Env: `TREND_RIDER_MIN_DOLLAR_VOL`, `TREND_RIDER_MIN_RVOL`, `TREND_RIDER_TREND_DAYS`, `TREND_RIDER_MIN_BREAKOUT_PCT`, global floors. Runs RTH.
-- **Swing Pullback** – Dip-buys inside uptrends near moving averages. Env: `SWING_*` thresholds (pullback %, trend days, RVOL, dollar vol), global floors. Runs RTH.
-- **Panic Flush** – Capitulation-style down days near lows with heavy RVOL. Env: `PANIC_FLUSH_MIN_DROP`, `PANIC_FLUSH_MIN_RVOL`, `PANIC_FLUSH_MAX_FROM_LOW_PCT`, global floors. Runs RTH.
-- **Momentum Reversal** – Large intraday moves that start reversing (mean reversion). Env: `MOMO_REV_MIN_RECLAIM_PCT`, `MOMO_REV_MIN_RVOL`, `MOMO_REV_MIN_MOVE_PCT`, `MOMO_REV_MAX_FROM_EXTREME_PCT`, global floors. Runs RTH.
-- **RSI Signals** – Overbought/oversold signals on intraday RSI with liquidity filters. Env: `RSI_PERIOD`, `RSI_TIMEFRAME_MIN`, `RSI_OVERBOUGHT`, `RSI_OVERSOLD`, `RSI_MIN_PRICE`, `RSI_MIN_DOLLAR_VOL`, `RSI_MAX_UNIVERSE`, global floors. Runs RTH.
-- **Opening Range Breakout (ORB)** – Breaks above/below opening range with retest/FVG context. Env: `ORB_RANGE_MINUTES`, `ORB_MIN_DOLLAR_VOL`, `ORB_MIN_RVOL`, `ORB_START_MINUTE`, `ORB_END_MINUTE`, global floors. Runs RTH opening window.
-- **Squeeze Bot** – Price/volume acceleration resembling short-squeeze behavior (no short-interest feed). Env: `SQUEEZE_*` thresholds, global floors. Runs RTH.
+- **Volume Monster** – Pure liquidity explosion detector (institutional participation). Env: `VOLUME_MONSTER_MIN_DOLLAR_VOL`, `VOLUME_MONSTER_RVOL`, global floors. Runs RTH.
+- **Gap Flow** – Gap + continuation behavior (holding strength after open). Env: `MIN_PREMARKET_MOVE_PCT`, `MIN_PREMARKET_DOLLAR_VOL`, `MIN_PREMARKET_RVOL`, global floors. Runs RTH.
+- **Trend Rider** – Institutional trend continuation & breakout structure (stacked MAs, VWAP alignment). Env: `TREND_RIDER_MIN_DOLLAR_VOL`, `TREND_RIDER_MIN_RVOL`, `TREND_RIDER_TREND_DAYS`, `TREND_RIDER_MIN_BREAKOUT_PCT`, global floors. Runs RTH.
+- **Swing Pullback** – Controlled dip-buys inside strong uptrends near key MAs. Env: `SWING_*` thresholds (pullback %, trend days, RVOL, dollar vol), global floors. Runs RTH.
+- **Panic Flush** – Capitulation detector: heavy down days pinned near lows with big RVOL (not a reversal confirmer). Env: `PANIC_FLUSH_MIN_DROP`, `PANIC_FLUSH_MIN_RVOL`, `PANIC_FLUSH_MAX_FROM_LOW_PCT`, global floors. Runs RTH.
+- **Momentum Reversal** – Confirmed intraday reversals after strong moves (VWAP reclaim/loss + range recoveries). Env: `MOMO_REV_MIN_RECLAIM_PCT`, `MOMO_REV_MIN_RVOL`, `MOMO_REV_MIN_MOVE_PCT`, `MOMO_REV_MAX_FROM_EXTREME_PCT`, global floors. Runs RTH.
+- **RSI Signals** – Pure RSI extremes (overbought/oversold) with liquidity filters. Env: `RSI_PERIOD`, `RSI_TIMEFRAME_MIN`, `RSI_OVERBOUGHT`, `RSI_OVERSOLD`, `RSI_MIN_PRICE`, `RSI_MIN_DOLLAR_VOL`, `RSI_MAX_UNIVERSE`, global floors. Runs RTH.
+- **Opening Range Breakout (ORB)** – Breaks above/below opening range with volume confirmation and VWAP context. Env: `ORB_RANGE_MINUTES`, `ORB_MIN_DOLLAR_VOL`, `ORB_MIN_RVOL`, `ORB_START_MINUTE`, `ORB_END_MINUTE`, global floors. Runs RTH opening window.
+- **Squeeze Bot** – Volatility compression → expansion breakout detector (compression first, then direction). Env: `SQUEEZE_*` thresholds, global floors. Runs RTH.
 - **Dark Pool Radar** – Highlights unusual dark-pool prints (count, total notional, largest print) for today. Env: `DARK_POOL_MIN_NOTIONAL`, `DARK_POOL_MIN_LARGEST_PRINT`, `DARK_POOL_LOOKBACK_MINUTES`, global floors. Runs RTH.
 - **Earnings Scanner** – Surfaces notable earnings movers/upcoming events. Env: `EARNINGS_MAX_FORWARD_DAYS`, plus earnings price/move/dollar-vol floors. Runs on a slower cadence.
 - **Options Cheap Flow** – Low-premium contracts with meaningful size/notional. Env: `CHEAP_MAX_PREMIUM`, `CHEAP_MIN_NOTIONAL`, `CHEAP_MIN_SIZE`, `OPTIONS_MIN_UNDERLYING_PRICE`, `OPTIONS_FLOW_MAX_UNIVERSE`. Runs RTH.
@@ -67,60 +67,83 @@ Real template examples mirroring current code output. Timestamps are EST, date f
 ### Premarket Scanner
 ```
 📣 PREMARKET — MDB
-🕒 09:05 AM EST · Jan 01
+🕒 09:05 AM EST · 01-01-2026
 💰 $382.40 · 📊 RVOL 1.8x
 ────────────
-🚀 Premarket move: 4.7% up vs prior close
+🚀 Premarket move: +4.7% vs prior close
 📈 Prev Close: $365.10 → Premarket Last: $382.40
 📊 Premarket Range: $378.00 – $386.20
 📦 Premarket Vol: 1,120,000 (≈ $428,000,000)
-💰 Day Vol (partial): 850,000 (≈ $325,000,000)
-📊 RVOL (partial): 1.8x
-🎯 Grade: A-
-🧠 Bias: Long premarket momentum / gap-and-go watch
+🧠 Read: Early momentum with solid liquidity; watch for gap-and-go.
 🔗 Chart: https://www.tradingview.com/chart/?symbol=MDB
 ```
 
 ### Volume Monster
 ```
-🚨 VOLUME MONSTER — AXSM (12-30-2025 · 02:21 PM EST)
-────────────
-• 💵 Last: $182.64 (O: $158.49, H: $184.40, L: $158.49)
-• 📊 RVOL: 6.3x | Volume: 3,059,410 (6.3x avg)
-• 💰 Dollar Vol: $558,770,642
-• 📈 Chart: https://www.tradingview.com/chart/?symbol=AXSM
+💥 VOLUME MONSTER — AXSM
+🕒 02:53 PM EST · 01-01-2026
+
+💰 Price + Move
+• Last: $182.64 (+22.8% UP)
+• O $158.49 · H $184.40 · L $158.49 · Last $182.64
+
+📊 Liquidity Snapshot
+• Volume: 3,059,410
+• RVOL: 6.3×
+• Dollar Vol: $558,770,642
+
+🧠 Read
+Extreme participation vs normal — big money is very active here.
+
+🔗 Chart
+https://www.tradingview.com/chart/?symbol=AXSM
 ```
 
 ### Gap Flow (Gap Up / Gap Down)
 ```
-🚀 GAP FLOW — AXSM (12-30-2025 · 09:45 AM EST)
-────────────
-• Direction: Gap Up (🔼 +6.5% vs prior close)
-• 💵 Last: $182.64 (O: $158.49, H: $184.40, L: $158.49)
-• 📊 RVOL: 6.3x | Volume: 3,059,410
-• 💰 Dollar Vol: $484,885,891
-• 📈 Chart: https://www.tradingview.com/chart/?symbol=AXSM
+📈 GAP FLOW — AXSM
+🕒 09:58 AM EST · 01-01-2026
+
+💰 Gap Stats
+• Gap: +6.5% vs prior close
+• O $158.49 · H $184.40 · L $158.49 · Last $182.64
+
+📊 Liquidity
+• Volume: 3,059,410
+• RVOL: 6.3×
+• Dollar Vol: $484,885,891
+
+📈 Continuation Context
+• Holding above VWAP: YES
+• Holding >60% of gap range
+• Direction: Bullish continuation gap
+
+🧠 Read
+Strong gap-and-go behavior with real volume behind the move.
+
+🔗 Chart
+https://www.tradingview.com/chart/?symbol=AXSM
 ```
-(Gap Down swaps 🔻 and negative gap %.)
+(Gap Down swaps 🔻 and downside continuation text.)
 
 ### Trend Rider
 ```
 🚀 TREND RIDER — NVDA
-🕒 01-01-2026 · 02:15 PM EST
+🕒 02:15 PM EST · 01-01-2026
 
-💰 Price + Volume
+💰 Price + Move
 • Last: $522.88 (+4.2% UP)
-• RVOL: 2.1×
-• Dollar Vol: $8,200,000,000
+• O $500.10 · H $525.40 · L $497.50 · C $522.88
+• RVOL: 2.1× · Dollar Vol: $8,200,000,000
 
 📈 Trend Structure
+• Above 50-day MA: YES
+• Above 200-day MA: YES
 • Breakout vs 20-day high: $510.20
-• 50 SMA: above 50SMA
-• 200 SMA: above 200SMA
-• Today’s range: O $500.10 · H $525.40 · L $497.50 · C $522.88
+• Intraday vs VWAP: ABOVE
 
 🧠 Read
-Strong trend, stacked MAs, fresh breakout.
+Clean, high-volume trend continuation with stacked MAs and fresh breakout.
 
 🔗 Chart
 https://www.tradingview.com/chart/?symbol=NVDA
@@ -128,53 +151,47 @@ https://www.tradingview.com/chart/?symbol=NVDA
 
 ### Swing Pullback
 ```
-🧠 SWING PULLBACK — AAPL
-🕒 12-30-2025 · 01:10 PM EST
+🎯 SWING PULLBACK — LULU
+🕒 11:40 AM EST · 01-01-2026
 
-💰 Price + Volume
-• Last: $191.40 (+1.0%)
-• RVOL: 1.4×
-• Dollar Vol: $3,200,000,000
+💰 Price Snapshot
+• Last: $420.15 (-4.1% from recent high)
+• O $432.80 · H $435.20 · L $418.10 · C $420.15
+• RVOL: 1.1×
 
-📈 Structure
-• Uptrend intact (price > MA20 > MA50)
-• Pullback: ~5.2% off recent high, near MA20
-• Today’s range: O $195.10 · H $196.00 · L $190.50 · C $191.40
+📈 Trend Context
+• Above 200-day MA: YES
+• Above / Near 50-day MA: NEAR (testing support)
+• Recent 20-day high: $438.50
 
 🧠 Read
-Dip within strong trend; potential swing entry on strength.
+Strong longer-term uptrend with a controlled pullback into support — potential swing-long “buy-the-dip” zone.
 
 🔗 Chart
-https://www.tradingview.com/chart/?symbol=AAPL
+https://www.tradingview.com/chart/?symbol=LULU
 ```
 
 ### Panic Flush
 ```
 ⚠️ PANIC FLUSH — AAPL
-🕒 01-01-2026 · 01:45 PM EST
+🕒 01:45 PM EST · 01-01-2026
 
-💰 Price + Volume
-• Last: $182.10 (-4.8% DOWN)
-• From Open: -6.2% DOWN
-• RVOL: 3.4×
+💰 Price + Damage
+• Last: $182.10 (-4.8% today)
+• O $194.00 · H $195.10 · L $180.55 · C $182.10
+• Distance from LOD: 0.9%
+
+📊 Liquidity
 • Volume: 78,200,000
+• RVOL: 3.4×
 • Dollar Vol: $14,200,000,000
 
-📉 Intraday Damage
-• O $194.00 · H $195.10 · L $180.55 · C $182.10
-• Closing Near Lows? Yes
-• Multi-day context: pressing into recent lows near $180.55
-
-📈 VWAP & Structure
-• VWAP: $188.20 (trading well below VWAP)
-• Day structure: heavy intraday selloff, near session lows with capitulation-style volume
-
-🔎 Reference levels
-• Support: today’s low $180.55 and prior day low $184.20
-• Resistance: VWAP $188.20, bounce high $186.90
+📉 Context
+• VWAP: BELOW
+• RSI(14): 31.2 (pressure zone)
 
 🧠 Read
-Violent sell pressure with elevated liquidity. Possible capitulation / flush zone for contrarian setups.
+Heavy capitulation selling with price pinned near lows. Very risky, but often where reflex bounces can start.
 
 🔗 Chart
 https://www.tradingview.com/chart/?symbol=AAPL
@@ -183,67 +200,74 @@ https://www.tradingview.com/chart/?symbol=AAPL
 ### Momentum Reversal (Bullish example)
 ```
 🔄 MOMENTUM REVERSAL — TSLA
-🕒 12-30-2025 · 02:56 PM EST
-────────────
-• Last: $242.10 (-3.1% intraday) after reclaiming 45.0% of early drop
-• RVOL: 2.0× | Dollar Vol: $4,477,000,000
-• VWAP: $320.10 (attempting reclaim)
-• 🧠 Read: Down-then-up reversal with rising bids; potential fade of capitulation
-• 📈 Chart: https://www.tradingview.com/chart/?symbol=TSLA
-```
-(Bearish variant swaps context to downside fade.)
+🕒 02:10 PM EST · 01-01-2026
 
-### RSI Oversold
-```
-🧠 RSI OVERSOLD — TSLA
-🕒 01-01-2026 · 02:20 PM EST
-
-💰 Price Snapshot
-• Last: $226.40 (-3.4% DOWN)
+💰 Price Path
+• Last: $226.40 (-1.2% today, from -5.0% low)
+• O $234.00 · H $236.20 · L $224.10 · C $226.40
 • RVOL: 1.9×
-• Dollar Vol: $6,400,000,000
 
-📉 Momentum Setup
-• RSI(14, 5m): 24.3 (≤ 30 OVERSOLD)
-• Today’s range: O $234.00 · H $236.20 · L $224.10 · C $226.40
-• Distance from Low: 1.0%
+📈 Reversal Context
+• Earlier: BELOW VWAP → Now ABOVE VWAP (reclaimed ~45% of range)
+• RSI(14, 5m): 28.4 → 42.1 (recovering)
 
 🧠 Read
-Short-term momentum washed out. Possible bounce / mean-reversion zone.
+Intraday reversal after a hard selloff — buyers reclaimed VWAP and are pushing off the lows.
 
 🔗 Chart
 https://www.tradingview.com/chart/?symbol=TSLA
 ```
+(Bearish variant swaps to VWAP loss, lower highs, RSI rollover.)
 
-### RSI Overbought
+### RSI Oversold
 ```
-🔥 RSI OVERBOUGHT — META
-🕒 01-01-2026 · 02:20 PM EST
+🧠 RSI OVERSOLD — META
+🕒 01:35 PM EST · 01-01-2026
 
 💰 Price Snapshot
-• Last: $410.22 (+3.8% UP)
-• RVOL: 2.0×
-• Dollar Vol: $3,900,000,000
+• Last: $310.22 (-3.1% today)
+• O $320.10 · H $322.80 · L $308.60 · C $310.22
 
-📈 Momentum Setup
-• RSI(14, 5m): 79.2 (≥ 70 OVERBOUGHT)
-• Today’s range: O $395.10 · H $411.80 · L $392.20 · C $410.22
-• Distance from High: 0.4%
+📉 Momentum
+• RSI(14, 5m): 23.4 (≤ 30 OVERSOLD)
+• RVOL: 1.6×
+• Distance from Low: 0.5%
 
 🧠 Read
-Short-term move looks stretched. Possible fade / digestion zone.
+Short-term momentum washed out — potential bounce/mean reversion area.
 
 🔗 Chart
 https://www.tradingview.com/chart/?symbol=META
 ```
 
+### RSI Overbought
+```
+🔥 RSI OVERBOUGHT — LLY
+🕒 10:50 AM EST · 01-01-2026
+
+💰 Price Snapshot
+• Last: $720.10 (+3.9% today)
+• O $695.80 · H $722.40 · L $694.50 · C $720.10
+
+📈 Momentum
+• RSI(14, 5m): 81.2 (≥ 70 OVERBOUGHT)
+• RVOL: 1.9×
+• Distance from High: 0.4%
+
+🧠 Read
+Momentum is very stretched — potential fade or consolidation zone.
+
+🔗 Chart
+https://www.tradingview.com/chart/?symbol=LLY
+```
+
 ### Opening Range Breakout (Long)
 ```
 ⚡️ OPENING RANGE BREAKOUT — NVDA
-🕒 01-01-2026 · 09:47 AM EST
+🕒 09:47 AM EST · 01-01-2026
 ────────────
 🚀 LONG Breakout Above Opening Range High
-💰 Last: $522.30 (+3.4% vs prior close, +2.1% from open, 1.2% below HOD)
+💰 Last: $522.30 (+3.4% vs prior close)
 
 📊 Opening Range (first 15m)
 • High: $510.00
@@ -260,31 +284,42 @@ https://www.tradingview.com/chart/?symbol=META
 🔎 Context
 Strong OR breakout with confirmed volume & trend strength
 
-• Reference levels:
-  - Support zone (near-term): $505.00
-  - Resistance zone: $525.40
-
-🔗 Chart:
+🔗 Chart
 https://www.tradingview.com/chart/?symbol=NVDA
 ```
 (Breakdown swaps 🩸 SHORT, below OR low, VWAP BELOW, negative break distance.)
 
 ### Squeeze Bot
 ```
-🧲 SQUEEZE RADAR — GME (12-30-2025 · 01:30 PM EST)
-────────────
-• Price + Volume: $38.40 (+12.5%) | RVOL: 3.2× | Dollar Vol: $471,000,000
-• Structure: Near day’s high, accelerating tape, elevated volume
-• Filters: Premium/size/notional per SQUEEZE_* envs
-• 🧠 Read: Short-squeeze style momentum with heavy flow
-• 📈 Chart: https://www.tradingview.com/chart/?symbol=GME
+🧨 SQUEEZE BREAKOUT — SHOP
+🕒 01:20 PM EST · 01-01-2026
+
+💰 Price Snapshot
+• Last: $82.40 (+2.9% today)
+• O $79.10 · H $83.00 · L $78.60 · C $82.40
+• RVOL: 1.5×
+
+📉 Compression Phase
+• Bollinger Band Width: 1.8% of price (near recent lows)
+• Daily range compression flagged over 5 sessions
+
+📈 Breakout Context
+• Break direction: UPSIDE (closing above upper band)
+• Above VWAP: YES
+• Recent swing high: $81.90 (now cleared)
+
+🧠 Read
+Volatility squeeze resolving to the upside with volume starting to expand — classic pre-breakout to breakout transition.
+
+🔗 Chart
+https://www.tradingview.com/chart/?symbol=SHOP
 ```
 
 ### Dark Pool Radar
 ```
 🕳️ DARK POOL RADAR — AAPL
-01-01-2026 · 02:15 PM EST
-💰 Underlying: $182.40 · Day Move: -1.4% · RVOL: 1.3x
+🕒 02:15 PM EST · 01-01-2026
+💰 Underlying: $182.40 · Day Move: -1.4% · RVOL: 1.3×
 ────────────
 🧊 Window: last 30 min (today only)
 📦 Prints: 42
@@ -297,18 +332,20 @@ https://www.tradingview.com/chart/?symbol=NVDA
 
 ### Earnings Scanner
 ```
-📅 EARNINGS RADAR — NFLX (01-01-2026 · 03:00 PM EST)
+📅 EARNINGS RADAR — NFLX
+🕒 03:00 PM EST · 01-01-2026
 ────────────
 • Earnings Date: 01-05-2026 (after close)
 • Price: $502.10 (+1.2%)
 • IV Snapshot: elevated vs baseline
-• 🧠 Read: Upcoming event within 4 days; watch for IV crush setups
-• 📈 Chart: https://www.tradingview.com/chart/?symbol=NFLX
+🧠 Read: Upcoming event within 4 days; watch for IV crush setups
+🔗 Chart: https://www.tradingview.com/chart/?symbol=NFLX
 ```
 
 ### Daily Ideas (Longs / Shorts)
 ```
-💡 DAILY IDEAS — LONGS (01-01-2026 · 10:52 AM EST)
+💡 DAILY IDEAS — LONGS
+🕒 10:52 AM EST · 01-01-2026
 ────────────
 Top LONG ideas (ranked by confluence score):
 
@@ -318,34 +355,37 @@ NVDA — Score: 9.1
    📊 Intraday: +2.4% vs prior close, above VWAP | RVOL 2.1×
    🔍 RSI (5m): 54.2
    🧩 Options flow bias: +0.72
+   🧠 Read: High confluence across trend, volume, RSI, flow
    📈 Chart: https://www.tradingview.com/chart/?symbol=NVDA
 ```
 (Shorts version swaps direction/bias; “No ideas” variants state none found.)
 
+All options alerts were fully redesigned for readability: parsed contracts, EST timestamps, human-readable premiums/notional, and clear context/bias lines.
+
 ### Options Cheap Flow (💰)
 ```
 💰 CHEAP FLOW — QID
-🕒 12-30-2025 · 02:21 PM EST
+🕒 02:25 PM EST · 01-01-2026
 💵 Underlying: $18.42 (+2.1% today)
 ────────────
 🎯 Order: 250x 01-16-2026 19C (Strike $19.00)
-⏳ Tenor: 15 DTE
-💸 Premium per contract: $0.18 (within CHEAP_MAX_PREMIUM=$0.80)
-💰 Total Notional: $4,500 (meets CHEAP_MIN_NOTIONAL; meets CHEAP_MIN_SIZE)
+⏳ DTE: 15
+💸 Premium per contract: $0.18 (below CHEAP_MAX_PREMIUM=$0.80)
+💰 Total Notional: $4,500 (meets CHEAP_MIN_NOTIONAL; size meets CHEAP_MIN_SIZE)
 📊 Structure: near-dated · OTM call · sized at 250 contracts
 ⚖️ Context: Option volume 3,200 vs OI 1,000 (3.2× OI)
-🧠 Bias: Speculative bullish "lottery" flow
+🧠 Read: Speculative bullish “lottery” flow priced cheaply.
 🔗 Chart: https://www.tradingview.com/chart/?symbol=QID
 ```
 
 ### Options Unusual Flow (⚠️)
 ```
 ⚠️ UNUSUAL FLOW — TSLA
-🕒 12-30-2025 · 02:21 PM EST
+🕒 02:20 PM EST · 01-01-2026
 💰 Underlying: $252.40 (+3.1% today) · RVOL 4.5×
 ────────────
 🎯 Order: 75x 01-16-2026 260C (Strike $260.00)
-💵 Premium per contract: $4.80 · Total Notional: $153,600
+💸 Premium per contract: $4.80 · Total Notional: $153,600
 📊 Unusual vs normal:
 • Option volume today: 2,300 (avg 120)
 • This trade: 75 contracts (3.3% of today’s option volume)
@@ -358,21 +398,21 @@ NVDA — Score: 9.1
 ### Options Whale Flow (🐳)
 ```
 🐳 WHALE FLOW — BDX
-🕒 12-30-2025 · 02:21 PM EST
+🕒 02:21 PM EST · 01-01-2026
 💰 Underlying: $245.32 (+1.8% today) · RVOL 2.4×
 ────────────
 📦 Order: 100x 01-16-2026 130C (Strike $130.00) (⏳ 15 DTE)
 💵 Premium per contract: $6.52 · Total Notional: $652,000
 📊 Flow tags: WHALE_SIZE · SHORT_DTE
 ⚖️ Context: Option volume 1,200 vs OI 3,400 (0.4× OI)
-🧠 Bias: Aggressive bullish whale flow
+🧠 Read: Aggressive bullish whale flow.
 🔗 Chart: https://www.tradingview.com/chart/?symbol=BDX
 ```
 
 ### Options IV Crush (🔥)
 ```
 🔥 IV CRUSH — AMD
-🕒 12-30-2025 · 02:21 PM EST
+🕒 09:45 AM EST · 01-02-2026
 💰 Underlying: $112.10 (-6.2% today)
 ────────────
 🎯 Contract: 150x 01-17-2026 115C (Strike $115.00)
@@ -389,12 +429,8 @@ NVDA — Score: 9.1
 ### Options Indicator (Analytics)
 ```
 🧠 OPTIONS_INDICATOR — SPY
-💰 Last: $475.10
-📊 RVOL: 1.3x
-────────────
-📈 OPTIONS INDICATOR — SPY
 🕒 02:52 PM EST · 01-01-2026
-💰 Underlying: $475.10 · RVOL 1.3x
+💰 Underlying: $475.10 · RVOL 1.3×
 ────────────
 🎯 Regime: HIGH-IV MOMENTUM
 📊 IV Rank (intra-chain): 78
@@ -408,9 +444,6 @@ NVDA — Score: 9.1
 🧠 Bias: Bullish momentum — continuing strength vs vol regime
 🔗 Chart: https://www.tradingview.com/chart/?symbol=SPY
 ```
-
----
-
 ## 4️⃣ Status Report & Heartbeat
 - **Source**: `bots/status_report.py` reads `STATUS_STATS_PATH`, filters to today’s trading day (EST), and builds the MoneySignalAI Heartbeat.
 - **What it shows**:
