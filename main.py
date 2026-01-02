@@ -5,6 +5,7 @@ import importlib
 import os
 import threading
 import time
+import traceback
 from datetime import datetime
 from typing import Dict, List, Tuple
 
@@ -227,7 +228,14 @@ def _time_window_allows(name: str, module_path: str) -> Tuple[bool, str | None]:
         return True, None
 
 
-async def _run_single_bot(public_name: str, module_path: str, func_name: str, record_error):
+async def _run_single_bot(
+    public_name: str,
+    module_path: str,
+    func_name: str,
+    record_error,
+    record_stats=None,
+):
+    start_dt = datetime.now(eastern)
     try:
         module = importlib.import_module(module_path)
         func = getattr(module, "run_bot", None) or getattr(module, func_name, None)
@@ -241,12 +249,32 @@ async def _run_single_bot(public_name: str, module_path: str, func_name: str, re
             await asyncio.wait_for(loop.run_in_executor(None, func), timeout=BOT_TIMEOUT_SECONDS)
 
     except Exception as e:
-        print(f"[main] ERROR running bot {public_name} ({module_path}.{func_name}): {e}")
+        tb = traceback.format_exc()
+        print(
+            f"[bot_runner] ERROR bot={public_name} fn={module_path}.{func_name} "
+            f"exc={e.__class__.__name__} msg={e}\n{tb}"
+        )
         if record_error is not None:
             try:
                 record_error(public_name, e)
             except Exception as inner:
                 print("[main] ERROR while recording bot error:", inner)
+        # Record a failed run so status shows attempted today
+        if record_stats is not None:
+            try:
+                finished_dt = datetime.now(eastern)
+                runtime = max((finished_dt - start_dt).total_seconds(), 0.0)
+                record_stats(
+                    public_name,
+                    scanned=0,
+                    matched=0,
+                    alerts=0,
+                    runtime_seconds=runtime,
+                    started_at=start_dt,
+                    finished_at=finished_dt,
+                )
+            except Exception as inner:
+                print(f"[bot_runner] warning recording failure stats for {public_name}: {inner}")
 
 
 async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS):
@@ -314,7 +342,13 @@ async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS):
                     print(f"[scheduler] bot={name} action=RUN interval={interval}s")
                     tasks.append(
                         asyncio.create_task(
-                            _run_single_bot(name, module_path, func_name, record_error)
+                            _run_single_bot(
+                                name,
+                                module_path,
+                                func_name,
+                                record_error,
+                                record_stats=record_bot_stats,
+                            )
                         )
                     )
                     next_run_ts[name] = cycle_start_ts + interval
