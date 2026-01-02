@@ -12,32 +12,50 @@
 
 import os
 import time
-from datetime import datetime, date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytz
 
 try:
     from massive import RESTClient  # optional internal wrapper
-except ImportError:
+except ImportError:  # pragma: no cover - fallback
     from polygon import RESTClient
 
 from bots.shared import (
     POLYGON_KEY,
     MIN_RVOL_GLOBAL,
     MIN_VOLUME_GLOBAL,
-    get_dynamic_top_volume_universe,
-    send_alert,
     chart_link,
-    now_est,
-    today_est_date,
-    minutes_since_midnight_est,
+    send_alert_text,
+    format_est_timestamp,
     in_rth_window_est,
     is_etf_blacklisted,
+    minutes_since_midnight_est,
+    now_est_dt,
+    resolve_universe_for_bot,
+    today_est_date,
 )
-from bots.status_report import record_bot_stats
+from bots.status_report import record_bot_stats, record_error
 
 eastern = pytz.timezone("US/Eastern")
+BOT_NAME = "opening_range_breakout"
+
+
+def should_run_now() -> tuple[bool, Optional[str]]:
+    """Expose RTH + opening-window gating to the scheduler."""
+
+    allow_outside = os.getenv("ORB_ALLOW_OUTSIDE_RTH", "false").lower() == "true"
+    if allow_outside:
+        return True, None
+
+    # Only proceed during RTH and within the configured ORB scan window.
+    if not in_rth_window_est():
+        return False, "outside RTH window"
+
+    if _in_orb_window():
+        return True, None
+    return False, "outside ORB scan window"
 
 
 def should_run_now() -> tuple[bool, str | None]:
@@ -66,18 +84,18 @@ _client: Optional[RESTClient] = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY e
 ORB_RANGE_MINUTES = int(os.getenv("ORB_RANGE_MINUTES", "15"))
 
 # When do we actually scan for ORB plays?
-#   • Start: right after the ORB window finishes
-#   • End: late morning by default (you can still change this)
-ORB_SCAN_START_MIN = 9 * 60 + 30 + ORB_RANGE_MINUTES  # e.g. 09:45 for 15-min ORB
-ORB_SCAN_END_MIN = 12 * 60 + 0  # 12:00 ET
+#   • Start: right after the ORB window finishes (default 5m after open)
+#   • End: typically within the first hour (default 60m after open)
+_ORB_START_MIN = int(os.getenv("ORB_START_MINUTE", "5"))
+_ORB_END_MIN = int(os.getenv("ORB_END_MINUTE", "60"))
 
 # Price / RVOL / dollar-volume filters
 ORB_MIN_PRICE = float(os.getenv("ORB_MIN_PRICE", "5.0"))
-ORB_MIN_DOLLAR_VOL = float(os.getenv("ORB_MIN_DOLLAR_VOL", os.getenv("ORB_MIN_DOLLAR_VOL", "200000")))
+ORB_MIN_DOLLAR_VOL = float(os.getenv("ORB_MIN_DOLLAR_VOL", "200000"))
 ORB_MIN_RVOL = float(os.getenv("ORB_MIN_RVOL", "1.0"))
 
 # Universe size
-ORB_MAX_UNIVERSE = int(os.getenv("ORB_MAX_UNIVERSE", "120"))
+ORB_MAX_UNIVERSE = int(os.getenv("ORB_MAX_UNIVERSE", "1500"))
 
 # Retest / buffer configuration
 # How close the retest needs to come back to the ORB high/low (as a fraction).
@@ -104,7 +122,10 @@ def _reset_day() -> None:
 
 def _in_orb_window() -> bool:
     mins = minutes_since_midnight_est()
-    return ORB_SCAN_START_MIN <= mins <= ORB_SCAN_END_MIN
+    open_min = 9 * 60 + 30
+    start_window = open_min + max(_ORB_START_MIN, ORB_RANGE_MINUTES)
+    end_window = open_min + max(_ORB_END_MIN, start_window - open_min)
+    return start_window <= mins <= end_window
 
 
 def _safe_float(x: Any) -> Optional[float]:
@@ -167,12 +188,13 @@ def _fetch_intraday_1min(sym: str, trading_day: date) -> List[Dict[str, Any]]:
         return []
 
 
-def _compute_rvol(sym: str, trading_day: date, day_vol: float) -> float:
-    """
-    Very lightweight 20-day RVOL using daily bars.
+def _compute_rvol(sym: str, trading_day: date, day_vol: float) -> Tuple[float, Optional[float], Optional[float]]:
+    """Compute a lightweight RVOL plus prior-day close/low.
+
+    Returns (rvol, prior_close, prior_low).
     """
     if not _client:
-        return 1.0
+        return 1.0, None, None
 
     try:
         start = (trading_day - timedelta(days=40)).isoformat()
@@ -190,14 +212,21 @@ def _compute_rvol(sym: str, trading_day: date, day_vol: float) -> float:
             )
         )
         if not daily:
-            return 1.0
+            return 1.0, None, None
+
+        prior_close = None
+        prior_low = None
+        if len(daily) > 1:
+            prior_bar = daily[1]
+            prior_close = _safe_float(getattr(prior_bar, "close", getattr(prior_bar, "c", None)))
+            prior_low = _safe_float(getattr(prior_bar, "low", getattr(prior_bar, "l", None)))
 
         # exclude today's bar from the average
         hist = daily[1:] if len(daily) > 1 else daily
         vols = [_safe_float(getattr(b, "volume", getattr(b, "v", None))) or 0.0 for b in hist]
         vols = [v for v in vols if v > 0]
         if not vols:
-            return 1.0
+            return 1.0, prior_close, prior_low
 
         avg_vol = sum(vols) / len(vols)
 
@@ -210,12 +239,27 @@ def _compute_rvol(sym: str, trading_day: date, day_vol: float) -> float:
 
         expected_by_now = avg_vol * intraday_frac
         if expected_by_now <= 0:
-            return 1.0
+            return 1.0, prior_close, prior_low
 
-        return day_vol / expected_by_now
+        return day_vol / expected_by_now, prior_close, prior_low
     except Exception as e:
         print(f"[opening_range_breakout] RVOL error for {sym}: {e}")
-        return 1.0
+        return 1.0, None, None
+
+
+def _compute_vwap(bars: List[Dict[str, Any]]) -> Optional[float]:
+    vol_sum = 0.0
+    px_vol_sum = 0.0
+    for b in bars:
+        price = b.get("c")
+        vol = b.get("v") or 0.0
+        if price is None or vol <= 0:
+            continue
+        vol_sum += vol
+        px_vol_sum += price * vol
+    if vol_sum <= 0:
+        return None
+    return px_vol_sum / vol_sum
 
 
 def _find_last_fvg(
@@ -334,168 +378,333 @@ def _detect_orb_signals(
 
 
 async def run_opening_range_breakout() -> None:
-    """
-    Opening Range Breakout bot with FVG + retest logic.
+    """Opening Range Breakout scanner with retest + FVG context."""
 
-    - Defines ORB_RANGE_MINUTES (default 15) from 09:30 ET.
-    - Requires:
-        • Break above/below ORB high/low
-        • Retest of that level
-        • RVOL + dollar-volume + price filters
-    - Adds FVG context into the alert for extra confluence.
-    """
     print("[opening_range_breakout] start")
     _reset_day()
 
+    started_at = now_est_dt()
+    start_ts = time.time()
+    alerts_sent = 0
+    matched_syms: set[str] = set()
+    scanned = 0
+
     if not POLYGON_KEY or not _client:
         print("[opening_range_breakout] missing POLYGON_KEY or client; skipping.")
-        record_bot_stats(BOT_NAME, 0, 0, 0, 0.0)
+        finished = now_est_dt()
+        record_bot_stats(
+            BOT_NAME,
+            0,
+            0,
+            0,
+            runtime_seconds=0.0,
+            started_at=started_at,
+            finished_at=finished,
+        )
         return
 
     if not _in_orb_window():
         print("[opening_range_breakout] outside ORB scan window; skipping.")
-        record_bot_stats(BOT_NAME, 0, 0, 0, 0.0)
+        finished = now_est_dt()
+        record_bot_stats(
+            BOT_NAME,
+            0,
+            0,
+            0,
+            runtime_seconds=0.0,
+            started_at=started_at,
+            finished_at=finished,
+        )
         return
 
-    BOT_NAME = "opening_range_breakout"
-    start_ts = time.time()
-    alerts_sent = 0
-    matched_syms: set[str] = set()
-
     trading_day = today_est_date()
-    now_str = now_est()
+    orb_start = datetime(trading_day.year, trading_day.month, trading_day.day, 9, 30, tzinfo=eastern)
+    orb_end = orb_start + timedelta(minutes=ORB_RANGE_MINUTES)
 
-    universe = get_dynamic_top_volume_universe(
-        max_tickers=ORB_MAX_UNIVERSE,
-        volume_coverage=0.90,
-    )
+    try:
+        universe = resolve_universe_for_bot(
+            bot_name=BOT_NAME,
+            max_universe_env="ORB_MAX_UNIVERSE",
+            default_max_universe=1500,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        record_error(BOT_NAME, exc)
+        universe = []
+
     if not universe:
-        print("[opening_range_breakout] empty universe; skipping.")
+        finished = now_est_dt()
+        record_bot_stats(
+            BOT_NAME,
+            0,
+            0,
+            0,
+            runtime_seconds=time.time() - start_ts,
+            started_at=started_at,
+            finished_at=finished,
+        )
         return
 
     print(f"[opening_range_breakout] scanning {len(universe)} symbols")
 
-    orb_start = datetime(trading_day.year, trading_day.month, trading_day.day, 9, 30, tzinfo=eastern)
-    orb_end = orb_start + timedelta(minutes=ORB_RANGE_MINUTES)
-
     for sym in universe:
-        if is_etf_blacklisted(sym):
-            continue
+        try:
+            if is_etf_blacklisted(sym):
+                continue
 
-        bars = _fetch_intraday_1min(sym, trading_day)
-        if not bars:
-            continue
+            bars = _fetch_intraday_1min(sym, trading_day)
+            if not bars:
+                continue
 
-        # Basic intraday aggregates for filters
-        day_vol = sum(b["v"] for b in bars)
-        day_dollar_vol = sum((b["c"] or 0.0) * b["v"] for b in bars)
-        last_price = bars[-1]["c"]
+            scanned += 1
 
-        if last_price is None or last_price < ORB_MIN_PRICE:
-            continue
-        if day_vol < MIN_VOLUME_GLOBAL or day_dollar_vol < ORB_MIN_DOLLAR_VOL:
-            continue
+            day_vol = sum(b["v"] for b in bars)
+            day_dollar_vol = sum((b["c"] or 0.0) * b["v"] for b in bars)
+            last_price = bars[-1]["c"]
+            open_price = bars[0]["o"] if bars else None
+            session_high = max(b["h"] for b in bars if b["h"] is not None)
+            session_low = min(b["l"] for b in bars if b["l"] is not None)
 
-        rvol = _compute_rvol(sym, trading_day, day_vol)
-        if rvol < max(ORB_MIN_RVOL, MIN_RVOL_GLOBAL):
-            continue
+            if last_price is None or last_price < ORB_MIN_PRICE:
+                continue
+            if day_vol < max(MIN_VOLUME_GLOBAL, 1):
+                continue
+            if day_dollar_vol < ORB_MIN_DOLLAR_VOL:
+                continue
 
-        long_trigger, short_trigger, bull_fvg, bear_fvg, last_bar = _detect_orb_signals(
-            bars, orb_start, orb_end
-        )
-        if last_bar is None:
-            continue
+            rvol, prior_close, prior_low = _compute_rvol(sym, trading_day, day_vol)
+            if rvol < max(ORB_MIN_RVOL, MIN_RVOL_GLOBAL):
+                continue
 
-        orb_high = last_bar["orb_high"]
-        orb_low = last_bar["orb_low"]
-
-        # LONG: ORB breakout + retest
-        if long_trigger and sym not in _seen_long:
-            fvg_line = ""
-            if bull_fvg:
-                f_lo, f_hi = bull_fvg
-                if last_bar["l"] <= f_hi and last_bar["h"] >= f_lo:
-                    fvg_line = f"🟩 Retest of bullish FVG zone: ${f_lo:.2f}–${f_hi:.2f}"
-                else:
-                    fvg_line = f"🟩 Bullish FVG below: ${f_lo:.2f}–${f_hi:.2f}"
-
-            header = f"🚀 ORB LONG (breakout + retest) — {sym}"
-            body_lines = [
-                header,
-                f"🕒 {now_str}",
-                "────────────",
-                f"💰 Price: ${last_price:.2f}",
-                f"📊 RVOL: {rvol:.2f}",
-                f"💵 Intraday $Vol: ≈ ${day_dollar_vol:,.0f}",
-                "",
-                f"📈 ORB High: ${orb_high:.2f}",
-                f"📉 ORB Low:  ${orb_low:.2f}",
-                f"🔁 Retest band: around ${orb_high:.2f}",
-            ]
-            if fvg_line:
-                body_lines.append(fvg_line)
-            body_lines.extend(
-                [
-                    "",
-                    "Bias: LONG idea above ORB high after retest. Combine with RSI + options flow for entries.",
-                    f"🔗 Chart: {chart_link(sym)}",
-                ]
+            long_trigger, short_trigger, bull_fvg, bear_fvg, last_bar = _detect_orb_signals(
+                bars, orb_start, orb_end
             )
-            extra = "\n".join(body_lines)
-            send_alert("orb_long", sym, float(last_price), rvol, extra=extra)
-            _seen_long.add(sym)
-            matched_syms.add(sym)
-            alerts_sent += 1
+            if last_bar is None:
+                continue
+
+            orb_high = last_bar["orb_high"]
+            orb_low = last_bar["orb_low"]
+            vwap = _compute_vwap(bars)
+
+            day_move_pct = None
+            if prior_close and prior_close > 0:
+                day_move_pct = (last_price - prior_close) / prior_close * 100.0
+            open_move_pct = None
+            if open_price and open_price > 0:
+                open_move_pct = (last_price - open_price) / open_price * 100.0
+            dist_low_pct = None
+            if session_low and session_low > 0:
+                dist_low_pct = (last_price - session_low) / session_low * 100.0
+            hod_dist_pct = None
+            if session_high and session_high > 0:
+                hod_dist_pct = (session_high - last_price) / session_high * 100.0
+
+            def _vwap_relation() -> str:
+                if vwap is None or vwap <= 0:
+                    return "n/a"
+                if last_price > vwap * 1.001:
+                    return "trading ABOVE VWAP"
+                if last_price < vwap * 0.999:
+                    return "trading BELOW VWAP"
+                return "hugging VWAP"
+
+            def _context_line(direction: str) -> str:
+                if direction == "long":
+                    if rvol >= 2.0:
+                        return "Strong OR breakout with confirmed volume & trend strength"
+                    return "Breakout attempt with constructive volume"
+                if rvol >= 2.0:
+                    return "Aggressive downside pressure + heavy volume breakdown"
+                return "Breakdown attempt with elevated supply"
+
+            def _support_level() -> Optional[float]:
+                candidates = [x for x in [prior_low, orb_low, session_low] if x]
+                if not candidates:
+                    return None
+                return sorted(candidates, key=lambda x: abs(x - last_price))[0]
+
+            def _resistance_level() -> Optional[float]:
+                candidates = [x for x in [session_high, orb_high] if x]
+                return max(candidates) if candidates else None
+
+            timestamp = format_est_timestamp()
+
+            # LONG: ORB breakout + retest
+            if long_trigger and sym not in _seen_long:
+                break_dist = ((last_price - orb_high) / orb_high * 100.0) if orb_high else None
+                header = [
+                    f"⚡️ OPENING RANGE BREAKOUT — {sym}",
+                    f"🕒 {timestamp}",
+                ]
+                lines = header + [
+                    "────────────",
+                    "🚀 LONG Breakout Above Opening Range High",
+                ]
+                price_line = f"💰 Last: ${last_price:.2f}"
+                move_bits: List[str] = []
+                if day_move_pct is not None:
+                    move_bits.append(f"{day_move_pct:+.1f}% vs prior close")
+                if open_move_pct is not None:
+                    move_bits.append(f"{open_move_pct:+.1f}% from open")
+                if hod_dist_pct is not None:
+                    move_bits.append(f"{hod_dist_pct:.1f}% below HOD")
+                if move_bits:
+                    price_line += f" ({', '.join(move_bits)})"
+                lines.append(price_line)
+                lines.extend(
+                    [
+                        "",
+                        f"📊 Opening Range (first {ORB_RANGE_MINUTES}m)",
+                        f"• High: ${orb_high:.2f}",
+                        f"• Low: ${orb_low:.2f}",
+                        "",
+                    ]
+                )
+                if break_dist is not None:
+                    lines.append(f"🔥 Break Distance: {break_dist:+.1f}% above OR high")
+                lines.extend(
+                    [
+                        "",
+                        "📈 Volume & Strength",
+                        f"• Volume: {day_vol:,.0f} ({rvol:.1f}× avg)",
+                        f"• Dollar Vol ≈ ${day_dollar_vol:,.0f}",
+                        f"• RVOL: {rvol:.1f}×",
+                    ]
+                )
+                if vwap:
+                    lines.append(f"• VWAP: ${vwap:.2f} ({_vwap_relation()})")
+                lines.extend(
+                    [
+                        "",
+                        "🔎 Context",
+                        _context_line("long"),
+                        "",
+                        "• Reference levels:",
+                    ]
+                )
+                support = _support_level()
+                resistance = _resistance_level()
+                if support:
+                    lines.append(f"  - Support zone (near-term): ${support:.2f}")
+                if resistance:
+                    lines.append(f"  - Resistance zone: ${resistance:.2f}")
+                lines.extend(
+                    [
+                        "",
+                        "🔗 Chart:",
+                        chart_link(sym),
+                    ]
+                )
+
+                if bull_fvg:
+                    f_lo, f_hi = bull_fvg
+                    lines.insert(
+                        7,
+                        f"🟩 Bullish FVG zone: ${f_lo:.2f}–${f_hi:.2f}",
+                    )
+
+                send_alert_text("\n".join(lines))
+                _seen_long.add(sym)
+                matched_syms.add(sym)
+                alerts_sent += 1
+                continue
+
+            # SHORT: ORB breakdown + retest
+            if short_trigger and sym not in _seen_short:
+                break_dist = ((last_price - orb_low) / orb_low * 100.0) if orb_low else None
+                header = [
+                    f"⚡️ OPENING RANGE BREAKDOWN — {sym}",
+                    f"🕒 {timestamp}",
+                ]
+                lines = header + [
+                    "────────────",
+                    "🩸 SHORT Breakdown Below Opening Range Low",
+                ]
+                price_line = f"💰 Last: ${last_price:.2f}"
+                move_bits: List[str] = []
+                if day_move_pct is not None:
+                    move_bits.append(f"{day_move_pct:+.1f}% vs prior close")
+                if open_move_pct is not None:
+                    move_bits.append(f"{open_move_pct:+.1f}% from open")
+                if hod_dist_pct is not None:
+                    move_bits.append(f"{hod_dist_pct:.1f}% below HOD")
+                if move_bits:
+                    price_line += f" ({', '.join(move_bits)})"
+                lines.append(price_line)
+                lines.extend(
+                    [
+                        "",
+                        f"📊 Opening Range (first {ORB_RANGE_MINUTES}m)",
+                        f"• High: ${orb_high:.2f}",
+                        f"• Low: ${orb_low:.2f}",
+                        "",
+                    ]
+                )
+                if break_dist is not None:
+                    lines.append(f"🔥 Break Distance: {break_dist:+.1f}% below OR low")
+                lines.extend(
+                    [
+                        "",
+                        "📈 Volume & Strength",
+                        f"• Volume: {day_vol:,.0f} ({rvol:.1f}× avg)",
+                        f"• Dollar Vol ≈ ${day_dollar_vol:,.0f}",
+                        f"• RVOL: {rvol:.1f}×",
+                    ]
+                )
+                if vwap:
+                    lines.append(f"• VWAP: ${vwap:.2f} ({_vwap_relation()})")
+                lines.extend(
+                    [
+                        "",
+                        "🔎 Context",
+                        _context_line("short"),
+                        "",
+                        "• Reference levels:",
+                    ]
+                )
+                support = _support_level()
+                resistance = _resistance_level()
+                if support:
+                    lines.append(f"  - Support zone (near-term): ${support:.2f}")
+                if resistance:
+                    lines.append(f"  - Resistance zone: ${resistance:.2f}")
+                lines.extend(
+                    [
+                        "",
+                        "🔗 Chart:",
+                        chart_link(sym),
+                    ]
+                )
+
+                if bear_fvg:
+                    f_hi, f_lo = bear_fvg
+                    lines.insert(
+                        7,
+                        f"🟥 Bearish FVG zone: ${f_lo:.2f}–${f_hi:.2f}",
+                    )
+
+                send_alert_text("\n".join(lines))
+                _seen_short.add(sym)
+                matched_syms.add(sym)
+                alerts_sent += 1
+
+        except Exception as exc:  # pragma: no cover - per-symbol resilience
+            print(f"[opening_range_breakout] error on {sym}: {exc}")
+            record_error(BOT_NAME, exc)
             continue
 
-        # SHORT: ORB breakdown + retest
-        if short_trigger and sym not in _seen_short:
-            fvg_line = ""
-            if bear_fvg:
-                f_hi, f_lo = bear_fvg
-                if last_bar["l"] <= f_hi and last_bar["h"] >= f_lo:
-                    fvg_line = f"🟥 Retest of bearish FVG zone: ${f_lo:.2f}–${f_hi:.2f}"
-                else:
-                    fvg_line = f"🟥 Bearish FVG above: ${f_lo:.2f}–${f_hi:.2f}"
-
-            header = f"🔻 ORB SHORT (breakdown + retest) — {sym}"
-            body_lines = [
-                header,
-                f"🕒 {now_str}",
-                "────────────",
-                f"💰 Price: ${last_price:.2f}",
-                f"📊 RVOL: {rvol:.2f}",
-                f"💵 Intraday $Vol: ≈ ${day_dollar_vol:,.0f}",
-                "",
-                f"📉 ORB Low:  ${orb_low:.2f}",
-                f"📈 ORB High: ${orb_high:.2f}",
-                f"🔁 Retest band: around ${orb_low:.2f}",
-            ]
-            if fvg_line:
-                body_lines.append(fvg_line)
-            body_lines.extend(
-                [
-                    "",
-                    "Bias: SHORT / take-profit idea below ORB low after retest. Combine with RSI + options flow for timing.",
-                    f"🔗 Chart: {chart_link(sym)}",
-                ]
-            )
-            extra = "\n".join(body_lines)
-            send_alert("orb_short", sym, float(last_price), rvol, extra=extra)
-            _seen_short.add(sym)
-            matched_syms.add(sym)
-            alerts_sent += 1
-
+    finished = now_est_dt()
     runtime = time.time() - start_ts
     try:
         record_bot_stats(
             BOT_NAME,
-            scanned=len(universe),
+            scanned=scanned or len(universe),
             matched=len(matched_syms),
             alerts=alerts_sent,
             runtime_seconds=runtime,
+            started_at=started_at,
+            finished_at=finished,
         )
-    except Exception as e:
+    except Exception as e:  # pragma: no cover - defensive
         print(f"[opening_range_breakout] record_bot_stats error: {e}")
 
     print("[opening_range_breakout] scan complete.")
