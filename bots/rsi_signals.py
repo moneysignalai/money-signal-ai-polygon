@@ -213,10 +213,16 @@ def _format_rsi_alert(
     vol_text = f"{volume:,.0f}" if volume > 0 else "N/A"
     dollar_vol_text = f"${dollar_vol:,.0f}" if dollar_vol > 0 else "N/A"
 
+    distance_low_text = (
+        f"{distance_from_low_pct:.1f}%" if distance_from_low_pct > 0 else "N/A"
+    )
+    distance_high_text = (
+        f"{distance_from_high_pct:.1f}%" if distance_from_high_pct > 0 else "N/A"
+    )
     distance_line = (
-        f"• Distance from Low: {distance_from_low_pct:.1f}%"
+        f"• Distance from Low: {distance_low_text}"
         if signal == "oversold"
-        else f"• Distance from High: {distance_from_high_pct:.1f}%"
+        else f"• Distance from High: {distance_high_text}"
     )
 
     rsi_threshold_text = (
