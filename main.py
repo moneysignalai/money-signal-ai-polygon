@@ -6,6 +6,7 @@ import os
 import threading
 import time
 import traceback
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Tuple
 
@@ -32,6 +33,7 @@ BOT_MAX_RUNTIME_SECONDS = int(os.getenv("BOT_MAX_RUNTIME_SECONDS", str(BOT_TIMEO
 BOT_MAX_CONCURRENCY = int(os.getenv("BOT_MAX_CONCURRENCY", "6"))
 BOT_TIMEOUT_SECONDS = max(5, BOT_TIMEOUT_SECONDS)
 STATUS_HEARTBEAT_INTERVAL_MIN = float(os.getenv("STATUS_HEARTBEAT_INTERVAL_MIN", "5"))
+BOT_FAILURE_COOLDOWN_SECONDS = float(os.getenv("BOT_FAILURE_COOLDOWN_SECONDS", "60"))
 
 
 def _parse_bot_list(env_var: str) -> set[str]:
@@ -282,6 +284,7 @@ async def _run_single_bot(
                 )
             except Exception as inner:
                 print(f"[bot_runner] warning recording failure stats for {public_name}: {inner}")
+        raise
     finally:
         finish_bot_run_context(run_ctx)
 
@@ -296,15 +299,32 @@ async def _run_bot_wrapper(
     running: Dict[str, bool],
     next_run_ts: Dict[str, float],
     semaphore: asyncio.Semaphore,
+    failure_until: Dict[str, float],
 ):
     running[public_name] = True
+    start_ts = time.time()
+    print(f"[scheduler] bot={public_name} action=START interval={interval}s")
     await semaphore.acquire()
     try:
         await _run_single_bot(public_name, module_path, func_name, record_error, record_stats)
+    except Exception:
+        failure_until[public_name] = time.time() + BOT_FAILURE_COOLDOWN_SECONDS
+        print(
+            f"[scheduler] bot={public_name} action=FAIL cooldown={BOT_FAILURE_COOLDOWN_SECONDS}s"
+        )
     finally:
         semaphore.release()
         running[public_name] = False
-        next_run_ts[public_name] = time.time() + interval
+        finished_ts = time.time()
+        runtime = finished_ts - start_ts
+        next_run_ts[public_name] = finished_ts + interval
+        if failure_until.get(public_name, 0) > finished_ts:
+            # preserve failure cooldown
+            next_run_ts[public_name] = max(next_run_ts[public_name], failure_until[public_name])
+        print(
+            f"[scheduler] bot={public_name} action=END runtime={runtime:.2f}s "
+            f"next_in={next_run_ts[public_name]-finished_ts:.1f}s"
+        )
 
 
 async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS, *, stop_after_cycles: int | None = None):
@@ -324,6 +344,7 @@ async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS, *, 
 
     next_run_ts: Dict[str, float] = {name: 0.0 for name, _, _, _ in BOTS}
     running: Dict[str, bool] = {name: False for name, _, _, _ in BOTS}
+    failure_until: Dict[str, float] = {name: 0.0 for name, _, _, _ in BOTS}
     pending_tasks: List[asyncio.Task] = []
     last_skip_day: Dict[str, str] = {}
     semaphore = asyncio.Semaphore(max(1, BOT_MAX_CONCURRENCY if not os.getenv("INTEGRATION_TEST", "false").lower() == "true" else min(BOT_MAX_CONCURRENCY, 2)))
@@ -342,6 +363,13 @@ async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS, *, 
                 skip = _skip_reason(name)
                 if skip:
                     print(f"[scheduler] bot={name} action=SKIPPED_DISABLED reason={skip}")
+                    continue
+
+                cooldown_until = failure_until.get(name, 0.0)
+                if cooldown_until and cycle_start_ts < cooldown_until:
+                    print(
+                        f"[scheduler] bot={name} action=SKIP_COOLDOWN until={cooldown_until:.0f}"
+                    )
                     continue
 
                 allowed, reason = _time_window_allows(name, module_path)
@@ -390,6 +418,7 @@ async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS, *, 
                             running,
                             next_run_ts,
                             semaphore,
+                            failure_until,
                         )
                     )
                     pending_tasks.append(task)
@@ -403,6 +432,8 @@ async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS, *, 
                 f"[main] scheduler cycle finished in {elapsed:.2f}s; "
                 f"sleeping {base_interval_seconds}s"
             )
+            # Clean up finished tasks to avoid unbounded list growth
+            pending_tasks = [t for t in pending_tasks if not t.done()]
         except Exception as exc:
             print(f"[main] scheduler loop error: {exc}")
         cycles += 1

@@ -452,3 +452,17 @@ MoneySignalAI delivers actionable, low-latency trading intelligence by fusing de
 - `CIRCUIT_BREAKER_FAILURES` / `CIRCUIT_BREAKER_COOLDOWN`: open a cooldown after repeated HTTP failures.
 - `TEST_MODE=true`: runs bots against local fixtures without network usage.
 - `INTEGRATION_TEST=true`: constrains universes and concurrency for safe limited-network verification.
+
+## Environment & Safety Defaults
+- `BOT_MAX_CONCURRENCY`: global cap for concurrent bots (default 6).
+- `BOT_MAX_RUNTIME_SECONDS`: hard runtime cap per bot run (default BOT_TIMEOUT_SECONDS).
+- `MAX_REQUESTS_PER_BOT_PER_RUN`: request cap enforced inside `bots.shared`.
+- `BOT_FAILURE_COOLDOWN_SECONDS`: cooldown applied after a failed run before rescheduling.
+- `UNIVERSE_HARD_CAP` / `UNIVERSE_TOP_N`: hard caps for universe resolution to avoid overload.
+- `TEST_MODE=true`: routes HTTP calls to fixtures under `tests/fixtures` to avoid live requests.
+
+## Running Tests
+```bash
+export TEST_MODE=true
+pytest
+```
