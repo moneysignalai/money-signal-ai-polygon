@@ -443,3 +443,12 @@ Use Case: Focus list for day traders and PM desk recaps.
 - **Institutional readiness**: Liquidity-aware filters, rate-limit protections, and fault isolation align with institutional expectations for reliability and auditability.
 
 MoneySignalAI delivers actionable, low-latency trading intelligence by fusing deterministic strategy logic with an evolving AI-style inference layer—built for traders today and extensible to institutional-grade SaaS tomorrow.
+
+## New runtime safeguards
+- `UNIVERSE_HARD_CAP` (default 800): global maximum tickers any bot will scan; enforced with diagnostics when trimmed.
+- `BOT_MAX_RUNTIME_SECONDS` (default equals `BOT_TIMEOUT_SECONDS`): hard per-run ceiling applied by the scheduler.
+- `BOT_MAX_CONCURRENCY` (default 6, capped to 2 when `INTEGRATION_TEST=true`): limits simultaneous bot executions.
+- `MAX_REQUESTS_PER_BOT_PER_RUN` (default 400): stops runaway HTTP loops per bot run.
+- `CIRCUIT_BREAKER_FAILURES` / `CIRCUIT_BREAKER_COOLDOWN`: open a cooldown after repeated HTTP failures.
+- `TEST_MODE=true`: runs bots against local fixtures without network usage.
+- `INTEGRATION_TEST=true`: constrains universes and concurrency for safe limited-network verification.
