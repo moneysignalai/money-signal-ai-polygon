@@ -259,6 +259,15 @@ def _format_heartbeat() -> str:
         total_matched += row.matched
         total_alerts += row.alerts
 
+    # Include any additional bots observed in stats to keep heartbeat complete
+    extra_bots = [b for b in bots_data.keys() if b not in BOT_DISPLAY_ORDER]
+    for internal in sorted(extra_bots):
+        row = _aggregate_today(internal, bots_data.get(internal, {}), today_iso)
+        bot_rows.append(row)
+        total_scanned += row.scanned
+        total_matched += row.matched
+        total_alerts += row.alerts
+
     now_ts = time.time()
     recent_errors = [e for e in errors_data if now_ts - float(e.get("ts", 0.0)) <= 60 * 60]
     error_bots = {str(e.get("bot", "")).lower() for e in recent_errors}

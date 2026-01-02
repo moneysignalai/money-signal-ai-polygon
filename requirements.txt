@@ -8,3 +8,4 @@ ta
 python-dateutil
 python-dotenv
 websocket-client
+pytest-asyncio>=0.21

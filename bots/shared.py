@@ -4,6 +4,7 @@ import os
 import time
 import math
 import json
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from typing import Dict, Any, List, Optional, Tuple
@@ -56,6 +57,29 @@ TEST_MODE_BOTS = {
 # DEBUG_FLOW_REASONS: if true, bots can log why candidates were rejected by filters.
 # Example: DEBUG_FLOW_REASONS=true
 DEBUG_FLOW_REASONS = os.getenv("DEBUG_FLOW_REASONS", "false").lower() == "true"
+
+TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
+INTEGRATION_TEST = os.getenv("INTEGRATION_TEST", "false").lower() == "true"
+UNIVERSE_HARD_CAP = int(os.getenv("UNIVERSE_HARD_CAP", "800"))
+MAX_REQUESTS_PER_BOT_PER_RUN = int(os.getenv("MAX_REQUESTS_PER_BOT_PER_RUN", "400"))
+CIRCUIT_BREAKER_FAILURES = int(os.getenv("CIRCUIT_BREAKER_FAILURES", "3"))
+CIRCUIT_BREAKER_COOLDOWN = float(os.getenv("CIRCUIT_BREAKER_COOLDOWN", "30"))
+BOTTLED_BACKOFF_CAP = float(os.getenv("BACKOFF_MAX_SECONDS", "8"))
+
+
+@dataclass
+class BotRunContext:
+    bot_name: str
+    start_ts: float
+    max_runtime: float
+    max_requests: int
+    request_count: int = 0
+    failure_count: int = 0
+    cooldown_until: float = 0.0
+    failure_reason: Optional[str] = None
+
+
+_BOT_CONTEXT: ContextVar[Optional[BotRunContext]] = ContextVar("bot_context", default=None)
 
 eastern = pytz.timezone("US/Eastern")
 
@@ -174,6 +198,32 @@ def is_bot_test_mode(bot_name: str) -> bool:
       • route alerts to a separate Telegram chat, etc.
     """
     return bot_name.strip().lower() in TEST_MODE_BOTS
+
+
+def start_bot_run_context(bot_name: str, *, max_runtime: Optional[int] = None) -> BotRunContext:
+    ctx = BotRunContext(
+        bot_name=bot_name,
+        start_ts=time.time(),
+        max_runtime=float(max_runtime or os.getenv("BOT_MAX_RUNTIME_SECONDS", "180")),
+        max_requests=MAX_REQUESTS_PER_BOT_PER_RUN,
+    )
+    _BOT_CONTEXT.set(ctx)
+    return ctx
+
+
+def _get_universe_hard_cap() -> int:
+    try:
+        return int(os.getenv("UNIVERSE_HARD_CAP", str(UNIVERSE_HARD_CAP)))
+    except Exception:
+        return UNIVERSE_HARD_CAP
+
+
+def finish_bot_run_context(ctx: Optional[BotRunContext]) -> None:
+    try:
+        if ctx:
+            _BOT_CONTEXT.set(None)
+    except Exception:
+        pass
 
 
 def debug_filter_reason(bot_name: str, symbol: str, reason: str) -> None:
@@ -335,6 +385,44 @@ def _save_stats_file(data: Dict[str, Any]) -> None:
             pass
 
 
+def _enforce_bot_limits(tag: str) -> None:
+    ctx = _BOT_CONTEXT.get()
+    if not ctx:
+        return
+
+    now = time.time()
+    if ctx.cooldown_until and now < ctx.cooldown_until:
+        raise RuntimeError(
+            f"{tag}: circuit breaker open for {ctx.bot_name} until {ctx.cooldown_until:.0f}"
+        )
+    if now - ctx.start_ts > ctx.max_runtime:
+        ctx.failure_reason = "max runtime exceeded"
+        raise TimeoutError(f"{tag}: exceeded max runtime {ctx.max_runtime}s")
+    if ctx.request_count >= ctx.max_requests:
+        ctx.failure_reason = "max requests reached"
+        raise RuntimeError(f"{tag}: exceeded max requests per run ({ctx.max_requests})")
+
+    ctx.request_count += 1
+
+
+def _handle_request_failure(tag: str, status_code: Optional[int] = None, *, exc: Optional[Exception] = None) -> None:
+    ctx = _BOT_CONTEXT.get()
+    if not ctx:
+        return
+    ctx.failure_count += 1
+    if ctx.failure_count >= CIRCUIT_BREAKER_FAILURES:
+        ctx.cooldown_until = time.time() + CIRCUIT_BREAKER_COOLDOWN
+        ctx.failure_reason = (
+            f"circuit open after {ctx.failure_count} errors"
+            + (f" status={status_code}" if status_code else "")
+            + (f" exc={exc}" if exc else "")
+        )
+        print(
+            f"[{tag}] circuit breaker for {ctx.bot_name} cooling down {CIRCUIT_BREAKER_COOLDOWN}s "
+            f"after repeated failures"
+        )
+
+
 def record_bot_stats(
     bot_name: str,
     scanned: int,
@@ -344,6 +432,7 @@ def record_bot_stats(
     *,
     started_at: Optional[datetime] = None,
     finished_at: Optional[datetime] = None,
+    failure_reason: Optional[str] = None,
 ) -> None:
     """Record per-bot stats with trading-day scoping.
 
@@ -376,6 +465,7 @@ def record_bot_stats(
         "finished_at_ts": finished.timestamp(),
         "finished_at_str": format_est_timestamp(finished),
         "trading_day": trading_day,
+        "failure_reason": failure_reason,
     }
 
     data = _load_stats_file()
@@ -425,26 +515,30 @@ def _http_get_json(
     slowness does not kill the bots or flood them with exceptions.
     """
     for attempt in range(retries + 1):
+        _enforce_bot_limits(tag)
         try:
             resp = requests.get(url, params=params, timeout=timeout)
             # Graceful handling of rate limits
             if resp.status_code == 429:
-                wait = backoff_seconds * (attempt + 1)
+                wait = min(backoff_seconds * (attempt + 1), BOTTLED_BACKOFF_CAP)
                 print(f"[{tag}] Polygon 429 rate-limit; sleeping {wait:.1f}s before retry.")
                 time.sleep(wait)
+                _handle_request_failure(tag, status_code=429)
                 continue
 
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
             if attempt < retries:
-                wait = backoff_seconds * (attempt + 1)
+                wait = min(backoff_seconds * (attempt + 1), BOTTLED_BACKOFF_CAP)
                 print(f"[{tag}] HTTP error on attempt {attempt+1}/{retries+1}: {e} — retrying in {wait:.1f}s")
                 time.sleep(wait)
+                _handle_request_failure(tag, exc=e)
             else:
                 msg = f"[{tag}] error after {retries+1} attempts: {e}"
                 print(msg)
                 report_status_error(tag, msg)
+                _handle_request_failure(tag, exc=e)
                 return None
     return None
 
@@ -534,6 +628,8 @@ def _get_top_volume_universe_sync(
 ) -> List[str]:
     """Return a liquid universe ordered by dollar volume with layered fallbacks."""
 
+    hard_cap = _get_universe_hard_cap()
+    max_tickers = min(max_tickers, hard_cap)
     now_ts = time.time()
     if _UNIVERSE_CACHE["data"] and now_ts - float(_UNIVERSE_CACHE["ts"]) < 60.0:
         cached = _UNIVERSE_CACHE["data"][:max_tickers]
@@ -604,6 +700,10 @@ def _get_top_volume_universe_sync(
             f"[universe] using top-volume universe size={len(universe)} "
             f"(source=TOP_{MAX_UNIVERSE_CAP}_VOLUME)"
         )
+        if len(universe) > hard_cap:
+            print(
+                f"[universe] WARNING capped universe from {len(universe)} to {hard_cap}"
+            )
         return universe[:max_tickers]
 
     env_universe = _get_env_universe("TICKER_UNIVERSE")
@@ -618,6 +718,10 @@ def _get_top_volume_universe_sync(
             f"[universe] massive volume feed unavailable, using ENV TICKER_UNIVERSE "
             f"size={len(env_universe)}"
         )
+        if len(env_universe) > hard_cap:
+            print(
+                f"[universe] WARNING ENV universe capped from {len(env_universe)} to {hard_cap}"
+            )
         return env_universe[:max_tickers]
 
     print("[universe] CRITICAL: universe empty — using emergency minimal fallback set")
@@ -781,14 +885,21 @@ def resolve_universe_for_bot(
         else:
             trimmed = selected_universe
 
-    if len(trimmed) > resolved_max:
+    hard_cap = min(resolved_max, _get_universe_hard_cap())
+    if len(trimmed) > hard_cap:
         print(
-            f"[shared] {bot_name}: capping universe from {len(trimmed)} → {resolved_max}"
+            f"[shared] {bot_name}: capping universe from {len(trimmed)} → {hard_cap} "
+            f"(hard cap {_get_universe_hard_cap()})"
         )
-    final_universe = trimmed[:resolved_max]
+    final_universe = trimmed[:hard_cap]
+    if not final_universe:
+        print(
+            f"[shared] {bot_name}: universe empty after filtering (reason="
+            f"{'no overrides' if not selected_universe else 'filtered out'})"
+        )
     print(
         f"[shared] {bot_name}: universe {len(final_universe)} names "
-        f"(max={resolved_max}, dynamic={'on' if apply_dynamic_filters else 'off'})"
+        f"(max={hard_cap}, dynamic={'on' if apply_dynamic_filters else 'off'})"
     )
     return final_universe
 
@@ -949,6 +1060,7 @@ def get_last_option_trades_cached(
     backoff_seconds = 2.5
 
     for attempt in range(retries + 1):
+        _enforce_bot_limits("shared:last_option_trade")
         try:
             resp = requests.get(url, params=params, timeout=timeout)
             if resp.status_code == 404:
@@ -960,12 +1072,13 @@ def get_last_option_trades_cached(
             return data
         except Exception as e:
             if attempt < retries:
-                wait = backoff_seconds * (attempt + 1)
+                wait = min(backoff_seconds * (attempt + 1), BOTTLED_BACKOFF_CAP)
                 print(
                     f"[shared:last_option_trade] HTTP error on attempt "
                     f"{attempt+1}/{retries+1}: {e} — retrying in {wait:.1f}s"
                 )
                 time.sleep(wait)
+                _handle_request_failure("shared:last_option_trade", exc=e)
             else:
                 msg = (
                     f"[shared] error fetching last option trade for "
@@ -973,6 +1086,7 @@ def get_last_option_trades_cached(
                 )
                 print(msg)
                 report_status_error("shared:last_option_trade", msg)
+                _handle_request_failure("shared:last_option_trade", exc=e)
                 return None
 
     return None
