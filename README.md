@@ -1,4 +1,4 @@
-# MoneySignalAI — Polygon Data Engine
+# MoneySignalAI — Stock & Options Data Engine
 
 MoneySignalAI is an institutional-grade, Python-native equities and options alerting platform. It watches a dynamic top-volume universe (up to ~1,500 tickers with `TICKER_UNIVERSE` fallback), applies strategy-specific filters, and streams emoji-rich, trader-ready alerts to Telegram. The FastAPI scheduler runs multiple bots in parallel, enforces time windows, and emits a heartbeat with per-bot health, scan counts, and runtimes.
 
