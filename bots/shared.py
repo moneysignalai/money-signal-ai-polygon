@@ -497,7 +497,7 @@ def _get_options_override_universe() -> List[str]:
     return tickers
 
 
-MAX_UNIVERSE_CAP = 250
+MAX_UNIVERSE_CAP = int(os.getenv("UNIVERSE_TOP_N", "250") or 250)
 
 
 def _should_log_universe(now_ts: float) -> bool:
@@ -532,30 +532,40 @@ def _get_top_volume_universe_sync(
         max_tickers = max(1, min(max_tickers, MAX_UNIVERSE_CAP))
 
     tickers: List[Tuple[str, float]] = []
+    grouped_source = None
     if POLYGON_KEY:
+        # Try to find the most recent trading day with grouped results to avoid
+        # weekend/holiday empty universes. Look back up to one week.
         today = today_est_date()
-        prev = today - timedelta(days=1)
-        from_ = prev.isoformat()
-        url = f"{API_BASE}/v2/aggs/grouped/locale/us/market/stocks/{from_}"
-        params = {"adjusted": "true", "apiKey": POLYGON_KEY}
-        data = _http_get_json(
-            url,
-            params,
-            tag="shared:universe",
-            timeout=7.0,
-            retries=1,
-            backoff_seconds=2.0,
-        )
-        results = data.get("results") if data else None
-        if results:
-            for row in results:
-                sym = row.get("T")
-                vol = float(row.get("v") or 0.0)
-                vwap = float(row.get("vw") or 0.0)
-                dollar_vol = vol * max(vwap, 0.0)
-                if not sym or dollar_vol <= 0:
-                    continue
-                tickers.append((sym, dollar_vol))
+        for offset in range(1, 8):
+            day = today - timedelta(days=offset)
+            from_ = day.isoformat()
+            url = f"{API_BASE}/v2/aggs/grouped/locale/us/market/stocks/{from_}"
+            params = {"adjusted": "true", "apiKey": POLYGON_KEY}
+            data = _http_get_json(
+                url,
+                params,
+                tag="shared:universe",
+                timeout=7.0,
+                retries=1,
+                backoff_seconds=2.0,
+            )
+            results = data.get("results") if data else None
+            if results:
+                grouped_source = from_
+                for row in results:
+                    sym = row.get("T")
+                    vol = float(row.get("v") or 0.0)
+                    vwap = float(row.get("vw") or 0.0)
+                    dollar_vol = vol * max(vwap, 0.0)
+                    if not sym or dollar_vol <= 0:
+                        continue
+                    tickers.append((sym, dollar_vol))
+                break
+        if grouped_source and _should_log_universe(now_ts):
+            print(
+                f"[universe] using grouped date={grouped_source} source=TOP_{MAX_UNIVERSE_CAP}_VOLUME"
+            )
     if tickers:
         tickers.sort(key=lambda x: x[1], reverse=True)
         total_dollar = sum(row[1] for row in tickers)
@@ -573,7 +583,7 @@ def _get_top_volume_universe_sync(
         _UNIVERSE_CACHE["log_ts"] = now_ts
         print(
             f"[universe] using top-volume universe size={len(universe)} "
-            f"(source=TOP_250_VOLUME)"
+            f"(source=TOP_{MAX_UNIVERSE_CAP}_VOLUME)"
         )
         return universe[:max_tickers]
 

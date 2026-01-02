@@ -268,64 +268,71 @@ async def scheduler_loop(base_interval_seconds: int = SCAN_INTERVAL_SECONDS):
     last_skip_day: Dict[str, str] = {}
 
     while True:
-        cycle_start_ts = time.time()
-        cycle_start_dt = datetime.fromtimestamp(cycle_start_ts, tz=eastern)
-        print(f"[main] scheduler cycle starting at {cycle_start_dt.strftime('%H:%M:%S')} ET")
+        try:
+            cycle_start_ts = time.time()
+            cycle_start_dt = datetime.fromtimestamp(cycle_start_ts, tz=eastern)
+            print(
+                f"[main] scheduler cycle starting at {cycle_start_dt.strftime('%H:%M:%S')} ET"
+            )
 
-        tasks: List[asyncio.Task] = []
-        for name, module_path, func_name, interval in BOTS:
-            skip = _skip_reason(name)
-            if skip:
-                print(f"[scheduler] bot={name} action=SKIPPED_DISABLED reason={skip}")
-                continue
+            tasks: List[asyncio.Task] = []
+            for name, module_path, func_name, interval in BOTS:
+                skip = _skip_reason(name)
+                if skip:
+                    print(f"[scheduler] bot={name} action=SKIPPED_DISABLED reason={skip}")
+                    continue
 
-            allowed, reason = _time_window_allows(name, module_path)
-            if not allowed:
-                print(
-                    f"[scheduler] bot={name} action=SKIPPED_TIME_WINDOW "
-                    f"reason={reason or 'time window closed'}"
-                )
-                # Record a zero-scan skip once per trading day so status doesn't show "no run"
-                if record_bot_stats and today_est_date:
-                    day_key = today_est_date().isoformat()
-                    last_key = last_skip_day.get(name)
-                    if last_key != day_key:
-                        try:
-                            record_bot_stats(
-                                name,
-                                scanned=0,
-                                matched=0,
-                                alerts=0,
-                                runtime_seconds=0.0,
-                            )
-                            last_skip_day[name] = day_key
-                        except Exception as exc:
-                            print(f"[scheduler] warning recording skip stats for {name}: {exc}")
-                next_run_ts[name] = cycle_start_ts + interval
-                continue
-
-            due_ts = next_run_ts.get(name, 0.0)
-            if cycle_start_ts >= due_ts:
-                print(f"[scheduler] bot={name} action=RUN interval={interval}s")
-                tasks.append(
-                    asyncio.create_task(
-                        _run_single_bot(name, module_path, func_name, record_error)
+                allowed, reason = _time_window_allows(name, module_path)
+                if not allowed:
+                    print(
+                        f"[scheduler] bot={name} action=SKIPPED_TIME_WINDOW "
+                        f"reason={reason or 'time window closed'}"
                     )
-                )
-                next_run_ts[name] = cycle_start_ts + interval
-            else:
-                wait_for = max(0.0, due_ts - cycle_start_ts)
-                print(f"[scheduler] bot={name} action=WAITING next_in={wait_for:.1f}s")
+                    # Record a zero-scan skip once per trading day so status doesn't show "no run"
+                    if record_bot_stats and today_est_date:
+                        day_key = today_est_date().isoformat()
+                        last_key = last_skip_day.get(name)
+                        if last_key != day_key:
+                            try:
+                                record_bot_stats(
+                                    name,
+                                    scanned=0,
+                                    matched=0,
+                                    alerts=0,
+                                    runtime_seconds=0.0,
+                                )
+                                last_skip_day[name] = day_key
+                            except Exception as exc:
+                                print(
+                                    f"[scheduler] warning recording skip stats for {name}: {exc}"
+                                )
+                    next_run_ts[name] = cycle_start_ts + interval
+                    continue
 
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+                due_ts = next_run_ts.get(name, 0.0)
+                if cycle_start_ts >= due_ts:
+                    print(f"[scheduler] bot={name} action=RUN interval={interval}s")
+                    tasks.append(
+                        asyncio.create_task(
+                            _run_single_bot(name, module_path, func_name, record_error)
+                        )
+                    )
+                    next_run_ts[name] = cycle_start_ts + interval
+                else:
+                    wait_for = max(0.0, due_ts - cycle_start_ts)
+                    print(f"[scheduler] bot={name} action=WAITING next_in={wait_for:.1f}s")
 
-        cycle_end_ts = time.time()
-        elapsed = cycle_end_ts - cycle_start_ts
-        print(
-            f"[main] scheduler cycle finished in {elapsed:.2f}s; "
-            f"sleeping {base_interval_seconds}s"
-        )
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            cycle_end_ts = time.time()
+            elapsed = cycle_end_ts - cycle_start_ts
+            print(
+                f"[main] scheduler cycle finished in {elapsed:.2f}s; "
+                f"sleeping {base_interval_seconds}s"
+            )
+        except Exception as exc:
+            print(f"[main] scheduler loop error: {exc}")
         await asyncio.sleep(base_interval_seconds)
 
 

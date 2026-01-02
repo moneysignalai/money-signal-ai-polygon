@@ -1,12 +1,12 @@
-# MoneySignalAI — Stock & Options Data Engine
+# MoneySignalAI — Polygon Data Engine
 
-MoneySignalAI is an institutional-grade, multi-bot equities and options alerting platform built in Python. It scans a dynamic top-volume universe (up to ~1,500 tickers with `TICKER_UNIVERSE` fallback), applies strategy-specific filters, and streams emoji-rich, trader-ready alerts to Telegram. The FastAPI scheduler runs multiple bots in parallel, enforces time windows, and emits a heartbeat with per-bot health, scan counts, and runtimes.
+MoneySignalAI is an institutional-grade, multi-bot equities and options alerting platform built in Python. It scans a dynamic top-volume universe (default top 250 by dollar volume with `TICKER_UNIVERSE` fallback), applies strategy-specific filters, and streams emoji-rich, trader-ready alerts to Telegram. The FastAPI scheduler runs multiple bots in parallel, enforces time windows, and emits a heartbeat with per-bot health, scan counts, and runtimes.
 
 - **AI-powered, modular bot engine** across equity momentum, intraday flows, gaps, squeezes, dark pool, earnings, options flow, analytics, and daily ideas.
-- **Real-time Polygon/Massive data** with EST-aware trading-day logic and dynamic top-volume universes.
+- **Real-time Polygon/Massive data** with EST-aware trading-day logic and dynamic top-volume universes (capped at top 250 by default).
 - **Env-driven tuning** for every threshold (RVOL, dollar volume, IV crush %, DTE, gap %, RSI bands, etc.).
 - **Production telemetry** via `status_report.py` (today-only stats, diagnostics, runtimes) and Telegram delivery.
-- **Scales to 1,500+ tickers** with safe fallbacks and per-bot timeouts.
+- **Scales fluidly across liquid names** with safe fallbacks and per-bot timeouts (top 250 by default, env overrides supported).
 
 ---
 

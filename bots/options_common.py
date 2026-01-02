@@ -15,6 +15,7 @@ from bots.shared import (
     eastern,
     get_last_option_trades_cached,
     get_option_chain_cached,
+    get_last_trade_cached,
     send_alert_text,
     today_est_date,
 )
@@ -324,6 +325,14 @@ def iter_option_contracts(symbol: str, *, ttl_seconds: int = 60) -> List[OptionC
             )
             if local_underlying_price is not None and local_underlying_price <= 0:
                 local_underlying_price = None
+            if local_underlying_price is None:
+                # As a last resort, pull a cached last trade to avoid $0.00 underlyings
+                try:
+                    last_price, _ = get_last_trade_cached(symbol)
+                    if last_price is not None and last_price > 0:
+                        local_underlying_price = last_price
+                except Exception:
+                    pass
 
         local_underlying_rvol = underlying_fields.get("rvol")
         if local_underlying_rvol is None:

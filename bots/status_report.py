@@ -346,6 +346,8 @@ async def run_status() -> None:
 
     text = _format_heartbeat()
 
+    # Always print heartbeat to stdout for observability even if Telegram fails
+    print("[status_report] Heartbeat:\n" + text)
     _send_telegram_status(text)
     data["last_heartbeat_ts"] = now_ts
     _save_stats(data)
