@@ -7,4 +7,5 @@ yfinance
 ta
 python-dateutil
 python-dotenv
-websocket-clientpytest-asyncio>=0.21
+websocket-client
+pytest-asyncio>=0.21
