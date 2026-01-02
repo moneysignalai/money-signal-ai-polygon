@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from statistics import mean
-from typing import List, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 try:
     from massive import RESTClient
@@ -29,9 +29,10 @@ from bots.shared import (
     POLYGON_KEY,
     chart_link,
     debug_filter_reason,
+    format_est_timestamp,
     in_rth_window_est,
     resolve_universe_for_bot,
-    send_alert,
+    send_alert_text,
 )
 from bots.status_report import record_bot_stats
 
@@ -56,6 +57,7 @@ class DailySnapshot:
     close: float
     volume: float
     avg_volume: float
+    prev_close: Optional[float]
 
     @property
     def rvol(self) -> float:
@@ -122,7 +124,12 @@ def _compute_daily(sym: str) -> DailySnapshot | None:
     ]
     avg_volume = mean(history_vols) if history_vols else 0.0
 
-    return DailySnapshot(open_, high, low, close, volume, avg_volume)
+    prev_close = None
+    if len(daily) >= 2:
+        _, _, _, prev_c, _ = _extract_ohlcv(daily[-2])
+        prev_close = prev_c if prev_c > 0 else None
+
+    return DailySnapshot(open_, high, low, close, volume, avg_volume, prev_close)
 
 
 def _fetch_intraday(sym: str) -> List:
@@ -162,36 +169,177 @@ def _fetch_intraday(sym: str) -> List:
     return filtered
 
 
-def _compute_reversal(sym: str, daily: DailySnapshot, intraday: List) -> Tuple[bool, bool, float, float, float]:
+def _rsi(values: Iterable[float], period: int = 14) -> Optional[float]:
+    closes = list(values)
+    if len(closes) <= period:
+        return None
+
+    gains: List[float] = []
+    losses: List[float] = []
+    for prev, curr in zip(closes, closes[1:]):
+        delta = curr - prev
+        if delta >= 0:
+            gains.append(delta)
+            losses.append(0.0)
+        else:
+            gains.append(0.0)
+            losses.append(-delta)
+
+    avg_gain = mean(gains[-period:]) if gains[-period:] else 0.0
+    avg_loss = mean(losses[-period:]) if losses[-period:] else 0.0
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _compute_reversal(sym: str, daily: DailySnapshot, intraday: List) -> dict:
     if not intraday:
         raise ValueError("no intraday data")
 
     open_, _, _, _, _ = _extract_ohlcv(intraday[0])
-    _, _, _, latest_close, _ = _extract_ohlcv(intraday[-1])
+    _, _, _, latest_close, latest_vol = _extract_ohlcv(intraday[-1])
     high_price = max(_extract_ohlcv(b)[1] for b in intraday)
     low_price = min(_extract_ohlcv(b)[2] for b in intraday)
+    total_vol = sum(_extract_ohlcv(b)[4] for b in intraday)
+    vwap = (
+        sum(_extract_ohlcv(b)[3] * _extract_ohlcv(b)[4] for b in intraday)
+        / total_vol
+        if total_vol > 0
+        else 0.0
+    )
+
+    closes = [_extract_ohlcv(b)[3] for b in intraday if _extract_ohlcv(b)[3] > 0]
+    rsi_current = _rsi(closes, period=14)
+    rsi_early = _rsi(closes[: len(closes) // 2], period=14) if closes else None
 
     high_move = (high_price - open_) / open_ * 100 if open_ > 0 else 0.0
     low_move = (low_price - open_) / open_ * 100 if open_ > 0 else 0.0
 
-    # Determine dominant initial move
-    bullish_reversal = False
-    bearish_reversal = False
+    direction = "none"
     move_pct = 0.0
     reclaim_pct = 0.0
+    earlier_below_vwap = any(
+        _extract_ohlcv(b)[3] < vwap for b in intraday[: len(intraday) // 2]
+    )
+    earlier_above_vwap = any(
+        _extract_ohlcv(b)[3] > vwap for b in intraday[: len(intraday) // 2]
+    )
 
-    if abs(low_move) > abs(high_move):
+    if abs(low_move) >= abs(high_move):
         move_pct = abs(low_move)
-        if high_price != low_price:
-            reclaim_pct = (latest_close - low_price) / (open_ - low_price) if open_ != low_price else 0.0
-        bullish_reversal = reclaim_pct >= _min_reclaim_pct
+        drop = open_ - low_price
+        reclaim_pct = (latest_close - low_price) / drop if drop > 0 else 0.0
+        if (
+            move_pct >= _min_move_pct
+            and reclaim_pct >= _min_reclaim_pct
+            and latest_close > vwap
+            and earlier_below_vwap
+        ):
+            direction = "bullish"
     else:
         move_pct = abs(high_move)
-        if high_price != open_:
-            reclaim_pct = (high_price - latest_close) / (high_price - open_)
-        bearish_reversal = reclaim_pct >= _min_reclaim_pct
+        pop = high_price - open_
+        reclaim_pct = (high_price - latest_close) / pop if pop > 0 else 0.0
+        if (
+            move_pct >= _min_move_pct
+            and reclaim_pct >= _min_reclaim_pct
+            and latest_close < vwap
+            and earlier_above_vwap
+        ):
+            direction = "bearish"
 
-    return bullish_reversal, bearish_reversal, move_pct, reclaim_pct, latest_close
+    return {
+        "direction": direction,
+        "move_pct": move_pct,
+        "reclaim_pct": reclaim_pct,
+        "vwap": vwap,
+        "latest_close": latest_close,
+        "high_price": high_price,
+        "low_price": low_price,
+        "open_price": open_,
+        "rsi": rsi_current,
+        "rsi_early": rsi_early,
+        "earlier_below_vwap": earlier_below_vwap,
+        "earlier_above_vwap": earlier_above_vwap,
+    }
+
+
+def _format_alert(sym: str, daily: DailySnapshot, info: dict) -> str:
+    ts = format_est_timestamp()
+    last = info["latest_close"]
+    open_price = info["open_price"]
+    high_price = info["high_price"]
+    low_price = info["low_price"]
+    vwap = info["vwap"]
+    rvol = daily.rvol
+    dollar_vol = daily.dollar_vol
+    rsi_early = info.get("rsi_early")
+
+    ref_price = daily.prev_close or daily.open
+    day_change_pct = (
+        (last - ref_price) / ref_price * 100 if ref_price and ref_price > 0 else None
+    )
+    low_change_pct = (
+        (low_price - ref_price) / ref_price * 100 if ref_price and ref_price > 0 else None
+    )
+
+    reclaim_pct = info["reclaim_pct"] * 100
+    direction = info["direction"]
+    rsi_val = info.get("rsi")
+
+    price_path = (
+        f"• Last: ${last:.2f}"
+        + (f" ({day_change_pct:+.1f}% today" if day_change_pct is not None else "")
+        + (f", from {low_change_pct:+.1f}% low" if low_change_pct is not None else "")
+        + (")" if day_change_pct is not None else "")
+    )
+
+    lines = [
+        f"🔄 MOMENTUM REVERSAL — {sym}",
+        f"🕒 {ts}",
+        "",
+        "💰 Price Path",
+        price_path,
+        f"• O ${open_price:.2f} · H ${high_price:.2f} · L ${low_price:.2f} · C ${last:.2f}",
+        f"• RVOL: {rvol:.1f}×",
+        f"• Dollar Vol: ${dollar_vol:,.0f}",
+        "",
+        "📈 Reversal Context",
+    ]
+
+    earlier_line = (
+        "Earlier in session: BELOW VWAP" if direction == "bullish" else "Earlier in session: ABOVE VWAP"
+    )
+    now_line = (
+        f"Now: ABOVE VWAP (reclaimed ~{reclaim_pct:.1f}% of range)"
+        if direction == "bullish"
+        else f"Now: BELOW VWAP (given up ~{reclaim_pct:.1f}% of early rip)"
+    )
+    lines.append(f"• {earlier_line}")
+    lines.append(f"• {now_line}")
+    if rsi_val is not None:
+        if rsi_early is not None:
+            lines.append(f"• RSI(14, 5m): {rsi_early:.1f} → {rsi_val:.1f}")
+        else:
+            lines.append(f"• RSI(14, 5m): {rsi_val:.1f}")
+
+    lines.extend(
+        [
+            "",
+            "🧠 Read",
+            (
+                "Intraday reversal after a hard selloff — buyers stepped in, reclaimed VWAP, and are pushing off the lows."
+                if direction == "bullish"
+                else "Intraday reversal after a rip — sellers faded strength, lost VWAP, and are leaning on the roll over."
+            ),
+            "",
+            "🔗 Chart",
+            chart_link(sym),
+        ]
+    )
+
+    return "\n".join(lines)
 
 
 async def run_momentum_reversal() -> None:
@@ -236,10 +384,11 @@ async def run_momentum_reversal() -> None:
                     continue
 
                 scanned += 1
-
-                bullish, bearish, move_pct, reclaim_pct, last_price = _compute_reversal(
-                    sym, daily, intraday
-                )
+                info = _compute_reversal(sym, daily, intraday)
+                direction = info["direction"]
+                move_pct = info["move_pct"]
+                reclaim_pct = info["reclaim_pct"]
+                last_price = info["latest_close"]
 
                 if move_pct < _min_move_pct:
                     debug_filter_reason(BOT_NAME, sym, "momo_move_too_small")
@@ -266,29 +415,13 @@ async def run_momentum_reversal() -> None:
                     reason_counts["rvol"] = reason_counts.get("rvol", 0) + 1
                     continue
 
-                if not (bullish or bearish):
+                if direction == "none":
                     debug_filter_reason(BOT_NAME, sym, "momo_no_reversal")
                     reason_counts["no_reversal"] = reason_counts.get("no_reversal", 0) + 1
                     continue
 
-                direction = "Bullish" if bullish else "Bearish"
                 matches += 1
-
-                body = (
-                    f"• Last: ${last_price:.2f}\n"
-                    f"• Initial move: {move_pct:.1f}% from open\n"
-                    f"• Reclaim: {reclaim_pct * 100:.1f}% of initial move\n"
-                    f"• Volume: {int(daily.volume):,} ({daily.rvol:.1f}× avg) — Dollar Vol: ${daily.dollar_vol:,.0f}\n"
-                    f"• Context: Strong intraday reversal ({direction.lower()}).\n"
-                    f"• Chart: {chart_link(sym)}"
-                )
-                send_alert(
-                    f"{BOT_NAME} {direction}",
-                    sym,
-                    last_price,
-                    daily.rvol,
-                    extra=body,
-                )
+                send_alert_text(_format_alert(sym, daily, info))
                 alerts += 1
             except Exception as exc:  # pragma: no cover - defensive
                 print(f"[momentum_reversal] error for {sym}: {exc}")
