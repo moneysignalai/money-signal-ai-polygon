@@ -9,7 +9,7 @@ import time
 from typing import Dict
 
 from bots.options_common import (
-    format_option_alert,
+    format_unusual_option_alert,
     iter_option_contracts,
     options_flow_allow_outside_rth,
     send_option_alert,
@@ -62,7 +62,11 @@ async def run_options_unusual_flow() -> None:
                 debug_filter_reason(BOT_NAME, symbol, "no_chain_data")
                 continue
             for c in contracts:
-                if c.underlying_price is not None and c.underlying_price < OPTIONS_MIN_UNDERLYING_PRICE:
+                if c.underlying_price is None or c.underlying_price <= 0:
+                    reason_counts["underlying_price"] = reason_counts.get("underlying_price", 0) + 1
+                    debug_filter_reason(BOT_NAME, c.contract, "unusual_underlying_price_missing")
+                    continue
+                if c.underlying_price < OPTIONS_MIN_UNDERLYING_PRICE:
                     reason_counts["underlying_price"] = reason_counts.get("underlying_price", 0) + 1
                     debug_filter_reason(BOT_NAME, c.contract, "unusual_underlying_price_too_low")
                     continue
@@ -80,11 +84,34 @@ async def run_options_unusual_flow() -> None:
                     continue
 
                 matches += 1
-                alert_text = format_option_alert(
-                    emoji="⚠️",
-                    label="UNUSUAL FLOW",
+                flow_tags = []
+                if c.size and c.size >= UNUSUAL_MIN_SIZE:
+                    flow_tags.append("SIZE")
+                if c.notional and c.notional >= UNUSUAL_MIN_NOTIONAL:
+                    flow_tags.append("NOTIONAL")
+                if c.cp:
+                    flow_tags.append(c.cp.upper())
+                if c.dte is not None:
+                    if c.dte <= 7:
+                        flow_tags.append("NEAR_TERM")
+                    elif c.dte <= 21:
+                        flow_tags.append("MID_TERM")
+
+                narrative = ""
+                if c.cp and c.cp.upper().startswith("C"):
+                    narrative = "Upside call flow well above normal activity."
+                elif c.cp and c.cp.upper().startswith("P"):
+                    narrative = "Downside put flow well above normal activity."
+                else:
+                    narrative = "Unusual flow above baseline volume."
+
+                alert_text = format_unusual_option_alert(
                     contract=c,
+                    flow_tags=flow_tags,
+                    volume_today=c.volume,
+                    trade_size=c.size,
                     chart_symbol=symbol,
+                    narrative=narrative,
                 )
                 alerts += 1
                 send_option_alert(alert_text)

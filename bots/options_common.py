@@ -309,6 +309,23 @@ def iter_option_contracts(symbol: str, *, ttl_seconds: int = 60) -> List[OptionC
         if premium is not None and size is not None:
             notional = premium * size * OPTION_MULTIPLIER
 
+        local_underlying_price = underlying_price
+        if local_underlying_price is None:
+            underlying_obj = opt.get("underlying") or {}
+            local_underlying_price = _safe_float(
+                (underlying_obj.get("last") or {}).get("price")
+                or underlying_obj.get("price")
+                or opt.get("underlying_price")
+                or opt.get("underlying_last")
+            )
+            if local_underlying_price is not None and local_underlying_price <= 0:
+                local_underlying_price = None
+
+        local_underlying_rvol = underlying_fields.get("rvol")
+        if local_underlying_rvol is None:
+            underlying_obj = opt.get("underlying") or {}
+            local_underlying_rvol = _safe_float(underlying_obj.get("rvol"))
+
         contracts.append(
             OptionContract(
                 symbol=symbol,
@@ -323,10 +340,10 @@ def iter_option_contracts(symbol: str, *, ttl_seconds: int = 60) -> List[OptionC
                 volume=volume,
                 open_interest=open_interest,
                 iv=_option_iv(opt),
-                underlying_price=underlying_price,
+                underlying_price=local_underlying_price,
                 underlying_open=underlying_fields.get("open"),
                 underlying_prev_close=underlying_fields.get("prev_close"),
-                underlying_rvol=underlying_fields.get("rvol"),
+                underlying_rvol=local_underlying_rvol,
                 underlying_volume=underlying_fields.get("volume"),
             )
         )
@@ -458,6 +475,87 @@ def format_whale_option_alert(
             tags_line,
             context_line_fmt,
             bias_line_fmt,
+            chart_line,
+        ]
+    )
+
+
+def format_unusual_option_alert(
+    *,
+    contract: OptionContract,
+    flow_tags: Optional[list[str]] = None,
+    volume_today: Optional[int] = None,
+    avg_volume: Optional[int] = None,
+    trade_size: Optional[int] = None,
+    chart_symbol: Optional[str] = None,
+    narrative: Optional[str] = None,
+) -> str:
+    """Premium unusual-flow alert with parsed contract + context."""
+
+    now = datetime.now(eastern)
+    timestamp = now.strftime("%m-%d-%Y · %I:%M %p EST")
+    symbol = (chart_symbol or contract.symbol or "?").upper()
+
+    change_pct = _underlying_change_pct(contract)
+    change_text = f" ({change_pct:+.1f}% today)" if change_pct is not None else ""
+    rvol_text = (
+        f" · RVOL {contract.underlying_rvol:.1f}×" if contract.underlying_rvol is not None else ""
+    )
+    underlying_line = f"💰 Underlying: {_format_currency(contract.underlying_price)}{change_text}{rvol_text}"
+
+    contract_brief = format_contract_brief_with_size(contract)
+    premium_text = _format_currency(contract.premium)
+    notional_text = _format_currency(contract.notional, decimals=0)
+
+    vol_today_val = volume_today if volume_today is not None else contract.volume
+    vol_today_text = f"{vol_today_val:,}" if vol_today_val is not None else "n/a"
+    avg_text = f"{avg_volume:,}" if avg_volume is not None else "n/a"
+
+    size_val = trade_size if trade_size is not None else contract.size
+    size_text = str(size_val) if size_val is not None else "n/a"
+
+    share_text = "n/a"
+    if vol_today_val and size_val:
+        share = (size_val / vol_today_val) * 100
+        share_text = f"{share:.1f}% of today’s option volume"
+
+    oi_val = contract.open_interest or 0
+    ratio_text = "n/a"
+    if oi_val and vol_today_val:
+        ratio_text = f"{vol_today_val/oi_val:.1f}× OI"
+    elif vol_today_val:
+        ratio_text = "volume present, no OI data"
+
+    flow_tag_text = " · ".join(flow_tags) if flow_tags else "n/a"
+    narrative_line = narrative or "Short-dated flow well above normal activity."
+
+    header = f"⚠️ UNUSUAL FLOW — {symbol}"
+    time_line = f"🕒 {timestamp}"
+    separator = "────────────"
+    order_line = f"🎯 Order: {contract_brief}"
+    money_line = f"💵 Premium per contract: {premium_text} · Total Notional: {notional_text}"
+    unusual_header = "📊 Unusual vs normal:"
+    volume_line = f"• Option volume today: {vol_today_text} (avg {avg_text})"
+    trade_line = f"• This trade: {size_text} contracts ({share_text})"
+    oi_line = f"• Volume vs OI: {vol_today_text} vs {oi_val} ({ratio_text})"
+    tags_line = f"🧠 Flow tags: {flow_tag_text}"
+    narrative_fmt = f"📌 Narrative: {narrative_line}"
+    chart_line = f"🔗 Chart: {chart_link(symbol)}"
+
+    return "\n".join(
+        [
+            header,
+            time_line,
+            underlying_line,
+            separator,
+            order_line,
+            money_line,
+            unusual_header,
+            volume_line,
+            trade_line,
+            oi_line,
+            tags_line,
+            narrative_fmt,
             chart_line,
         ]
     )
