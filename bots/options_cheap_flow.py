@@ -11,7 +11,7 @@ from typing import Dict
 
 from bots.options_common import (
     OptionContract,
-    format_option_alert,
+    format_cheap_option_alert,
     iter_option_contracts,
     options_flow_allow_outside_rth,
     send_option_alert,
@@ -107,10 +107,11 @@ async def run_options_cheap_flow() -> None:
                     continue
 
                 matches += 1
-                alert_text = format_option_alert(
-                    emoji="💰",
-                    label="CHEAP FLOW",
+                alert_text = format_cheap_option_alert(
                     contract=c,
+                    premium_cap=CHEAP_MAX_PREMIUM,
+                    min_notional=CHEAP_MIN_NOTIONAL,
+                    min_size=CHEAP_MIN_SIZE,
                     chart_symbol=symbol,
                 )
                 alerts += 1

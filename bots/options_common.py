@@ -561,6 +561,97 @@ def format_unusual_option_alert(
     )
 
 
+def format_cheap_option_alert(
+    *,
+    contract: OptionContract,
+    premium_cap: float,
+    min_notional: float,
+    min_size: int,
+    chart_symbol: Optional[str] = None,
+    narrative: Optional[str] = None,
+) -> str:
+    """Lottery-style cheap-flow alert with thresholds and context."""
+
+    now = datetime.now(eastern)
+    timestamp = now.strftime("%m-%d-%Y · %I:%M %p EST")
+    symbol = (chart_symbol or contract.symbol or "?").upper()
+
+    change_pct = _underlying_change_pct(contract)
+    change_text = f" ({change_pct:+.1f}% today)" if change_pct is not None else ""
+    underlying_line = f"💵 Underlying: {_format_currency(contract.underlying_price)}{change_text}"
+
+    contract_brief = format_contract_brief_with_size(contract)
+    premium_text = _format_currency(contract.premium)
+    notional_text = _format_currency(contract.notional, decimals=0)
+    size_text = str(contract.size) if contract.size is not None else "n/a"
+
+    premium_note = f"within CHEAP_MAX_PREMIUM=${premium_cap:.2f}"
+    notional_note = "meets CHEAP_MIN_NOTIONAL" if contract.notional and contract.notional >= min_notional else "notional n/a"
+    size_note = "meets CHEAP_MIN_SIZE" if contract.size and contract.size >= min_size else "size n/a"
+
+    dte_text = f"{contract.dte} DTE" if contract.dte is not None else "n/a"
+
+    # Simple structure: near/short dated + moneyness + size
+    structure_bits: list[str] = []
+    if contract.dte is not None:
+        if contract.dte <= 21:
+            structure_bits.append("near-dated")
+        elif contract.dte <= 60:
+            structure_bits.append("mid-term")
+        else:
+            structure_bits.append("far-dated")
+    parsed = _parse_occ(contract.contract)
+    if contract.strike is not None and contract.underlying_price:
+        cp_source = contract.cp or parsed.get("cp")
+        cp_letter = "C" if cp_source == "CALL" else "P" if cp_source == "PUT" else None
+        if cp_letter == "C":
+            structure_bits.append("OTM call" if contract.strike > contract.underlying_price else "ITM/ATM call")
+        elif cp_letter == "P":
+            structure_bits.append("OTM put" if contract.strike < contract.underlying_price else "ITM/ATM put")
+    structure_bits.append(f"sized at {size_text} contracts" if contract.size else "size unknown")
+    structure_line = " · ".join(structure_bits)
+
+    oi_val = contract.open_interest or 0
+    vol_val = contract.volume or 0
+    ratio_text = "n/a"
+    if oi_val and vol_val:
+        ratio_text = f"{vol_val/oi_val:.1f}× OI"
+    elif vol_val:
+        ratio_text = "volume present, no OI data"
+
+    context_line = f"Option volume {vol_val} vs OI {oi_val} ({ratio_text})"
+    bias = narrative or "Speculative bullish \"lottery\" flow"
+
+    header = f"💰 CHEAP FLOW — {symbol}"
+    time_line = f"🕒 {timestamp}"
+    separator = "────────────"
+    order_line = f"🎯 Order: {contract_brief}"
+    premium_line = f"💸 Premium per contract: {premium_text} ({premium_note})"
+    notional_line = f"💰 Total Notional: {notional_text} ({notional_note}; {size_note})"
+    structure_header = f"📊 Structure: {structure_line}" if structure_line else "📊 Structure: n/a"
+    context_fmt = f"⚖️ Context: {context_line}"
+    bias_line = f"🧠 Bias: {bias}"
+    dte_line = f"⏳ Tenor: {dte_text}" if contract.dte is not None else None
+    chart_line = f"🔗 Chart: {chart_link(symbol)}"
+
+    lines = [
+        header,
+        time_line,
+        underlying_line,
+        separator,
+        order_line,
+        premium_line,
+        notional_line,
+        structure_header,
+        context_fmt,
+        bias_line,
+    ]
+    if dte_line:
+        lines.insert(5, dte_line)
+    lines.append(chart_line)
+
+    return "\n".join(lines)
+
 def format_option_alert(
     *,
     emoji: str,
