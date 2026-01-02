@@ -13,6 +13,7 @@ from bots.shared import (
     chart_link,
     debug_filter_reason,
     eastern,
+    DEBUG_FLOW_REASONS,
     get_last_option_trades_cached,
     get_option_chain_cached,
     get_last_trade_cached,
@@ -138,6 +139,33 @@ class OptionContract:
     underlying_prev_close: Optional[float] = None
     underlying_rvol: Optional[float] = None
     underlying_volume: Optional[int] = None
+    price_size_reason: Optional[str] = None
+
+
+class FlowReasonTracker:
+    """Accumulates filter reasons and optional examples for debug mode."""
+
+    def __init__(self, bot_name: str, *, max_examples: int = 3):
+        self.bot_name = bot_name
+        self.max_examples = max_examples
+        self.counts: Dict[str, int] = {}
+        self.examples: Dict[str, list[str]] = {}
+
+    def record(self, symbol: str, reason: str) -> None:
+        self.counts[reason] = self.counts.get(reason, 0) + 1
+        if DEBUG_FLOW_REASONS and self.counts[reason] <= self.max_examples:
+            self.examples.setdefault(reason, []).append(symbol)
+            debug_filter_reason(self.bot_name, symbol, reason)
+
+    def log_summary(self) -> None:
+        if not DEBUG_FLOW_REASONS or not self.counts:
+            return
+        summary = ", ".join(f"{k}={v}" for k, v in sorted(self.counts.items()))
+        print(f"[{self.bot_name}] filter summary: {summary}")
+        for reason, samples in sorted(self.examples.items()):
+            if samples:
+                joined = ", ".join(samples[: self.max_examples])
+                print(f"[{self.bot_name}] examples {reason}: {joined}")
 
 
 def _extract_underlying_fields(chain: Dict[str, Any]) -> Dict[str, Optional[Any]]:
@@ -218,7 +246,9 @@ def _is_trade_today(ts_raw: Any) -> bool:
     return bool(dt and dt.date() == today_est_date())
 
 
-def iter_option_contracts(symbol: str, *, ttl_seconds: int = 60) -> List[OptionContract]:
+def iter_option_contracts(
+    symbol: str, *, ttl_seconds: int = 60, reason_tracker: Optional[FlowReasonTracker] = None
+) -> List[OptionContract]:
     """Return parsed option contracts for an underlying symbol.
 
     Each contract includes price/size/notional when available. Errors are
@@ -234,7 +264,10 @@ def iter_option_contracts(symbol: str, *, ttl_seconds: int = 60) -> List[OptionC
     for opt in options:
         expiry, contract, dte = _parse_option_details(opt)
         if not contract:
-            debug_filter_reason("options_common", symbol, "missing_contract_symbol")
+            if reason_tracker:
+                reason_tracker.record(symbol, "missing_contract_symbol")
+            else:
+                debug_filter_reason("options_common", symbol, "missing_contract_symbol")
             continue
 
         occ_parts = _parse_occ(contract)
@@ -268,13 +301,16 @@ def iter_option_contracts(symbol: str, *, ttl_seconds: int = 60) -> List[OptionC
             or last_trade_obj.get("t")
         )
         premium = _safe_float(
-            last_trade_obj.get("price")
-            or last_trade_obj.get("p")
+            last_trade_obj.get("p")
+            or last_trade_obj.get("price")
             or last_trade_obj.get("mid")
             or opt.get("last_price")
             or opt.get("price")
         )
-        size = _safe_int(last_trade_obj.get("size") or last_trade_obj.get("s") or opt.get("size"))
+        size = _safe_int(last_trade_obj.get("s") or last_trade_obj.get("size") or opt.get("size"))
+
+        last_trade_present = bool(last_trade_obj)
+        last_trade_stale = bool(trade_ts and not _is_trade_today(trade_ts))
 
         if trade_ts and not _is_trade_today(trade_ts):
             # Ignore stale trades from prior sessions
@@ -287,6 +323,7 @@ def iter_option_contracts(symbol: str, *, ttl_seconds: int = 60) -> List[OptionC
                 lt = get_last_option_trades_cached(contract)
                 trade = lt.get("results") if isinstance(lt, dict) else None
                 if trade:
+                    last_trade_present = True
                     ts_val = (
                         trade.get("sip_timestamp")
                         or trade.get("participant_timestamp")
@@ -294,8 +331,11 @@ def iter_option_contracts(symbol: str, *, ttl_seconds: int = 60) -> List[OptionC
                         or trade.get("t")
                     )
                     if _is_trade_today(ts_val):
-                        premium = premium if premium is not None else _safe_float(trade.get("price"))
-                        size = size if size is not None else _safe_int(trade.get("size"))
+                        premium = premium if premium is not None else _safe_float(trade.get("p") or trade.get("price"))
+                        size = size if size is not None else _safe_int(trade.get("s") or trade.get("size"))
+                        last_trade_stale = False
+                    else:
+                        last_trade_stale = True
             except Exception:
                 pass
 
@@ -313,6 +353,21 @@ def iter_option_contracts(symbol: str, *, ttl_seconds: int = 60) -> List[OptionC
         notional = None
         if premium is not None and size is not None:
             notional = premium * size * OPTION_MULTIPLIER
+
+        price_size_reason: Optional[str] = None
+        if premium is None or size is None:
+            if not last_trade_present:
+                price_size_reason = "missing_last_trade"
+            elif last_trade_stale:
+                price_size_reason = "stale_last_trade"
+            elif premium is None and (bid is None or ask is None):
+                price_size_reason = "missing_quote"
+            elif premium is None and size is not None:
+                price_size_reason = "missing_premium"
+            elif size is None and premium is not None:
+                price_size_reason = "missing_size"
+            if price_size_reason is None:
+                price_size_reason = "missing_price_size"
 
         local_underlying_price = underlying_price
         if local_underlying_price is None:
@@ -358,6 +413,7 @@ def iter_option_contracts(symbol: str, *, ttl_seconds: int = 60) -> List[OptionC
                 underlying_prev_close=underlying_fields.get("prev_close"),
                 underlying_rvol=local_underlying_rvol,
                 underlying_volume=underlying_fields.get("volume"),
+                price_size_reason=price_size_reason,
             )
         )
     return contracts

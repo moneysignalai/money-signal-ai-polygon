@@ -7,9 +7,9 @@ Runs during RTH unless overridden via OPTIONS_FLOW_ALLOW_OUTSIDE_RTH.
 
 import os
 import time
-from typing import Dict
 
 from bots.options_common import (
+    FlowReasonTracker,
     OptionContract,
     format_cheap_option_alert,
     iter_option_contracts,
@@ -17,7 +17,6 @@ from bots.options_common import (
     send_option_alert,
 )
 from bots.shared import (
-    DEBUG_FLOW_REASONS,
     debug_filter_reason,
     in_rth_window_est,
     now_est_dt,
@@ -59,7 +58,7 @@ async def run_options_cheap_flow() -> None:
     scanned = 0
     matches = 0
     alerts = 0
-    reason_counts: Dict[str, int] = {}
+    tracker = FlowReasonTracker(BOT_NAME)
 
     allow_outside = options_flow_allow_outside_rth()
     if not allow_outside and not in_rth_window_est():
@@ -79,31 +78,26 @@ async def run_options_cheap_flow() -> None:
     for symbol in universe:
         scanned += 1
         try:
-            contracts = iter_option_contracts(symbol)
+            contracts = iter_option_contracts(symbol, reason_tracker=tracker)
             if not contracts:
-                reason_counts["no_chain"] = reason_counts.get("no_chain", 0) + 1
-                debug_filter_reason(BOT_NAME, symbol, "no_chain_data")
+                tracker.record(symbol, "cheap_no_chain_data")
                 continue
             for c in contracts:
                 if c.underlying_price is not None and c.underlying_price < OPTIONS_MIN_UNDERLYING_PRICE:
-                    reason_counts["underlying_price"] = reason_counts.get("underlying_price", 0) + 1
-                    debug_filter_reason(BOT_NAME, c.contract, "cheap_underlying_price_too_low")
+                    tracker.record(c.contract, "cheap_underlying_price_too_low")
                     continue
                 if c.premium is None or c.size is None or c.notional is None:
-                    reason_counts["missing_prices"] = reason_counts.get("missing_prices", 0) + 1
-                    debug_filter_reason(BOT_NAME, c.contract, "cheap_missing_price_size")
+                    suffix = c.price_size_reason or "missing_price_size"
+                    tracker.record(c.contract, f"cheap_{suffix}")
                     continue
                 if c.premium > CHEAP_MAX_PREMIUM:
-                    reason_counts["premium"] = reason_counts.get("premium", 0) + 1
-                    debug_filter_reason(BOT_NAME, c.contract, "cheap_premium_too_high")
+                    tracker.record(c.contract, "cheap_premium_too_high")
                     continue
                 if c.size < CHEAP_MIN_SIZE or c.notional < CHEAP_MIN_NOTIONAL:
-                    reason_counts["size_notional"] = reason_counts.get("size_notional", 0) + 1
-                    debug_filter_reason(BOT_NAME, c.contract, "cheap_size_notional_too_small")
+                    tracker.record(c.contract, "cheap_size_notional_too_small")
                     continue
                 if not _dte_in_range(c):
-                    reason_counts["dte"] = reason_counts.get("dte", 0) + 1
-                    debug_filter_reason(BOT_NAME, c.contract, "cheap_dte_out_of_range")
+                    tracker.record(c.contract, "cheap_dte_out_of_range")
                     continue
 
                 matches += 1
@@ -123,7 +117,6 @@ async def run_options_cheap_flow() -> None:
 
     finished = now_est_dt()
     runtime = time.perf_counter() - start_perf
-    if DEBUG_FLOW_REASONS and matches == 0:
-        print(f"[options_cheap_flow] No alerts. Filter breakdown: {reason_counts}")
+    tracker.log_summary()
     record_bot_stats(BOT_NAME, scanned, matches, alerts, runtime, started_at=start_dt, finished_at=finished)
 
