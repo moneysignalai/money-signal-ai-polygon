@@ -27,11 +27,12 @@ from bots.shared import (
     now_est_dt,
     in_rth_window_est,
     resolve_universe_for_bot,
-    send_alert,
+    send_alert_text,
 )
 from bots.status_report import record_bot_stats
 
 BOT_NAME = "swing_pullback"
+STRATEGY_TAG = "SWING_PULLBACK"
 
 _allow_outside_rth = os.getenv("SWING_PULLBACK_ALLOW_OUTSIDE_RTH", "false").lower() == "true"
 _min_price = float(os.getenv("SWING_MIN_PRICE", "5"))
@@ -280,7 +281,7 @@ async def run_swing_pullback() -> None:
                 timestamp=timestamp,
             )
             try:
-                send_alert(text)
+                send_alert_text(text, bot_name=BOT_NAME)
                 alerts += 1
             except Exception as exc:
                 print(f"[swing_pullback] alert error for {sym}: {exc}")

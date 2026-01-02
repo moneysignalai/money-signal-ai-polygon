@@ -25,6 +25,14 @@ from bots.shared import (
 OPTION_MULTIPLIER = 100
 
 
+def _normalize_bias_label(bias: Optional[str]) -> tuple[str, str]:
+    normalized = (bias or "neutral").strip().lower()
+    if normalized not in {"bullish", "bearish", "neutral"}:
+        normalized = "neutral"
+    emoji = {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪"}[normalized]
+    return normalized.capitalize(), emoji
+
+
 def _safe_float(val: Any) -> Optional[float]:
     try:
         if val is None:
@@ -807,6 +815,7 @@ def format_option_alert(
     contract: OptionContract,
     iv_line: Optional[str] = None,
     chart_symbol: Optional[str] = None,
+    bias: Optional[str] = None,
 ) -> str:
     """Return a human-readable option alert body used by all option flow bots."""
 
@@ -826,9 +835,12 @@ def format_option_alert(
     )
     iv_display = iv_line if iv_line is not None else f"IV: {iv_value} | Volume: {volume_text} | OI: {oi_text}"
 
+    bias_label, bias_emoji = _normalize_bias_label(bias)
+
     header_symbol = (chart_symbol or contract.symbol or "?").upper()
-    header = f"{emoji} {label} — {header_symbol} ({timestamp})"
+    header = f"{bias_emoji} {emoji} {label} — {header_symbol} ({timestamp})"
     separator = "────────────"
+    bias_line = f"Bias: {bias_label}"
     contract_line = (
         f"• Contract: {format_option_contract_display(contract)} (⏳ {dte_text})"
     )
@@ -842,6 +854,7 @@ def format_option_alert(
     return "\n".join(
         [
             header,
+            bias_line,
             separator,
             contract_line,
             underlying_line,

@@ -31,6 +31,7 @@ from bots.shared import (
 from bots.status_report import record_bot_stats, record_error
 
 BOT_NAME = "gap_flow"
+STRATEGY_TAG = "GAP_FLOW"
 
 _allow_outside_rth = (
     os.getenv("GAP_FLOW_ALLOW_OUTSIDE_RTH")

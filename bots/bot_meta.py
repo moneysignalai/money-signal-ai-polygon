@@ -1,5 +1,6 @@
 """Central registry for bot metadata and strategy tags."""
 
+import importlib
 from dataclasses import dataclass
 from typing import Dict
 
@@ -50,7 +51,18 @@ BOT_METADATA: Dict[str, BotMeta] = {
 
 def get_strategy_tag(bot_name: str) -> str:
     meta = BOT_METADATA.get(bot_name.lower())
-    return meta.strategy_tag if meta else "UNKNOWN"
+    if meta:
+        return meta.strategy_tag
+
+    try:
+        module = importlib.import_module(f"bots.{bot_name}")
+        tag = getattr(module, "STRATEGY_TAG", None)
+        if tag:
+            return str(tag)
+    except Exception:
+        pass
+
+    return "UNKNOWN"
 
 
 def get_bot_meta(bot_name: str) -> BotMeta | None:

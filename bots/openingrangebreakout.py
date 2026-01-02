@@ -40,6 +40,7 @@ from bots.status_report import record_bot_stats, record_error
 
 eastern = pytz.timezone("US/Eastern")
 BOT_NAME = "opening_range_breakout"
+STRATEGY_TAG = "OPEN_RANGE"
 
 
 def should_run_now() -> tuple[bool, Optional[str]]:

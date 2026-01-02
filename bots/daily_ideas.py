@@ -43,6 +43,7 @@ from bots.status_report import record_error
 # ----------------- ENV / CONFIG -----------------
 
 BOT_NAME = "daily_ideas"
+STRATEGY_TAG = "DAILY_IDEAS"
 
 POLYGON_KEY = os.getenv("POLYGON_KEY") or os.getenv("POLYGON_API_KEY")
 _CLIENT: Optional[RESTClient] = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None

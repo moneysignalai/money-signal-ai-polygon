@@ -23,6 +23,7 @@ from bots.shared import (
 from bots.status_report import record_bot_stats, record_error
 
 BOT_NAME = "options_unusual_flow"
+STRATEGY_TAG = "UNUSUAL_FLOW"
 
 UNUSUAL_MIN_SIZE = int(os.getenv("UNUSUAL_MIN_SIZE", "20"))
 UNUSUAL_MIN_NOTIONAL = float(os.getenv("UNUSUAL_MIN_NOTIONAL", "15000"))

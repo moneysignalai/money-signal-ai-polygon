@@ -34,6 +34,7 @@ from bots.shared import (
 from bots.status_report import record_bot_stats, record_error
 
 BOT_NAME = "volume_monster"
+STRATEGY_TAG = "VOLUME_MONSTER"
 
 _allow_outside_rth = os.getenv("VOLUME_MONSTER_ALLOW_OUTSIDE_RTH", "false").lower() == "true"
 _min_dollar_vol = float(os.getenv("VOLUME_MONSTER_MIN_DOLLAR_VOL", "150000"))

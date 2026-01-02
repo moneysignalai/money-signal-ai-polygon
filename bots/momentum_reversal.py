@@ -37,6 +37,7 @@ from bots.shared import (
 from bots.status_report import record_bot_stats
 
 BOT_NAME = "momentum_reversal"
+STRATEGY_TAG = "MOMO_REVERSAL"
 
 _client = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY else None
 _allow_outside_rth = os.getenv("MOMENTUM_REVERSAL_ALLOW_OUTSIDE_RTH", "false").lower() == "true"

@@ -43,6 +43,7 @@ _client: Optional[RESTClient] = RESTClient(api_key=POLYGON_KEY) if POLYGON_KEY e
 # ---------------- CONFIG ----------------
 
 BOT_NAME = "squeeze"
+STRATEGY_TAG = "SQUEEZE_BREAK"
 
 SQUEEZE_MAX_UNIVERSE = int(os.getenv("SQUEEZE_MAX_UNIVERSE", "2000"))
 SQUEEZE_ALLOW_OUTSIDE_RTH = (

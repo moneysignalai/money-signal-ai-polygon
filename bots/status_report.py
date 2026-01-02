@@ -22,6 +22,9 @@ from bots.shared import (
 
 # ----------------- CONFIG -----------------
 
+BOT_NAME = "status_report"
+STRATEGY_TAG = "STATUS_HEARTBEAT"
+
 HEARTBEAT_INTERVAL_MIN = float(os.getenv("STATUS_HEARTBEAT_INTERVAL_MIN", "5"))
 TELEGRAM_CHAT_ALL = os.getenv("TELEGRAM_CHAT_ALL")
 TELEGRAM_TOKEN_STATUS = os.getenv("TELEGRAM_TOKEN_STATUS")

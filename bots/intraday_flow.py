@@ -11,6 +11,9 @@ import time
 
 from bots.status_report import record_bot_stats
 
+BOT_NAME = "intraday_flow"
+STRATEGY_TAG = "INTRADAY_FLOW"
+
 
 def should_run_now():
     return False, "deprecated"
@@ -19,4 +22,4 @@ def should_run_now():
 async def run_intraday_flow() -> None:
     start = time.perf_counter()
     print("[intraday_flow] deprecated stub; use dedicated bots instead")
-    record_bot_stats("intraday_flow", 0, 0, 0, time.perf_counter() - start)
+    record_bot_stats(BOT_NAME, 0, 0, 0, time.perf_counter() - start)
