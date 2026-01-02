@@ -192,27 +192,64 @@ def _format_rsi_alert(
     open_: float,
     high: float,
     low: float,
+    close: float,
     rvol: float,
+    volume: float,
     dollar_vol: float,
     day_move_pct: float,
+    direction_label: str,
     signal: str,
-    ma20: float,
-    ma50: float,
-    regime_text: str,
+    distance_from_low_pct: float,
+    distance_from_high_pct: float,
     ts: datetime,
 ) -> str:
-    header = f"{'🟢' if signal == 'oversold' else '🔴'} RSI {'OVERSOLD' if signal == 'oversold' else 'OVERBOUGHT'} — {symbol} ({format_est_timestamp(ts)})"
-    rvol_text = f"{rvol:.1f}x" if rvol > 0 else "N/A"
-    vol_text = f"${dollar_vol:,.0f}" if dollar_vol > 0 else "N/A"
+    """Return a premium, emoji-rich alert for RSI overbought/oversold events."""
+
+    timestamp = format_est_timestamp(ts)
+    header_emoji = "🧠" if signal == "oversold" else "🔥"
+    header_title = "RSI OVERSOLD" if signal == "oversold" else "RSI OVERBOUGHT"
+
+    rvol_text = f"{rvol:.1f}×" if rvol > 0 else "N/A"
+    vol_text = f"{volume:,.0f}" if volume > 0 else "N/A"
+    dollar_vol_text = f"${dollar_vol:,.0f}" if dollar_vol > 0 else "N/A"
+
+    distance_line = (
+        f"• Distance from Low: {distance_from_low_pct:.1f}%"
+        if signal == "oversold"
+        else f"• Distance from High: {distance_from_high_pct:.1f}%"
+    )
+
+    rsi_threshold_text = (
+        f"(≤ {RSI_OVERSOLD} OVERSOLD)"
+        if signal == "oversold"
+        else f"(≥ {RSI_OVERBOUGHT} OVERBOUGHT)"
+    )
+
+    read_line = (
+        "Short-term momentum washed out. Potential bounce or mean-reversion zone."
+        if signal == "oversold"
+        else "Short-term move looks stretched. Possible fade / digestion zone."
+    )
+
     lines = [
-        header,
-        "────────────",
-        f"• Last: {_fmt_price(last)} (O: {_fmt_price(open_)}, H: {_fmt_price(high)}, L: {_fmt_price(low)})",
-        f"• RSI({RSI_PERIOD}, {RSI_TIMEFRAME_MIN}-min): {rsi_val:.1f} ({'oversold < ' + str(RSI_OVERSOLD) if signal == 'oversold' else 'overbought > ' + str(RSI_OVERBOUGHT)})",
-        f"• RVOL: {rvol_text} · Dollar Vol: {vol_text}",
-        f"• Day Move: {_fmt_pct(day_move_pct)} vs prior close",
-        f"• Regime: {regime_text}",
-        f"• Chart: {chart_link(symbol)}",
+        f"{header_emoji} {header_title} — {symbol}",
+        f"🕒 {timestamp}",
+        "",
+        "💰 Price Snapshot",
+        f"• Last: {_fmt_price(last)} ({day_move_pct:.1f}% {direction_label})",
+        f"• RVOL: {rvol_text}",
+        f"• Dollar Vol: {dollar_vol_text}",
+        "",
+        "📉 Momentum Setup" if signal == "oversold" else "📈 Momentum Setup",
+        f"• RSI({RSI_PERIOD}, {RSI_TIMEFRAME_MIN}m): {rsi_val:.1f} {rsi_threshold_text}",
+        f"• Today’s range: O {_fmt_price(open_)} · H {_fmt_price(high)} · L {_fmt_price(low)} · C {_fmt_price(close)}",
+        distance_line,
+        "",
+        "🧠 Read",
+        read_line,
+        "",
+        "🔗 Chart",
+        chart_link(symbol),
     ]
     return "\n".join(lines)
 
@@ -328,20 +365,6 @@ async def run_rsi_signals() -> None:
                 prev_close = _extract_daily_fields(daily[-2])[3]
                 day_move_pct = ((last - prev_close) / prev_close * 100) if prev_close > 0 else 0.0
 
-                ma20_vals = [
-                    _extract_daily_fields(b)[3]
-                    for b in daily[-21:-1]
-                    if _extract_daily_fields(b)[3] > 0
-                ]
-                ma50_vals = [
-                    _extract_daily_fields(b)[3]
-                    for b in daily[-51:-1]
-                    if _extract_daily_fields(b)[3] > 0
-                ]
-                ma20 = statistics.mean(ma20_vals) if ma20_vals else 0.0
-                ma50 = statistics.mean(ma50_vals) if ma50_vals else 0.0
-                regime_text = _regime(last, ma20, ma50)
-
                 signal: Optional[str] = None
                 if rsi_last <= RSI_OVERSOLD:
                     signal = "oversold"
@@ -354,6 +377,10 @@ async def run_rsi_signals() -> None:
                     reason_counts["rsi_neutral"] = reason_counts.get("rsi_neutral", 0) + 1
                     continue
 
+                direction_label = "UP" if day_move_pct >= 0 else "DOWN"
+                distance_from_low_pct = ((last - low) / low * 100) if low > 0 else 0.0
+                distance_from_high_pct = ((high - last) / high * 100) if high > 0 else 0.0
+
                 alert_text = _format_rsi_alert(
                     symbol=sym,
                     rsi_val=rsi_last,
@@ -361,13 +388,15 @@ async def run_rsi_signals() -> None:
                     open_=open_,
                     high=high,
                     low=low,
+                    close=last,
                     rvol=rvol,
+                    volume=day_vol,
                     dollar_vol=dollar_vol,
                     day_move_pct=day_move_pct,
+                    direction_label=direction_label,
                     signal=signal,
-                    ma20=ma20,
-                    ma50=ma50,
-                    regime_text=regime_text,
+                    distance_from_low_pct=distance_from_low_pct,
+                    distance_from_high_pct=distance_from_high_pct,
                     ts=datetime.now(),
                 )
                 send_alert_text(alert_text)
@@ -396,13 +425,15 @@ if __name__ == "__main__":  # simple formatter demo
         open_=105.1,
         high=106.3,
         low=100.8,
+        close=102.4,
         rvol=1.7,
+        volume=8_220_000,
         dollar_vol=842_000_000,
         day_move_pct=-4.6,
+        direction_label="DOWN",
         signal="oversold",
-        ma20=110.0,
-        ma50=105.0,
-        regime_text="Uptrend (price > MA20 > MA50)",
+        distance_from_low_pct=1.6,
+        distance_from_high_pct=3.7,
         ts=datetime(2026, 1, 1, 10, 32),
     )
     print(demo)
